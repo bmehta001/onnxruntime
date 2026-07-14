@@ -19,18 +19,22 @@
 
 #ifdef __APPLE__
 #include <sys/sysctl.h>
+#include <sys/types.h>
 #endif
 
 #if defined(__linux__) || defined(__ANDROID__)
 #include <fstream>
+#include <sys/sysinfo.h>
 #endif
 
 #include <cctype>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
-#include <thread>
-#include <sstream>
 #include <iomanip>
+#include <random>
+#include <sstream>
+#include <thread>
 
 #include "core/common/common.h"
 #include "core/common/logging/logging.h"
@@ -215,6 +219,85 @@ class EventBuilder {
   return oss.str();
 }
 
+namespace {
+
+// Generate a random v4 UUID as a hex string (e.g. "f81d4fae-7dec-41d0-8f12-00a0c91e6bf6").
+std::string GenerateGuidV4() {
+  // Draw the 128 bits directly from a CSPRNG-backed std::random_device rather
+  // than seeding a PRNG, so the full entropy is preserved and the value is
+  // non-predictable.
+  std::random_device rd;
+  uint64_t hi = (static_cast<uint64_t>(rd()) << 32) | rd();
+  uint64_t lo = (static_cast<uint64_t>(rd()) << 32) | rd();
+  // Set version (4) and variant (10xx) bits.
+  hi = (hi & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;
+  lo = (lo & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;
+
+  char buf[37];
+  std::snprintf(buf, sizeof(buf),
+                "%08x-%04x-%04x-%04x-%012llx",
+                static_cast<uint32_t>(hi >> 32),
+                static_cast<uint32_t>((hi >> 16) & 0xFFFF),
+                static_cast<uint32_t>(hi & 0xFFFF),
+                static_cast<uint32_t>(lo >> 48),
+                static_cast<unsigned long long>(lo & 0xFFFFFFFFFFFFULL));
+  return std::string(buf);
+}
+
+const std::string& GetAppSessionGuid() {
+  static const std::string guid = GenerateGuidV4();
+  return guid;
+}
+
+std::string GetCpuModel() {
+#if defined(__APPLE__)
+  char buf[256]{};
+  size_t len = sizeof(buf);
+  if (sysctlbyname("machdep.cpu.brand_string", buf, &len, nullptr, 0) == 0) {
+    return std::string(buf, len > 0 ? len - 1 : 0);
+  }
+  return "unknown";
+#else
+  std::ifstream ifs("/proc/cpuinfo");
+  std::string line;
+  while (std::getline(ifs, line)) {
+    if (line.find("model name") == 0) {
+      auto pos = line.find(':');
+      if (pos != std::string::npos) {
+        auto result = line.substr(pos + 1);
+        auto start = result.find_first_not_of(" \t");
+        return start != std::string::npos ? result.substr(start) : result;
+      }
+    }
+  }
+  return "unknown";
+#endif
+}
+
+int64_t GetProcessorCount() {
+  auto n = sysconf(_SC_NPROCESSORS_ONLN);
+  return n > 0 ? static_cast<int64_t>(n) : 0;
+}
+
+int64_t GetTotalMemoryMB() {
+#if defined(__APPLE__)
+  int64_t mem = 0;
+  size_t len = sizeof(mem);
+  if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0) {
+    return mem / (1024 * 1024);
+  }
+  return 0;
+#else
+  struct sysinfo si{};
+  if (sysinfo(&si) == 0) {
+    return static_cast<int64_t>((static_cast<uint64_t>(si.totalram) * si.mem_unit) / (1024 * 1024));
+  }
+  return 0;
+#endif
+}
+
+}  // namespace
+
 PosixTelemetry::PosixTelemetry() {
   std::lock_guard<std::mutex> lock(global_mutex_);
 
@@ -358,6 +441,10 @@ void PosixTelemetry::Initialize() {
   logger->SetContext("AppName", "ONNXRuntime");
   logger->SetContext("AppVersion", ORT_VERSION);
   logger->SetContext("Platform", GetPlatformInfo());
+  logger->SetContext("AppSessionGuid", GetAppSessionGuid());
+  logger->SetContext("cpuModel", GetCpuModel());
+  logger->SetContext("processorCount", GetProcessorCount());
+  logger->SetContext("totalMemoryMB", GetTotalMemoryMB());
 
   // Caller-framework label from the build-time ORT_CALLER_FRAMEWORK option; only stamped when a
   // redistributor sets it, so standard builds add nothing. Matches the Windows provider's field.

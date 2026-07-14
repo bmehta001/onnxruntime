@@ -4,6 +4,7 @@
 #include "core/platform/windows/telemetry.h"
 #include <winapifamily.h>
 #include <cwchar>
+#include <cstdint>
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
 #include <shellapi.h>
 #endif
@@ -61,6 +62,55 @@ TRACELOGGING_DEFINE_PROVIDER(telemetry_provider_handle, "Microsoft.ML.ONNXRuntim
                              // {3a26b1ff-7484-7484-7484-15261f42614d}
                              (0x3a26b1ff, 0x7484, 0x7484, 0x74, 0x84, 0x15, 0x26, 0x1f, 0x42, 0x61, 0x4d),
                              TraceLoggingOptionMicrosoftTelemetry());
+
+std::string GetCpuModel() {
+  try {
+    HKEY key{};
+    if (::RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                        "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                        0,
+                        KEY_READ,
+                        &key) != ERROR_SUCCESS) {
+      return "unknown";
+    }
+
+    char cpu_model[256]{};
+    DWORD value_type = REG_SZ;
+    DWORD size = sizeof(cpu_model);
+    const LSTATUS status = ::RegQueryValueExA(key,
+                                              "ProcessorNameString",
+                                              nullptr,
+                                              &value_type,
+                                              reinterpret_cast<LPBYTE>(cpu_model),
+                                              &size);
+    ::RegCloseKey(key);
+
+    if (status != ERROR_SUCCESS || value_type != REG_SZ || size == 0) {
+      return "unknown";
+    }
+
+    cpu_model[sizeof(cpu_model) - 1] = '\0';
+    return cpu_model[0] != '\0' ? std::string(cpu_model) : std::string("unknown");
+  } catch (...) {
+    return "unknown";
+  }
+}
+
+uint32_t GetProcessorCount() {
+  SYSTEM_INFO system_info{};
+  ::GetSystemInfo(&system_info);
+  return static_cast<uint32_t>(system_info.dwNumberOfProcessors);
+}
+
+uint32_t GetTotalMemoryMB() {
+  MEMORYSTATUSEX memory_status{};
+  memory_status.dwLength = sizeof(memory_status);
+  if (::GlobalMemoryStatusEx(&memory_status) == 0) {
+    return 0;
+  }
+
+  return static_cast<uint32_t>(memory_status.ullTotalPhys / (1024 * 1024));
+}
 
 std::string ConvertWideStringToUtf8(const std::wstring& wide) {
   if (wide.empty())
@@ -325,6 +375,9 @@ void WindowsTelemetry::LogProcessInfo() const {
   isRedist = false;
 #endif
   const std::string service_names = GetServiceNamesForCurrentProcess();
+  const std::string cpu_model = GetCpuModel();
+  const uint32_t processor_count = GetProcessorCount();
+  const uint32_t total_memory_mb = GetTotalMemoryMB();
   TraceLoggingWrite(telemetry_provider_handle,
                     "ProcessInfo",
                     TraceLoggingBool(true, "UTCReplace_AppSessionGuid"),
@@ -334,6 +387,9 @@ void WindowsTelemetry::LogProcessInfo() const {
                     // Telemetry info
                     TraceLoggingUInt8(0, "schemaVersion"),
                     TraceLoggingString(ORT_VERSION, "runtimeVersion"),
+                    TraceLoggingString(cpu_model.c_str(), "cpuModel"),
+                    TraceLoggingUInt32(processor_count, "processorCount"),
+                    TraceLoggingUInt32(total_memory_mb, "totalMemoryMB"),
                     TraceLoggingBool(IsDebuggerPresent(), "isDebuggerAttached"),
                     TraceLoggingBool(isRedist, "isRedist"),
                     TraceLoggingString(ORT_CALLER_FRAMEWORK, "frameworkName"),
