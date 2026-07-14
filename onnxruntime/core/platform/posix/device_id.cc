@@ -4,11 +4,9 @@
 #include "core/platform/posix/device_id.h"
 
 #include "core/common/common.h"
+#include "core/platform/telemetry_guid.h"
 
 #include <fstream>
-#include <sstream>
-#include <random>
-#include <iomanip>
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
@@ -51,34 +49,6 @@ std::string DeviceId::GetStatusString() {
     default:
       return "Unknown";
   }
-}
-
-std::string DeviceId::GenerateUUID() {
-  // Draw the UUID fields directly from std::random_device -- a non-deterministic,
-  // CSPRNG-backed source on the POSIX platforms this file targets (glibc/bionic/
-  // libc++ draw from getrandom or /dev/urandom). Seeding a std::mt19937 from a
-  // single random_device value would cap the entropy at 32 bits and make device
-  // ids collide across a large fleet (birthday-bound ~77k devices), so each field
-  // is sourced straight from the device. random_device::operator() spans the full
-  // unsigned int (>= 32-bit) range.
-  std::random_device rd;
-
-  uint32_t data1 = rd();
-  uint16_t data2 = static_cast<uint16_t>(rd() & 0xFFFF);
-  uint16_t data3 = static_cast<uint16_t>((rd() & 0x0FFF) | 0x4000);  // Version 4
-  uint16_t data4 = static_cast<uint16_t>((rd() & 0x3FFF) | 0x8000);  // Variant 1
-  uint16_t data5a = static_cast<uint16_t>(rd() & 0xFFFF);
-  uint32_t data5b = rd();
-
-  std::ostringstream oss;
-  oss << std::hex << std::setfill('0')
-      << std::setw(8) << data1 << '-'
-      << std::setw(4) << data2 << '-'
-      << std::setw(4) << data3 << '-'
-      << std::setw(4) << data4 << '-'
-      << std::setw(4) << data5a
-      << std::setw(8) << data5b;
-  return oss.str();
 }
 
 bool DeviceId::IsValidGUID(const std::string& str) {
@@ -197,7 +167,7 @@ void DeviceId::InitializeInternal() {
     }
 
     // Generate new device ID
-    device_id_ = GenerateUUID();
+    device_id_ = GenerateGuidV4();
 
     // Create directory tree
     CreateDirectoryTree(dir_path);

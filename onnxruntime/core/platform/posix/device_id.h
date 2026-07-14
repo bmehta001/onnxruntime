@@ -53,9 +53,6 @@ class DeviceId {
 
   void InitializeInternal();
 
-  // Generate a random UUID v4
-  static std::string GenerateUUID();
-
   // Validate GUID format (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
   static bool IsValidGUID(const std::string& str);
 

@@ -4,6 +4,7 @@
 #include "core/platform/posix/telemetry.h"
 #include "core/platform/posix/device_id.h"
 #include "core/platform/telemetry_environment.h"
+#include "core/platform/telemetry_guid.h"
 #include "core/platform/telemetry_redaction.h"
 
 #ifdef __APPLE__
@@ -219,29 +220,6 @@ class EventBuilder {
 }
 
 namespace {
-
-// Generate a random v4 UUID as a hex string (e.g. "f81d4fae-7dec-41d0-8f12-00a0c91e6bf6").
-std::string GenerateGuidV4() {
-  // Draw the 128 bits directly from a CSPRNG-backed std::random_device rather
-  // than seeding a PRNG, so the full entropy is preserved and the value is
-  // non-predictable.
-  std::random_device rd;
-  uint64_t hi = (static_cast<uint64_t>(rd()) << 32) | rd();
-  uint64_t lo = (static_cast<uint64_t>(rd()) << 32) | rd();
-  // Set version (4) and variant (10xx) bits.
-  hi = (hi & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;
-  lo = (lo & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;
-
-  char buf[37];
-  std::snprintf(buf, sizeof(buf),
-                "%08x-%04x-%04x-%04x-%012llx",
-                static_cast<uint32_t>(hi >> 32),
-                static_cast<uint32_t>((hi >> 16) & 0xFFFF),
-                static_cast<uint32_t>(hi & 0xFFFF),
-                static_cast<uint32_t>(lo >> 48),
-                static_cast<unsigned long long>(lo & 0xFFFFFFFFFFFFULL));
-  return std::string(buf);
-}
 
 const std::string& GetAppSessionGuid() {
   static const std::string guid = GenerateGuidV4();
