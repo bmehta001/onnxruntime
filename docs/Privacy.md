@@ -19,6 +19,8 @@ Telemetry is turned **ON** by default in the official builds ([see here](../READ
 
 **Non-Windows (Linux, macOS, Android, iOS).** These platforms use the cross-platform 1DS SDK ([cpp_client_telemetry](https://github.com/microsoft/cpp_client_telemetry)) to send the same trace events to Microsoft's telemetry backend over HTTPS. As on Windows, and based on user consent, this data is handled following GDPR and privacy regulations for anonymity and data access controls. WebAssembly builds are not supported and include no telemetry.
 
+**Error-message scrubbing.** When an error message is included in a trace event, filesystem paths are removed before transmission on every platform: everything from the first path anchor (a Windows or POSIX path, absolute or relative) to the end of the message is replaced with `[path]`, so user names and directory layout — including paths that contain spaces — are never sent. This matches ONNX Runtime GenAI.
+
 For the ways to disable telemetry, see the [Disabling Telemetry](#disabling-telemetry) section below.
 
 ### Disabling Telemetry

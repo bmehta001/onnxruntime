@@ -11,10 +11,10 @@ namespace onnxruntime {
 namespace test {
 
 // The scrubber is anchor-based: it finds the FIRST filesystem-path anchor (drive prefix, UNC prefix,
-// home prefix, or a >=2-segment POSIX path) and replaces everything from that anchor to the end of the
-// message with a single "[path]" placeholder. Redacting to end-of-message -- rather than classifying
-// each whitespace-delimited token -- is what makes a space-separated user name (C:\Users\First Last\...)
-// impossible to leak.
+// home prefix, a relative Windows path with >=2 '\'-delimited segments, or a >=2-segment POSIX path) and
+// replaces everything from that anchor to the end of the message with a single "[path]" placeholder.
+// Redacting to end-of-message -- rather than classifying each whitespace-delimited token -- is what makes
+// a space-separated user name (C:\Users\First Last\...) impossible to leak.
 
 TEST(TelemetryRedactionTest, EmptyAndNoPath) {
   EXPECT_EQ(ScrubStringForTelemetry(""), "");
@@ -71,6 +71,8 @@ TEST(TelemetryRedactionTest, HomeUsernameNeverLeaksAcrossVariants) {
       "/home/./alice/model.onnx",
       "input:/home/alice/secret/m.onnx",
       "file:///home/alice/secret/model.onnx",
+      "Users\\alice\\model.onnx",
+      "at proj\\alice\\weights\\m.onnx",
   };
   for (const char* in : inputs) {
     const std::string out = ScrubStringForTelemetry(in);
@@ -86,10 +88,23 @@ TEST(TelemetryRedactionTest, MultiSegmentRelativePathReplaced) {
   EXPECT_EQ(ScrubStringForTelemetry("x/y/z/"), "x[path]");
 }
 
+TEST(TelemetryRedactionTest, RelativeWindowsPathReplaced) {
+  // A drive-less relative Windows path (>= 2 '\'-delimited segments) has no C:\ / UNC / home prefix to
+  // anchor on, but is still a path: it anchors at the first backslash and redacts to end-of-message, so
+  // the user name in the second segment cannot leak.
+  EXPECT_EQ(ScrubStringForTelemetry("a\\b\\c"), "a[path]");
+  EXPECT_EQ(ScrubStringForTelemetry("Users\\alice\\model.onnx"), "Users[path]");
+  EXPECT_EQ(ScrubStringForTelemetry("Load Users\\bob\\m.onnx failed"), "Load Users[path]");
+}
+
 TEST(TelemetryRedactionTest, SingleSegmentAndNonPathSlashesKept) {
   // A single "/x" segment is not enough to anchor a path, so ordinary text with slashes is preserved.
   EXPECT_EQ(ScrubStringForTelemetry("models/foo.onnx"), "models/foo.onnx");
   EXPECT_EQ(ScrubStringForTelemetry("ratio 3/4 and and/or"), "ratio 3/4 and and/or");
+  // A single backslash is likewise not a path anchor, so a Windows account name (DOMAIN\user) and other
+  // one-backslash tokens are kept verbatim rather than over-redacted.
+  EXPECT_EQ(ScrubStringForTelemetry("domain\\user"), "domain\\user");
+  EXPECT_EQ(ScrubStringForTelemetry("read\\write access"), "read\\write access");
 }
 
 TEST(TelemetryRedactionTest, LengthIsCappedAfterScrub) {
