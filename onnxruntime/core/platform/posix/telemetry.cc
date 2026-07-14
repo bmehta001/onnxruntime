@@ -24,7 +24,6 @@
 
 #if defined(__linux__) || defined(__ANDROID__)
 #include <fstream>
-#include <sys/sysinfo.h>
 #endif
 
 #include <cctype>
@@ -249,51 +248,9 @@ const std::string& GetAppSessionGuid() {
   return guid;
 }
 
-std::string GetCpuModel() {
-#if defined(__APPLE__)
-  char buf[256]{};
-  size_t len = sizeof(buf);
-  if (sysctlbyname("machdep.cpu.brand_string", buf, &len, nullptr, 0) == 0) {
-    return std::string(buf, len > 0 ? len - 1 : 0);
-  }
-  return "unknown";
-#else
-  std::ifstream ifs("/proc/cpuinfo");
-  std::string line;
-  while (std::getline(ifs, line)) {
-    if (line.find("model name") == 0) {
-      auto pos = line.find(':');
-      if (pos != std::string::npos) {
-        auto result = line.substr(pos + 1);
-        auto start = result.find_first_not_of(" \t");
-        return start != std::string::npos ? result.substr(start) : result;
-      }
-    }
-  }
-  return "unknown";
-#endif
-}
-
 int64_t GetProcessorCount() {
   auto n = sysconf(_SC_NPROCESSORS_ONLN);
   return n > 0 ? static_cast<int64_t>(n) : 0;
-}
-
-int64_t GetTotalMemoryMB() {
-#if defined(__APPLE__)
-  int64_t mem = 0;
-  size_t len = sizeof(mem);
-  if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0) {
-    return mem / (1024 * 1024);
-  }
-  return 0;
-#else
-  struct sysinfo si{};
-  if (sysinfo(&si) == 0) {
-    return static_cast<int64_t>((static_cast<uint64_t>(si.totalram) * si.mem_unit) / (1024 * 1024));
-  }
-  return 0;
-#endif
 }
 
 }  // namespace
