@@ -13,7 +13,6 @@
 #include <string>
 #include <vector>
 #include "core/common/logging/logging.h"
-#include "core/platform/telemetry_environment.h"
 #include "core/platform/telemetry_redaction.h"
 #include "onnxruntime_config.h"
 
@@ -262,13 +261,6 @@ std::mutex WindowsTelemetry::callbacks_mutex_;
 
 WindowsTelemetry::WindowsTelemetry() {
   std::lock_guard<std::mutex> lock(mutex_);
-  // Suppress all telemetry when explicitly disabled via ORT_TELEMETRY_DISABLED or when running in a
-  // CI / build-pipeline environment (matches Olive / Foundry Local): never register the ETW provider,
-  // so every Log* early-returns (global_register_count_ stays 0) and no events are emitted.
-  if (ShouldSuppressTelemetry()) {
-    enabled_ = false;
-    return;
-  }
   if (global_register_count_ == 0) {
     // TraceLoggingRegister is fancy in that you can only register once GLOBALLY for the whole process
     HRESULT hr = TraceLoggingRegisterEx(telemetry_provider_handle, ORT_TL_EtwEnableCallback, nullptr);

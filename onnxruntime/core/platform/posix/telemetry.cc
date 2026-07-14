@@ -386,7 +386,7 @@ void PosixTelemetry::Initialize() {
   {
     std::string cache_dir = DeviceId::EnsureStorageDirectory();
     if (!cache_dir.empty()) {
-      std::string cache_path = cache_dir + "/telemetry_cache.db";
+      std::string cache_path = cache_dir + "/onnxruntime.db";
       config[CFG_STR_CACHE_FILE_PATH] = cache_path;
     }
   }
