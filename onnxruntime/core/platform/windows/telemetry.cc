@@ -63,36 +63,32 @@ TRACELOGGING_DEFINE_PROVIDER(telemetry_provider_handle, "Microsoft.ML.ONNXRuntim
                              TraceLoggingOptionMicrosoftTelemetry());
 
 std::string GetCpuModel() {
-  try {
-    HKEY key{};
-    if (::RegOpenKeyExA(HKEY_LOCAL_MACHINE,
-                        "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
-                        0,
-                        KEY_READ,
-                        &key) != ERROR_SUCCESS) {
-      return "unknown";
-    }
-
-    char cpu_model[256]{};
-    DWORD value_type = REG_SZ;
-    DWORD size = sizeof(cpu_model);
-    const LSTATUS status = ::RegQueryValueExA(key,
-                                              "ProcessorNameString",
-                                              nullptr,
-                                              &value_type,
-                                              reinterpret_cast<LPBYTE>(cpu_model),
-                                              &size);
-    ::RegCloseKey(key);
-
-    if (status != ERROR_SUCCESS || value_type != REG_SZ || size == 0) {
-      return "unknown";
-    }
-
-    cpu_model[sizeof(cpu_model) - 1] = '\0';
-    return cpu_model[0] != '\0' ? std::string(cpu_model) : std::string("unknown");
-  } catch (...) {
+  HKEY key{};
+  if (::RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                      "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                      0,
+                      KEY_READ,
+                      &key) != ERROR_SUCCESS) {
     return "unknown";
   }
+
+  char cpu_model[256]{};
+  DWORD value_type = REG_SZ;
+  DWORD size = sizeof(cpu_model);
+  const LSTATUS status = ::RegQueryValueExA(key,
+                                            "ProcessorNameString",
+                                            nullptr,
+                                            &value_type,
+                                            reinterpret_cast<LPBYTE>(cpu_model),
+                                            &size);
+  ::RegCloseKey(key);
+
+  if (status != ERROR_SUCCESS || value_type != REG_SZ || size == 0) {
+    return "unknown";
+  }
+
+  cpu_model[sizeof(cpu_model) - 1] = '\0';
+  return cpu_model[0] != '\0' ? std::string(cpu_model) : std::string("unknown");
 }
 
 uint32_t GetProcessorCount() {
