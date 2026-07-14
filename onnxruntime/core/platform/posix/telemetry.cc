@@ -313,12 +313,17 @@ void PosixTelemetry::LogEventAsync(Microsoft::Applications::Events::EventPropert
 void PosixTelemetry::Initialize() {
   std::unique_lock<std::shared_mutex> lock(mutex_);
 
-  // Suppress all telemetry when explicitly disabled via ORT_TELEMETRY_DISABLED or when running in a
-  // CI / build-pipeline environment (matches Olive / Foundry Local): skip creating the 1DS uploader
-  // entirely so no events are emitted.
-  if (ShouldSuppressTelemetry()) {
+  // In a CI / build-pipeline environment, collect nothing at all: skip creating the 1DS uploader
+  // entirely so no events (not even ProcessInfo) are emitted and no device id is written.
+  if (IsRunningInCI()) {
     enabled_.store(false, std::memory_order_release);
     return;
+  }
+
+  // ORT_TELEMETRY_DISABLED suppresses the usage events but still creates the uploader, so the one-shot
+  // ProcessInfo event is still emitted. DisableTelemetryEvents() behaves the same way at runtime.
+  if (IsTelemetryDisabledByEnvVar()) {
+    enabled_.store(false, std::memory_order_release);
   }
 
   // NOTE: On Android, the Java layer must be initialized before calling this:
@@ -692,9 +697,10 @@ uint64_t PosixTelemetry::Keyword() const {
 }
 
 void PosixTelemetry::LogProcessInfo() const {
-  // LogProcessInfo only collects system metadata, but it must still honor the
-  // runtime opt-out (DisableTelemetryEvents) like every other event.
-  if (!IsEnabled()) {
+  // ProcessInfo fires whenever telemetry is initialized (i.e. not in a CI build), even when the usage
+  // events are disabled via ORT_TELEMETRY_DISABLED or DisableTelemetryEvents(). It only needs a live
+  // logger; CI suppression already prevents one from being created.
+  if (logger_.load(std::memory_order_acquire) == nullptr) {
     return;
   }
 
