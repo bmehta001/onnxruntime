@@ -53,14 +53,11 @@ class DeviceId {
 
   void InitializeInternal();
 
-  // Generate a random UUID v4
-  static std::string GenerateUUID();
-
   // Validate GUID format (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
   static bool IsValidGUID(const std::string& str);
 
-  // Create directory tree recursively using platform APIs
-  static void CreateDirectoryTree(const std::string& path);
+  // Create directory tree recursively using platform APIs.
+  static bool CreateDirectoryTree(const std::string& path, bool leaf = true);
 
   static constexpr const char* kDeviceIdDir = "Microsoft/DeveloperTools/.onnxruntime";
   static constexpr const char* kFileName = "deviceid";

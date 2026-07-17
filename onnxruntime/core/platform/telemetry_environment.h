@@ -85,6 +85,13 @@ inline bool IsRunningInCI() {
   return false;
 }
 
+// True if ORT_RUNNING_UNIT_TESTS is set to a truthy value. ORT's own unit-test entry points set this
+// before creating any environment, so local (non-CI) test runs never initialize the telemetry uploader
+// or emit events. This is an internal harness signal, not a user-facing opt-out.
+inline bool IsRunningUnitTests() {
+  return telemetry_detail::IsTruthyCiValue(telemetry_detail::GetTelemetryEnv("ORT_RUNNING_UNIT_TESTS"));
+}
+
 // True if ORT_TELEMETRY_DISABLED is set to a truthy value (1/true/yes/on/y, case-insensitive). This
 // is the explicit, cross-platform opt-out and is honored on every platform (a no-op only in the sense
 // that Windows ETW events are already inert without a listener).
@@ -94,10 +101,10 @@ inline bool IsTelemetryDisabledByEnvVar() {
   return value == "1" || value == "true" || value == "yes" || value == "on" || value == "y";
 }
 
-// True if telemetry should be fully suppressed for this process: either explicitly disabled via
-// ORT_TELEMETRY_DISABLED or running in a CI / build-pipeline environment.
+// True if telemetry should be fully suppressed for this process: explicitly disabled via
+// ORT_TELEMETRY_DISABLED, running in a CI / build-pipeline environment, or in ORT's unit-test harness.
 inline bool ShouldSuppressTelemetry() {
-  return IsTelemetryDisabledByEnvVar() || IsRunningInCI();
+  return IsTelemetryDisabledByEnvVar() || IsRunningInCI() || IsRunningUnitTests();
 }
 
 }  // namespace onnxruntime

@@ -104,18 +104,23 @@ else()
          "${ONNXRUNTIME_ROOT}/core/platform/device_discovery_default.cc")
 endif()
 
+# Raw /bigobj is a cl.exe option. Do not apply it to CUDA sources; nvcc treats a
+# standalone /bigobj as an input file on Windows ARM64 CUDA 13.1.
+set(onnxruntime_msvc_bigobj_compile_option
+    "$<$<AND:$<NOT:$<COMPILE_LANGUAGE:ASM_MARMASM>>,$<NOT:$<COMPILE_LANGUAGE:CUDA>>>:/bigobj>")
+
 if(onnxruntime_target_platform STREQUAL "ARM64EC")
     if (MSVC)
         link_directories("$ENV{VCINSTALLDIR}/Tools/MSVC/$ENV{VCToolsVersion}/lib/ARM64EC")
         link_directories("$ENV{VCINSTALLDIR}/Tools/MSVC/$ENV{VCToolsVersion}/ATLMFC/lib/ARM64EC")
         link_libraries(softintrin.lib)
-        add_compile_options("$<$<NOT:$<COMPILE_LANGUAGE:ASM_MARMASM>>:/bigobj>")
+        add_compile_options("${onnxruntime_msvc_bigobj_compile_option}")
     endif()
 endif()
 
 if(onnxruntime_target_platform STREQUAL "ARM64")
     if (MSVC)
-        add_compile_options("$<$<NOT:$<COMPILE_LANGUAGE:ASM_MARMASM>>:/bigobj>")
+        add_compile_options("${onnxruntime_msvc_bigobj_compile_option}")
     endif()
 endif()
 
@@ -160,9 +165,21 @@ if (onnxruntime_USE_TELEMETRY)
     set_target_properties(onnxruntime_common PROPERTIES COMPILE_FLAGS "/FI${ONNXRUNTIME_INCLUDE_DIR}/core/platform/windows/TraceLoggingConfigPrivate.h")
   else()
     target_compile_definitions(onnxruntime_common PRIVATE USE_POSIX_TELEMETRY)
-    # Optional tenant-token override, injected via a generated header (kept off the compiler command line).
-    if(onnxruntime_TELEMETRY_TENANT_TOKEN)
-      set(ONNXRUNTIME_TELEMETRY_TENANT_TOKEN_DEFINE "#define ORT_TELEMETRY_TENANT_TOKEN \"${onnxruntime_TELEMETRY_TENANT_TOKEN}\"")
+    # Optional tenant-token override written into a generated header in the build tree (kept off the
+    # compiler command line, so the token never appears in compile_commands.json or build logs). It may be
+    # supplied either as -DONNXRUNTIME_TELEMETRY_TENANT_TOKEN=... or via an
+    # ONNXRUNTIME_TELEMETRY_TENANT_TOKEN environment variable — the latter lets callers inject a token without
+    # it ever appearing on any command line. When unset, telemetry.cc uses the encoded in-repo default.
+    if(NOT ONNXRUNTIME_TELEMETRY_TENANT_TOKEN AND DEFINED ENV{ONNXRUNTIME_TELEMETRY_TENANT_TOKEN})
+      set(ONNXRUNTIME_TELEMETRY_TENANT_TOKEN "$ENV{ONNXRUNTIME_TELEMETRY_TENANT_TOKEN}")
+    endif()
+    # Ignore an unexpanded build-system macro (e.g. the literal "$(ONNXRUNTIME_TELEMETRY_TENANT_TOKEN)")
+    # so the build falls back to the in-repo default instead of embedding the macro text as a bogus token.
+    if(ONNXRUNTIME_TELEMETRY_TENANT_TOKEN MATCHES "^\\$\\(")
+      set(ONNXRUNTIME_TELEMETRY_TENANT_TOKEN "")
+    endif()
+    if(ONNXRUNTIME_TELEMETRY_TENANT_TOKEN)
+      set(ONNXRUNTIME_TELEMETRY_TENANT_TOKEN_DEFINE "#define ORT_TELEMETRY_TENANT_TOKEN \"${ONNXRUNTIME_TELEMETRY_TENANT_TOKEN}\"")
     else()
       set(ONNXRUNTIME_TELEMETRY_TENANT_TOKEN_DEFINE "")
     endif()

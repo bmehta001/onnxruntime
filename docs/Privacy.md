@@ -17,7 +17,9 @@ Telemetry is turned **ON** by default in the official builds ([see here](../READ
 
 **Windows.** The Windows provider uses the [TraceLogging](https://docs.microsoft.com/en-us/windows/win32/tracelogging/trace-logging-about) API for its implementation. This enables ONNX Runtime trace events to be collected by the operating system, and based on user consent, this data may be periodically sent to Microsoft servers following GDPR and privacy regulations for anonymity and data access controls. Windows ML and onnxruntime C APIs allow Trace Logging to be turned on/off (see [API pages](../README.md#api-documentation) for details); there are equivalent APIs in the C#, Python, and Java language bindings as well.
 
-**Non-Windows (Linux, macOS, Android, iOS).** These platforms use the cross-platform 1DS SDK ([cpp_client_telemetry](https://github.com/microsoft/cpp_client_telemetry)) to send the same trace events to Microsoft's telemetry backend over HTTPS. As on Windows, and based on user consent, this data is handled following GDPR and privacy regulations for anonymity and data access controls. WebAssembly builds are not supported and include no telemetry.
+**Non-Windows (Linux, macOS, Android, iOS).** These platforms use the cross-platform 1DS SDK (cpp_client_telemetry) to send the same trace events to Microsoft's telemetry backend over HTTPS. Based on user consent, this data is handled following GDPR and privacy regulations for anonymity and data access controls.
+
+For Linux and macOS, ONNX Runtime sends a product-salted hash of a locally generated per-user UUID as its device identifier. For Android and iOS, ONNX Runtime uses the platform device identifier provided by the 1DS SDK instead of creating a separate ONNX Runtime-generated mobile device id.
 
 For the ways to disable telemetry, see the [Disabling Telemetry](#disabling-telemetry) section below.
 
@@ -26,6 +28,5 @@ For the ways to disable telemetry, see the [Disabling Telemetry](#disabling-tele
 Telemetry can be disabled in any of these ways:
 
 - **Don't build it in.** The telemetry provider is only compiled when configuring with `--use_telemetry`, so a build configured without it collects no data.
-- **Automatically in CI / build pipelines.** When a well-known CI environment variable (`CI`, `TF_BUILD`, `GITHUB_ACTIONS`, `GITLAB_CI`, and others) is set to a truthy value, ONNX Runtime suppresses all telemetry on every platform — the non-Windows 1DS uploader is never created and the Windows ETW provider is never registered. This matches tools such as Olive and Foundry Local.
-- **At runtime, via environment variable.** Set `ORT_TELEMETRY_DISABLED=1` (also accepts `true`/`yes`/`on`/`y`, case-insensitive) before ONNX Runtime initializes. It is honored on every platform: the non-Windows provider skips creating the uploader and the Windows provider skips registering its ETW provider. The same variable is also honored by ONNX Runtime GenAI.
-- **At runtime, via the API.** The C API (and the C#, Python, and Java bindings) expose calls to turn telemetry on/off. (The Windows provider is passive regardless — events are only emitted while an external trace session is collecting.)
+- **At runtime, via environment variable (non-Windows).** Set `ORT_TELEMETRY_DISABLED=1` (also accepts `true`/`yes`/`on`/`y`, case-insensitive) before ONNX Runtime initializes to disable session, model, execution provider, performance, and error telemetry. ONNX Runtime may still send a minimal initialization event for aggregate heartbeat metrics.
+- **At runtime, via the API.** The C API (and the C#, Python, and Java bindings) expose calls to turn telemetry on/off for session, model, execution provider, performance, and error telemetry. On **Windows**, ETW events are still emitted if an external trace session is collecting.

@@ -110,5 +110,23 @@ TEST(TelemetryEnvironmentTest, CiDetectionSuppresses) {
   EXPECT_TRUE(ShouldSuppressTelemetry());
 }
 
+TEST(TelemetryEnvironmentTest, RunningUnitTestsSuppresses) {
+  // The unit-test entry point sets ORT_RUNNING_UNIT_TESTS process-wide; save/restore so this test can
+  // exercise both directions without leaking state to siblings.
+  ScopedEnvVar guard("ORT_RUNNING_UNIT_TESTS");
+
+  SetEnv("ORT_RUNNING_UNIT_TESTS", "1");
+  EXPECT_TRUE(IsRunningUnitTests());
+  EXPECT_TRUE(ShouldSuppressTelemetry());
+
+  // Only IsRunningUnitTests() is asserted in the negative direction; ShouldSuppressTelemetry() may
+  // still hold from a CI variable when this test itself runs in CI.
+  SetEnv("ORT_RUNNING_UNIT_TESTS", "0");
+  EXPECT_FALSE(IsRunningUnitTests());
+
+  UnsetEnv("ORT_RUNNING_UNIT_TESTS");
+  EXPECT_FALSE(IsRunningUnitTests());
+}
+
 }  // namespace test
 }  // namespace onnxruntime

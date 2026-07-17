@@ -4,12 +4,13 @@
 #include "core/platform/posix/device_id.h"
 
 #include "core/common/common.h"
+#include "core/platform/telemetry_guid.h"
 
+#include <algorithm>
 #include <fstream>
-#include <sstream>
-#include <random>
-#include <iomanip>
 #include <cstdint>
+#include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <vector>
 
@@ -53,34 +54,6 @@ std::string DeviceId::GetStatusString() {
   }
 }
 
-std::string DeviceId::GenerateUUID() {
-  // Draw the UUID fields directly from std::random_device -- a non-deterministic,
-  // CSPRNG-backed source on the POSIX platforms this file targets (glibc/bionic/
-  // libc++ draw from getrandom or /dev/urandom). Seeding a std::mt19937 from a
-  // single random_device value would cap the entropy at 32 bits and make device
-  // ids collide across a large fleet (birthday-bound ~77k devices), so each field
-  // is sourced straight from the device. random_device::operator() spans the full
-  // unsigned int (>= 32-bit) range.
-  std::random_device rd;
-
-  uint32_t data1 = rd();
-  uint16_t data2 = static_cast<uint16_t>(rd() & 0xFFFF);
-  uint16_t data3 = static_cast<uint16_t>((rd() & 0x0FFF) | 0x4000);  // Version 4
-  uint16_t data4 = static_cast<uint16_t>((rd() & 0x3FFF) | 0x8000);  // Variant 1
-  uint16_t data5a = static_cast<uint16_t>(rd() & 0xFFFF);
-  uint32_t data5b = rd();
-
-  std::ostringstream oss;
-  oss << std::hex << std::setfill('0')
-      << std::setw(8) << data1 << '-'
-      << std::setw(4) << data2 << '-'
-      << std::setw(4) << data3 << '-'
-      << std::setw(4) << data4 << '-'
-      << std::setw(4) << data5a
-      << std::setw(8) << data5b;
-  return oss.str();
-}
-
 bool DeviceId::IsValidGUID(const std::string& str) {
   if (str.length() != 36) return false;
 
@@ -109,7 +82,11 @@ std::string DeviceId::GetStorageDirectory() {
     struct passwd pwd;
     struct passwd* result = nullptr;
     const long sc = ::sysconf(_SC_GETPW_R_SIZE_MAX);
-    std::vector<char> buf(sc > 0 ? static_cast<size_t>(sc) : 16384);
+    constexpr size_t kDefaultPwBufferSize = 16384;
+    constexpr size_t kMaxPwBufferSize = 1 << 20;
+    const size_t pw_buffer_size =
+        sc > 0 ? std::min(static_cast<size_t>(sc), kMaxPwBufferSize) : kDefaultPwBufferSize;
+    std::vector<char> buf(pw_buffer_size);
     if (::getpwuid_r(::getuid(), &pwd, buf.data(), buf.size(), &result) == 0 &&
         result != nullptr && result->pw_dir != nullptr && result->pw_dir[0] != '\0') {
       home = result->pw_dir;
@@ -133,24 +110,46 @@ std::string DeviceId::GetStorageDirectory() {
 
 std::string DeviceId::EnsureStorageDirectory() {
   std::string dir = GetStorageDirectory();
-  if (!dir.empty()) {
-    CreateDirectoryTree(dir);
+  if (!dir.empty() && !CreateDirectoryTree(dir)) {
+    return "";
   }
   return dir;
 }
 
-void DeviceId::CreateDirectoryTree(const std::string& path) {
-  if (path.empty()) return;
+bool DeviceId::CreateDirectoryTree(const std::string& path, bool leaf) {
+  if (path.empty()) return false;
+
+  struct stat path_info{};
+  if (::lstat(path.c_str(), &path_info) == 0) {
+    if (leaf && S_ISLNK(path_info.st_mode)) {
+      return false;
+    }
+    if (::stat(path.c_str(), &path_info) != 0 || !S_ISDIR(path_info.st_mode)) {
+      return false;
+    }
+    if (leaf) {
+      ::chmod(path.c_str(), S_IRWXU);
+    }
+    return true;
+  }
+  if (errno != ENOENT) {
+    return false;
+  }
 
   size_t pos = path.find_last_of('/');
   if (pos != std::string::npos && pos > 0) {
-    CreateDirectoryTree(path.substr(0, pos));
+    if (!CreateDirectoryTree(path.substr(0, pos), false)) {
+      return false;
+    }
   }
 
-  // Owner-only (0700): this tree holds the persistent device id and the telemetry offline cache, so
-  // it should not be listable/traversable by other users. mkdir only sets the mode for directories
-  // it actually creates; pre-existing directories are left untouched.
-  mkdir(path.c_str(), 0700);
+  if (::mkdir(path.c_str(), S_IRWXU) != 0 && errno != EEXIST) {
+    return false;
+  }
+  if (::lstat(path.c_str(), &path_info) != 0 || (leaf && S_ISLNK(path_info.st_mode))) {
+    return false;
+  }
+  return ::stat(path.c_str(), &path_info) == 0 && S_ISDIR(path_info.st_mode);
 }
 
 void DeviceId::InitializeInternal() {
@@ -158,6 +157,10 @@ void DeviceId::InitializeInternal() {
   initialized_ = true;
 
   ORT_TRY {
+    // Keep an ephemeral fallback so persistence failures never expose the SDK's hardware-derived
+    // desktop identifier.
+    device_id_ = GenerateGuidV4();
+
     std::string dir_path = GetStorageDirectory();
     if (dir_path.empty()) {
       status_ = DeviceIdStatus::Failed;
@@ -168,6 +171,11 @@ void DeviceId::InitializeInternal() {
 
     // Try to read existing device ID
     {
+      struct stat file_info{};
+      if (::lstat(file_path.c_str(), &file_info) == 0 && S_ISLNK(file_info.st_mode)) {
+        status_ = DeviceIdStatus::Failed;
+        return;
+      }
       std::ifstream infile(file_path);
       if (infile.good()) {
         infile.seekg(0, std::ios::end);
@@ -196,28 +204,75 @@ void DeviceId::InitializeInternal() {
       }
     }
 
-    // Generate new device ID
-    device_id_ = GenerateUUID();
-
     // Create directory tree
-    CreateDirectoryTree(dir_path);
-
-    // Persist with owner-only (0600) permissions from creation. Using open() with mode 0600 (and
-    // fchmod to also tighten a pre-existing file) avoids the window where std::ofstream would create
-    // the file using the process umask and only chmod it afterwards — during which the device id
-    // could briefly be world-readable. fchmod runs before any write, so content is never exposed.
+    if (!CreateDirectoryTree(dir_path)) {
+      status_ = DeviceIdStatus::Failed;
+      return;
+    }
     const bool regenerated_from_corruption = (status_ == DeviceIdStatus::Corrupted);
-    const int fd = ::open(file_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    const std::string temp_path = file_path + ".tmp." + GenerateGuidV4();
+    int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    const int fd = ::open(temp_path.c_str(), flags, S_IRUSR | S_IWUSR);
     if (fd >= 0) {
       ::fchmod(fd, S_IRUSR | S_IWUSR);
-      const ssize_t written = ::write(fd, device_id_.data(), device_id_.size());
-      ::close(fd);
-      if (written == static_cast<ssize_t>(device_id_.size())) {
-        // Preserve Corrupted (defined as "invalid and regenerated") instead of overwriting it with
-        // New, so callers/telemetry can still observe that the persisted id had to be regenerated.
-        status_ = regenerated_from_corruption ? DeviceIdStatus::Corrupted : DeviceIdStatus::New;
-      } else {
+      const char* data = device_id_.data();
+      size_t remaining = device_id_.size();
+      while (remaining > 0) {
+        const ssize_t written = ::write(fd, data, remaining);
+        if (written <= 0) {
+          break;
+        }
+        data += written;
+        remaining -= static_cast<size_t>(written);
+      }
+      const int close_result = ::close(fd);
+      const bool wrote = remaining == 0 && close_result == 0;
+      if (!wrote) {
+        ::unlink(temp_path.c_str());
         status_ = DeviceIdStatus::Failed;
+      } else if (regenerated_from_corruption) {
+        if (::rename(temp_path.c_str(), file_path.c_str()) == 0) {
+          status_ = DeviceIdStatus::Corrupted;
+        } else {
+          ::unlink(temp_path.c_str());
+          status_ = DeviceIdStatus::Failed;
+        }
+      } else {
+        const int link_result = ::link(temp_path.c_str(), file_path.c_str());
+        const int link_error = errno;
+        ::unlink(temp_path.c_str());
+        if (link_result == 0) {
+          status_ = DeviceIdStatus::New;
+        } else if (link_error == EEXIST) {
+          // Another process won the first-run race. Its complete file was published atomically,
+          // so use that value instead of allowing the persisted id to flap.
+          struct stat file_info{};
+          std::ifstream winner;
+          if (::lstat(file_path.c_str(), &file_info) == 0 && !S_ISLNK(file_info.st_mode)) {
+            winner.open(file_path);
+          }
+          std::string content;
+          if (winner.good() && std::getline(winner, content)) {
+            while (!content.empty() &&
+                   (content.back() == '\n' || content.back() == '\r' || content.back() == ' ')) {
+              content.pop_back();
+            }
+          }
+          if (IsValidGUID(content)) {
+            device_id_ = content;
+            status_ = DeviceIdStatus::Existing;
+          } else {
+            status_ = DeviceIdStatus::Failed;
+          }
+        } else {
+          status_ = DeviceIdStatus::Failed;
+        }
       }
     } else {
       status_ = DeviceIdStatus::Failed;

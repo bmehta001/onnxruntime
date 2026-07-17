@@ -148,7 +148,6 @@ class PosixTelemetry : public Telemetry {
   std::string GetDeviceClass() const;
   static std::string GetArchitecture();
   static int64_t GetTotalMemoryMB();
-  static std::string GetLocale();
 
   // Safe async event logging.
   void LogEventAsync(::Microsoft::Applications::Events::EventProperties&& props) const;
@@ -185,9 +184,6 @@ class PosixTelemetry : public Telemetry {
   // Global registration count for singleton behavior
   static std::atomic<uint32_t> global_register_count_;
   static std::mutex global_mutex_;
-
-  // Make EventBuilder a friend so it can access projection_
-  friend class EventBuilder;
 };
 
 }  // namespace onnxruntime
