@@ -14,6 +14,9 @@
 // 1DS SDK
 #include <LogManagerProvider.hpp>
 #include <ILogConfiguration.hpp>
+#if defined(__ANDROID__)
+#include "http/HttpClient_Android.hpp"
+#endif
 
 #include <unistd.h>
 #include <sys/resource.h>
@@ -228,10 +231,16 @@ class EventBuilder {
 
   // Helper for batch size duration map
   EventBuilder& AddBatchSizeDurations(const std::unordered_map<int64_t, long long>& durations) {
+    std::string result;
     for (const auto& [batch_size, duration] : durations) {
-      std::string key = "batchSize_" + std::to_string(batch_size);
-      props_.SetProperty(key, static_cast<int64_t>(duration));
+      if (!result.empty()) {
+        result += ", ";
+      }
+      result += std::to_string(batch_size);
+      result += ": ";
+      result += std::to_string(duration);
     }
+    props_.SetProperty("totalRunDurationPerBatchSize", result);
     return *this;
   }
 
@@ -350,11 +359,14 @@ void PosixTelemetry::Initialize() {
     enabled_.store(false, std::memory_order_release);
   }
 
-  // NOTE: On Android, the Java layer must be initialized before calling this:
-  //   System.loadLibrary("maesdk");
-  //   new HttpClient(getApplicationContext());
-  //   OfflineRoom.connectContext(getApplicationContext());  // if using Room DB
-  // See cpp_client_telemetry/docs/cpp-start-android.md for details.
+  // The official Android AAR initializes the SDK's Java HttpClient before ORT is loaded. Native-only
+  // integrators must provide the same application-context initialization before creating an OrtEnv.
+#if defined(__ANDROID__)
+  if (!HttpClient_Android::GetClientInstance()) {
+    ORT_TELEMETRY_WARN("Android telemetry is waiting for the 1DS Java HttpClient");
+    return;
+  }
+#endif
 
   // Create SDK configuration — stored as member because LogManagerImpl holds a reference
   // and the configuration must remain valid for the lifetime of the log manager.
@@ -368,7 +380,9 @@ void PosixTelemetry::Initialize() {
   // Shutdown non-blocking and avoids adding exit latency to host apps.
   config[CFG_INT_MAX_TEARDOWN_TIME] = 0;
 
-  // Configure cache for offline scenarios — use same directory as device ID storage
+#if !defined(__ANDROID__)
+  // Configure the desktop cache in the same directory as device ID storage. Android's Java
+  // HttpClient supplies the app-private cache directory to 1DS.
   {
     std::string cache_dir = DeviceId::EnsureStorageDirectory();
     if (!cache_dir.empty()) {
@@ -376,6 +390,7 @@ void PosixTelemetry::Initialize() {
       config[CFG_STR_CACHE_FILE_PATH] = cache_path;
     }
   }
+#endif
 
   // Configure RAM queue for async batching
   config[CFG_INT_RAM_QUEUE_SIZE] = 512 * 1024;  // 512KB RAM queue
@@ -423,7 +438,8 @@ void PosixTelemetry::Initialize() {
 #else
   // Desktop: send a hashed version of our persistent UUID (the "c:" prefix marks it as a
   // caller-supplied identifier); the raw UUID itself is never transmitted.
-  std::string raw_device_id = DeviceId::Instance().GetValue();
+  auto& device_id = DeviceId::Instance();
+  std::string raw_device_id = device_id.GetValue();
   if (!raw_device_id.empty()) {
     logger->GetSemanticContext()->SetDeviceId("c:" + HashDeviceId(raw_device_id));
   }
@@ -719,6 +735,12 @@ void PosixTelemetry::LogProcessInfo() const {
     return;
   }
 
+#if !defined(__ANDROID__) && !(defined(__APPLE__) && TARGET_OS_IOS)
+  if (DeviceId::Instance().GetStatus() == DeviceIdStatus::Failed) {
+    ORT_TELEMETRY_WARN("Failed to persist telemetry device ID; using an in-memory identifier");
+  }
+#endif
+
   auto builder = EventBuilder("ProcessInfo", EventPriority::CRITICAL)
                      .AddString("runtimeVersion", ORT_VERSION)
 #if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IOS)
@@ -731,7 +753,7 @@ void PosixTelemetry::LogProcessInfo() const {
                      .AddString("architecture", GetArchitecture())
                      .AddString("cpuModel", GetCpuModel())
                      .AddString("deviceClass", GetDeviceClass())
-                     .AddInt32("cpuCount", GetProcessorCount())
+                     .AddInt32("processorCount", GetProcessorCount())
                      .AddInt64("totalMemoryMB", GetTotalMemoryMB());
 
   LogEventAsync(builder.Build());
@@ -981,10 +1003,11 @@ void PosixTelemetry::LogProviderOptions(
   }
 
   std::string event_name = captureState ? "ProviderOptions_CaptureState" : "ProviderOptions";
+  const std::string scrubbed_provider_options = ScrubStringForTelemetry(provider_options_string);
 
   auto event = EventBuilder(std::move(event_name), EventPriority::NORMAL)
                    .AddString("providerId", provider_id)
-                   .AddString("providerOptions", provider_options_string)
+                   .AddString("providerOptions", scrubbed_provider_options)
                    .Build();
 
   LogEventAsync(std::move(event));
@@ -1102,9 +1125,10 @@ void PosixTelemetry::LogRegisterEpLibraryWithLibPath(const std::string& registra
     return;
   }
 
+  const std::string scrubbed_lib_path = ScrubStringForTelemetry(lib_path);
   auto event = EventBuilder("RegisterEpLibraryWithLibPath", EventPriority::NORMAL)
                    .AddString("registrationName", registration_name)
-                   .AddString("libPath", lib_path)
+                   .AddString("libPath", scrubbed_lib_path)
                    .Build();
 
   LogEventAsync(std::move(event));
