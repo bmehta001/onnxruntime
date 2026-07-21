@@ -314,11 +314,9 @@ PosixTelemetry::~PosixTelemetry() {
     ORT_TRY {
       Shutdown();
     }
-    ORT_CATCH(const std::exception& ex) {
-      // Don't throw from a destructor.
-      ORT_HANDLE_EXCEPTION([&]() {
-        ORT_TELEMETRY_WARN("Error during telemetry shutdown: " << ex.what());
-      });
+    ORT_CATCH(...) {
+      // Don't throw from a destructor. This can run during process teardown after logging and/or
+      // 1DS static state has started shutting down, so avoid touching any other infrastructure here.
     }
   }
 }
