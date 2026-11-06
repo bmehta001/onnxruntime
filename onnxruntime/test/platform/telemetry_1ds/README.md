@@ -55,6 +55,9 @@ or forced termination.
 | `threaded` | Same checks after singleton initialization on an application thread. |
 | `retry` | Collector returns 503 once; the real SDK retries and succeeds. |
 | `pending` | Parent receives the full native request and withholds its response. Child exits normally, and provider teardown cancels and drains the request. |
+| `exception`, `exception-nonstandard` | An upload-start listener throws before HTTP callback registration. The original reserved event must upload on retry, subsequent events must succeed, and teardown must drain normally. |
+| `exception-exit`, `exception-exit-nonstandard` | Exit immediately after the failed preparation task. Teardown must finish with no HTTP requests, rather than spinning on a stranded active upload. |
+| `send-exception`, `complete-then-throw` | The HTTP adapter throws before sending, or delivers a synchronous failure callback and then throws. The SDK must complete exactly once and retry the original event through the native transport. |
 | `disabled` | Environment opt-out creates no SDK transport, files, or requests. |
 | `unit-disabled` | Unit-test suppression creates no SDK transport, files, or requests. |
 | `ci-disabled` | CI suppression creates no SDK transport, files, or requests. |
@@ -88,6 +91,29 @@ These tests use local HTTP, not TLS. They do not replace certificate-policy
 tests, native platform coverage beyond the selected transport, or the distinct Windows
 `ExitProcess`/DLL-process-detach regression introduced by #33291. A zero SDK
 teardown-upload budget does not bound cancellation or worker draining.
+
+## Upload exception safety
+
+The downstream SDK patch retires uploads abandoned before HTTP callback
+registration, including when record cleanup itself throws. Registered HTTP
+callbacks retain responsibility for terminal completion; preparation recovery
+must not retire their uploads or release records a second time.
+
+`onnxruntime_telemetry_upload_exception_test` checks both scheduled and immediate
+upload entry points with standard and nonstandard exceptions, throwing record
+cleanup, delayed HTTP ownership, synchronous completion, and an exception after
+synchronous completion. It asserts active-upload counts and context release
+before exercising shutdown. Its HTTP module rejects all network activity.
+The preparation-retry modes additionally exercise the real SDK's `EVT_SENDING`
+stage and record reservation/release against the loopback collector. The exit
+modes verify teardown without first retrying the abandoned upload; the HTTP
+handoff modes guard against duplicate completion.
+Exception regressions are registered only when ORT exceptions are enabled.
+
+```text
+cmake --build . --config RelWithDebInfo --target onnxruntime_telemetry_upload_exception_test onnxruntime_telemetry_transport_test onnxruntime_telemetry_transport_fixture
+ctest -C RelWithDebInfo -R "^onnxruntime_telemetry_(upload_exception|transport_(exception.*|send-exception|complete-then-throw))_test$" --output-on-failure
+```
 
 ## Windows process termination
 

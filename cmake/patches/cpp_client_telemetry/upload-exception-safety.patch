@@ -1,0 +1,162 @@
+diff --git a/lib/http/HttpClientManager.cpp b/lib/http/HttpClientManager.cpp
+--- a/lib/http/HttpClientManager.cpp
++++ b/lib/http/HttpClientManager.cpp
+@@ -367,16 +367,20 @@
+     void HttpClientManager::handleSendRequest(EventsUploadContextPtr const& ctx)
+     {
+         auto registry = m_callbackRegistry;
+-        HttpCallback *callback = new HttpCallback(ctx, registry);
++        auto pendingCallback = std::unique_ptr<HttpCallback>(new HttpCallback(ctx, registry));
++        HttpCallback *callback = pendingCallback.get();
+         auto completion = callback->m_completion;
+-        {
+-            LOCKGUARD(registry->mutex);
+-            registry->callbacks.push_back(callback);
+-        }
+
+         LOG_INFO("Uploading %u event(s) of priority %d (%s) for %u tenant(s) in HTTP request %s (approx. %u bytes)...",
+             static_cast<unsigned>(ctx->recordIdsAndTenantIds.size()), ctx->latency, latencyToStr(ctx->latency), static_cast<unsigned>(ctx->packageIds.size()),
+             ctx->httpRequest->GetId().c_str(), static_cast<unsigned>(ctx->httpRequest->GetSizeEstimate()));
++
++        {
++            LOCKGUARD(registry->mutex);
++            registry->callbacks.push_back(callback);
++            ctx->httpRequestRegistered = true;
++            pendingCallback.release();
++        }
+
+ #if HAVE_EXCEPTIONS
+         try
+diff --git a/lib/system/Contexts.hpp b/lib/system/Contexts.hpp
+--- a/lib/system/Contexts.hpp
++++ b/lib/system/Contexts.hpp
+@@ -111,6 +111,7 @@
+         // Sending
+         IHttpRequest*                        httpRequest = nullptr;
+         std::string                          httpRequestId;
++        bool                                 httpRequestRegistered = false;
+
+         // Receiving
+         IHttpResponse*                       httpResponse = nullptr;
+diff --git a/lib/system/TelemetrySystem.cpp b/lib/system/TelemetrySystem.cpp
+--- a/lib/system/TelemetrySystem.cpp
++++ b/lib/system/TelemetrySystem.cpp
+@@ -174,6 +174,7 @@
+         storage.storeRecordFailed >> stats.onIncomingEventFailed;
+
+         tpm.initiateUpload >> storage.retrieveEvents;
++        tpm.releaseFailedUpload >> storage.releaseRecords;
+
+         storage.retrievedEvent >> packager.addEventToPackage;
+         storage.retrievalFinished >> packager.finalizePackage;
+diff --git a/lib/tpm/TransmissionPolicyManager.cpp b/lib/tpm/TransmissionPolicyManager.cpp
+--- a/lib/tpm/TransmissionPolicyManager.cpp
++++ b/lib/tpm/TransmissionPolicyManager.cpp
+@@ -7,6 +7,7 @@
+ #include "TransmitProfiles.hpp"
+ #include "utils/Utils.hpp"
+
++#include <exception>
+ #include <limits>
+
+ namespace MAT_NS_BEGIN {
+@@ -256,8 +257,68 @@
+
+         auto ctx = m_system.createEventsUploadContext();
+         ctx->requestedMinLatency = requestedLatency;
++        startUpload(ctx);
++    }
++
++    void TransmissionPolicyManager::startUpload(EventsUploadContextPtr const& ctx)
++    {
+         addUpload(ctx);
+-        initiateUpload(ctx);
++#if HAVE_EXCEPTIONS
++        try
++        {
++#endif
++            initiateUpload(ctx);
++#if HAVE_EXCEPTIONS
++        }
++        catch (const std::exception& ex)
++        {
++            (void)ex;
++            LOG_ERROR("Upload preparation failed: %s", ex.what());
++            abandonUpload(ctx);
++        }
++        catch (...)
++        {
++            LOG_ERROR("Upload preparation failed with a non-standard exception");
++            abandonUpload(ctx);
++        }
++#endif
++    }
++
++    void TransmissionPolicyManager::abandonUpload(EventsUploadContextPtr const& ctx)
++    {
++        // Once registered, the HTTP callback owns terminal completion, even if
++        // SendRequestAsync completes synchronously or throws after completion.
++        if (ctx->httpRequestRegistered)
++        {
++            return;
++        }
++        {
++            LOCKGUARD(m_activeUploads_lock);
++            if (m_activeUploads.find(ctx) == m_activeUploads.end())
++            {
++                return;
++            }
++        }
++#if HAVE_EXCEPTIONS
++        try
++        {
++#endif
++            releaseFailedUpload(ctx);
++#if HAVE_EXCEPTIONS
++        }
++        catch (const std::exception& ex)
++        {
++            (void)ex;
++            LOG_ERROR("Failed to release records after upload preparation failed: %s", ex.what());
++        }
++        catch (...)
++        {
++            LOG_ERROR("Failed to release records after upload preparation failed with a non-standard exception");
++        }
++#endif
++        // Cleanup is best effort, but retiring the upload must not depend on it.
++        // Keep it active until cleanup finishes so teardown cannot race storage.
++        removeUpload(ctx);
+     }
+
+     void TransmissionPolicyManager::finishUpload(EventsUploadContextPtr const& ctx, const std::chrono::milliseconds& nextUpload)
+@@ -382,8 +443,7 @@
+         if (event->record.latency > EventLatency_RealTime) {
+             auto ctx = m_system.createEventsUploadContext();
+             ctx->requestedMinLatency = event->record.latency;
+-            addUpload(ctx);
+-            initiateUpload(ctx);
++            startUpload(ctx);
+             return;
+         }
+
+diff --git a/lib/tpm/TransmissionPolicyManager.hpp b/lib/tpm/TransmissionPolicyManager.hpp
+--- a/lib/tpm/TransmissionPolicyManager.hpp
++++ b/lib/tpm/TransmissionPolicyManager.hpp
+@@ -83,6 +83,8 @@
+         std::chrono::milliseconds increaseBackoff();
+
+         void uploadAsync(EventLatency priority);
++        void startUpload(EventsUploadContextPtr const& ctx);
++        void abandonUpload(EventsUploadContextPtr const& ctx);
+         void finishUpload(EventsUploadContextPtr const& ctx, const std::chrono::milliseconds& nextUpload);
+         bool updateTimersIfNecessary();
+
+@@ -179,6 +181,7 @@
+         RouteSink<TransmissionPolicyManager, IncomingEventContextPtr const&> eventArrived{ this, &TransmissionPolicyManager::handleEventArrived };
+
+         RouteSource<EventsUploadContextPtr const&>                           initiateUpload;
++        RouteSource<EventsUploadContextPtr const&>                           releaseFailedUpload;
+         RouteSink<TransmissionPolicyManager, EventsUploadContextPtr const&>  nothingToUpload{ this, &TransmissionPolicyManager::handleNothingToUpload };
+         RouteSink<TransmissionPolicyManager, EventsUploadContextPtr const&>  packagingFailed{ this, &TransmissionPolicyManager::handlePackagingFailed };
+         RouteSink<TransmissionPolicyManager, EventsUploadContextPtr const&>  eventsUploadSuccessful{ this, &TransmissionPolicyManager::handleEventsUploadSuccessful };

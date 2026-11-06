@@ -86,7 +86,22 @@ def main():
     parser.add_argument(
         "--mode",
         required=True,
-        choices=("upload", "threaded", "retry", "pending", "disabled", "unit-disabled", "ci-disabled", "reload"),
+        choices=(
+            "upload",
+            "threaded",
+            "retry",
+            "pending",
+            "disabled",
+            "unit-disabled",
+            "ci-disabled",
+            "reload",
+            "exception",
+            "exception-nonstandard",
+            "exception-exit",
+            "exception-exit-nonstandard",
+            "send-exception",
+            "complete-then-throw",
+        ),
     )
     args = parser.parse_args()
     with (
@@ -159,6 +174,8 @@ def main():
             if args.mode in suppression:
                 assert server.requests == 0, "Suppressed telemetry made an HTTP request"
                 assert not list(pathlib.Path(home).rglob("*")), "Suppressed telemetry persisted files"
+            elif args.mode.startswith("exception-exit"):
+                assert server.requests == 0, "Abandoned pre-HTTP upload unexpectedly reached the collector"
             else:
                 assert server.requests >= expected_cycles, "Test did not exercise real native HTTP requests"
                 assert b"synthetic-before-disable" in server.markers, "Initial ORT event did not reach the collector"

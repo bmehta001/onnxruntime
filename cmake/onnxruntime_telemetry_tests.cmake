@@ -65,6 +65,21 @@ endif()
 set_target_properties(onnxruntime_telemetry_sdk_test onnxruntime_telemetry_mutex_lifetime_test
   PROPERTIES FOLDER "ONNXRuntimeTest")
 
+if(NOT onnxruntime_DISABLE_EXCEPTIONS)
+  onnxruntime_add_executable(onnxruntime_telemetry_upload_exception_test
+    "${telemetry_test_dir}/telemetry_upload_exception_test.cc")
+  target_include_directories(onnxruntime_telemetry_upload_exception_test PRIVATE
+    $<TARGET_PROPERTY:mat,INCLUDE_DIRECTORIES>
+    "${cpp_client_telemetry_SOURCE_DIR}/lib")
+  target_compile_definitions(onnxruntime_telemetry_upload_exception_test PRIVATE
+    $<TARGET_PROPERTY:mat,COMPILE_DEFINITIONS>)
+  target_link_libraries(onnxruntime_telemetry_upload_exception_test PRIVATE mat Threads::Threads)
+  set_target_properties(onnxruntime_telemetry_upload_exception_test PROPERTIES FOLDER "ONNXRuntimeTest")
+  add_test(NAME onnxruntime_telemetry_upload_exception_test
+    COMMAND onnxruntime_telemetry_upload_exception_test)
+  set_tests_properties(onnxruntime_telemetry_upload_exception_test PROPERTIES TIMEOUT 15)
+endif()
+
 # Ordinary test mains suppress telemetry. Each mode gets a private cache,
 # clears CI suppression, and dispatches only an internal diagnostic, never an upload event.
 foreach(mode enabled threaded disabled disabled-threaded)
@@ -168,6 +183,10 @@ add_test(NAME onnxruntime_telemetry_transport_runner_test
 set_tests_properties(onnxruntime_telemetry_transport_runner_test PROPERTIES TIMEOUT 10)
 
 set(telemetry_transport_modes upload threaded retry pending disabled unit-disabled ci-disabled)
+if(NOT onnxruntime_DISABLE_EXCEPTIONS)
+  list(APPEND telemetry_transport_modes
+    exception exception-nonstandard exception-exit exception-exit-nonstandard send-exception complete-then-throw)
+endif()
 # The Objective-C runtime retains the Apple transport's image after dlclose, so
 # loading it again cannot provide the fresh static state required by this test.
 if(NOT APPLE)

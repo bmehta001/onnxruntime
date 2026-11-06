@@ -15,6 +15,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -28,6 +29,8 @@
 #include "IHttpClient.hpp"
 #include "ILogConfiguration.hpp"
 #include "ILogManager.hpp"
+#include "pal/PAL.hpp"
+#include "pal/TaskDispatcher.hpp"
 #include "telemetry_test_registry.h"
 
 #if defined(ORT_TELEMETRY_TRANSPORT_LIBRARY) && defined(HAVE_MAT_CURL_HTTP_CLIENT)
@@ -58,11 +61,41 @@ struct Observation {
   bool configured = false;
   bool suppressed = false;
   bool pending = false;
+  bool inject_exception = false;
+  bool nonstandard_exception = false;
+  bool exception_injected = false;
+  bool exception_drained = false;
+  bool exit_after_exception = false;
+  bool send_exception = false;
+  bool complete_then_throw = false;
   sdk::ILogManager* manager = nullptr;
 };
 
 Observation observation;
 std::string collector_url;
+
+class ThrowingListener final : public sdk::DebugEventListener {
+ public:
+  void OnDebugEvent(sdk::DebugEvent&) override {
+#if HAVE_EXCEPTIONS
+    {
+      std::lock_guard lock(observation.mutex);
+      if (!observation.inject_exception || observation.exception_injected) {
+        return;
+      }
+      observation.exception_injected = true;
+      Check(observation.sent == 0, "injected exception occurred after HTTP handoff");
+    }
+    observation.changed.notify_all();
+    if (observation.nonstandard_exception) {
+      throw 7;
+    }
+    throw std::runtime_error("injected EVT_SENDING failure");
+#endif
+  }
+};
+
+ThrowingListener throwing_listener;
 
 class LoopbackHttpClient final : public sdk::IHttpClient {
  public:
@@ -94,6 +127,20 @@ class LoopbackHttpClient final : public sdk::IHttpClient {
   sdk::IHttpRequest* CreateRequest() override { return client_->CreateRequest(); }
 
   void SendRequestAsync(sdk::IHttpRequest* request, sdk::IHttpResponseCallback* callback) override {
+#if HAVE_EXCEPTIONS
+    {
+      std::unique_lock lock(observation.mutex);
+      if ((observation.send_exception || observation.complete_then_throw) && !observation.exception_injected) {
+        observation.exception_injected = true;
+        const bool complete = observation.complete_then_throw;
+        lock.unlock();
+        if (complete) {
+          callback->OnHttpResponse(new sdk::SimpleHttpResponse(request->GetId()));
+        }
+        throw std::runtime_error("injected HTTP handoff failure");
+      }
+    }
+#endif
     // Every request goes to the parent-owned collector, including retries.
     request->SetUrl(collector_url);
     auto tracked = std::make_unique<Callback>(*callback);
@@ -158,11 +205,19 @@ void VerifyExit() {
     Check(!observation.configured && !observation.manager && observation.sent == 0,
           "suppressed telemetry initialized the SDK");
   } else {
-    Check(observation.configured && observation.sent > 0, "test did not exercise an upload");
+    Check(observation.configured && (observation.sent > 0 || observation.exit_after_exception),
+          "test did not exercise an upload");
     Check(observation.clients_destroyed == 1 && observation.completed == observation.sent,
           "provider did not destroy and drain its native transport");
     if (observation.pending) {
       Check(observation.aborted > 0, "pending upload was not cancelled during provider teardown");
+    }
+    if (observation.inject_exception) {
+      Check(observation.exception_injected && observation.exception_drained,
+            "upload preparation exception was not exercised");
+    }
+    if (observation.send_exception || observation.complete_then_throw) {
+      Check(observation.exception_injected, "HTTP handoff exception was not exercised");
     }
   }
   std::fputs("PASS telemetry lifecycle\n", stdout);
@@ -172,6 +227,11 @@ void VerifyExit() {
 void Run(std::string_view mode) {
   observation.suppressed = mode == "disabled" || mode == "unit-disabled" || mode == "ci-disabled";
   observation.pending = mode == "pending";
+  observation.inject_exception = mode.starts_with("exception");
+  observation.nonstandard_exception = mode.ends_with("-nonstandard");
+  observation.exit_after_exception = mode == "exception-exit" || mode == "exception-exit-nonstandard";
+  observation.send_exception = mode == "send-exception";
+  observation.complete_then_throw = mode == "complete-then-throw";
   const auto url = onnxruntime::telemetry_detail::ReadTelemetryEnvironment("ORT_TEST_TELEMETRY_COLLECTOR");
   Check(url.has_value() && !url->empty(), "missing or unreadable loopback collector URL");
   collector_url = *url;
@@ -214,6 +274,30 @@ void Run(std::string_view mode) {
   }
   Check(observation.manager != nullptr, "provider did not publish the SDK manager");
   observation.manager->UploadNow();
+  if (observation.inject_exception) {
+    {
+      std::unique_lock lock(observation.mutex);
+      Check(observation.changed.wait_for(lock, 10s, [] { return observation.exception_injected; }),
+            "SDK did not reach the throwing upload-start listener");
+    }
+    // Queue behind the failed upload so its record cleanup finishes before retry.
+    auto dispatcher = sdk::PlatformAbstraction::getDefaultTaskDispatcher();
+    auto barrier = sdk::PlatformAbstraction::scheduleTask(dispatcher.get(), 0, [] {
+      std::lock_guard lock(observation.mutex);
+      observation.exception_drained = true;
+      observation.changed.notify_all();
+    });
+    Check(barrier.GetTask() != nullptr, "could not queue upload failure barrier");
+    {
+      std::unique_lock lock(observation.mutex);
+      Check(observation.changed.wait_for(lock, 10s, [] { return observation.exception_drained; }),
+            "failed upload task did not finish");
+    }
+    if (observation.exit_after_exception) {
+      return;
+    }
+    observation.manager->UploadNow();
+  }
   if (observation.pending) {
     std::string command;
     Check(static_cast<bool>(std::getline(std::cin, command)) && command == "shutdown",
@@ -273,6 +357,9 @@ void OrtTelemetryTestConfigure(sdk::ILogConfiguration& config) {
 void OrtTelemetryTestReady(sdk::ILogManager& manager) {
   observation.manager = &manager;
   manager.SetTransmitProfile(sdk::TransmitProfile_RealTime);
+  if (observation.inject_exception) {
+    manager.AddEventListener(sdk::DebugEventType::EVT_SENDING, throwing_listener);
+  }
 }
 }  // namespace onnxruntime
 
