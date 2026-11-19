@@ -2,9 +2,14 @@
 // Licensed under the MIT License.
 
 #include "core/providers/cpu/math/softmax.h"
-#include "core/providers/cpu/tensor/transpose.h"
-#include <vector>
-#include <numeric>
+
+#include <algorithm>
+#include <cmath>
+#include <type_traits>
+
+#include "core/common/safeint.h"
+#include "core/mlas/inc/mlas.h"
+#include "core/platform/threadpool.h"
 
 namespace onnxruntime {
 
@@ -120,72 +125,134 @@ Status Softmax<T>::ComputeImpl(const Tensor& input, Tensor& output, size_t axis,
   return SoftmaxCPU<T>(N, D, input.Data<T>(), output.MutableData<T>(), log_softmax_, thread_pool, mlas_backend_kernel_selector_config);
 }
 
+namespace {
+
+constexpr size_t kMaxBlock = 256;
+constexpr size_t kMinBlock = 64;
+
+template <typename T>
+void ExpInPlace(T* data, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    data[i] = std::exp(data[i]);
+  }
+}
+
+template <>
+void ExpInPlace<float>(float* data, size_t count) {
+  MlasComputeExp(data, data, count);
+}
+
+// Softmax/LogSoftmax along the middle axis of a tensor viewed as [outer, axis_dim, inner] with inner > 1.
+// Each task reduces a block of contiguous inner columns across axis_dim, so every access is unit-stride and no
+// transposed copies are needed. Arithmetic matches SoftmaxCPU for each element type. Y may alias X: an element of Y
+// is only written after the last read of the same element of X.
+template <typename T>
+void SoftmaxInnerStrided(const T* X, T* Y, size_t outer, size_t axis_dim, size_t inner, bool log_softmax,
+                         concurrency::ThreadPool* thread_pool) {
+  // Narrow the column blocks when there are too few of them to keep every thread busy.
+  const size_t target_tasks = 4 * static_cast<size_t>(concurrency::ThreadPool::DegreeOfParallelism(thread_pool));
+  size_t block = kMaxBlock;
+  while (block > kMinBlock && outer * ((inner + block - 1) / block) < target_tasks) {
+    block /= 2;
+  }
+  const size_t blocks_per_outer = (inner + block - 1) / block;
+  const size_t num_tasks = SafeInt<size_t>(outer) * blocks_per_outer;
+  const double block_elements = static_cast<double>(axis_dim) * static_cast<double>(std::min(inner, block));
+  const TensorOpCost cost{3.0 * block_elements * sizeof(T), block_elements * sizeof(T), 24.0 * block_elements};
+
+  concurrency::ThreadPool::TryParallelFor(
+      thread_pool, static_cast<std::ptrdiff_t>(num_tasks), cost,
+      [=](std::ptrdiff_t first, std::ptrdiff_t last) {
+        T max_vals[kMaxBlock];
+        T sums[kMaxBlock];
+        T scratch[kMaxBlock];
+
+        for (std::ptrdiff_t task = first; task < last; ++task) {
+          const size_t o = static_cast<size_t>(task) / blocks_per_outer;
+          const size_t col = (static_cast<size_t>(task) % blocks_per_outer) * block;
+          const size_t len = std::min(block, inner - col);
+          const size_t base = o * axis_dim * inner + col;
+          const T* x = X + base;
+          T* y = Y + base;
+
+          std::copy_n(x, len, max_vals);
+          for (size_t a = 1; a < axis_dim; ++a) {
+            const T* x_row = x + a * inner;
+            for (size_t j = 0; j < len; ++j) {
+              max_vals[j] = std::max(max_vals[j], x_row[j]);
+            }
+          }
+
+          std::fill_n(sums, len, T{0});
+          for (size_t a = 0; a < axis_dim; ++a) {
+            const T* x_row = x + a * inner;
+            // LogSoftmax re-reads X in the final pass, so keep exp() results out of Y in case they alias.
+            T* exp_row = log_softmax ? scratch : y + a * inner;
+            for (size_t j = 0; j < len; ++j) {
+              exp_row[j] = x_row[j] - max_vals[j];
+            }
+            ExpInPlace(exp_row, len);
+            for (size_t j = 0; j < len; ++j) {
+              sums[j] += exp_row[j];
+            }
+          }
+
+          if (log_softmax) {
+            for (size_t j = 0; j < len; ++j) {
+              if constexpr (std::is_same_v<T, float>) {
+                sums[j] = std::log(sums[j]);
+              } else {
+                sums[j] = std::log(std::fmax(sums[j], 1e-20));
+              }
+            }
+            for (size_t a = 0; a < axis_dim; ++a) {
+              const T* x_row = x + a * inner;
+              T* y_row = y + a * inner;
+              for (size_t j = 0; j < len; ++j) {
+                y_row[j] = x_row[j] - max_vals[j] - sums[j];
+              }
+            }
+          } else {
+            if constexpr (std::is_same_v<T, float>) {
+              for (size_t j = 0; j < len; ++j) {
+                sums[j] = 1.0f / sums[j];
+              }
+            }
+            for (size_t a = 0; a < axis_dim; ++a) {
+              T* y_row = y + a * inner;
+              for (size_t j = 0; j < len; ++j) {
+                if constexpr (std::is_same_v<T, float>) {
+                  y_row[j] *= sums[j];
+                } else {
+                  y_row[j] /= sums[j];
+                }
+              }
+            }
+          }
+        }
+      });
+}
+
+}  // namespace
+
 // opset-13 and above
 template <typename T>
 Status Softmax<T>::ComputeImplOpset13(const Tensor& input, Tensor& output, size_t axis,
-                                      concurrency::ThreadPool* thread_pool, OpKernelContext* ctx,
+                                      concurrency::ThreadPool* thread_pool,
                                       const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) const {
+  // From opset 13 the softmax is computed along `axis` only, rather than over all dims from `axis` onwards.
   const auto& X_shape = input.Shape();
-  size_t rank = X_shape.NumDimensions();
+  const size_t outer = onnxruntime::narrow<size_t>(X_shape.SizeToDimension(axis));
+  const size_t axis_dim = onnxruntime::narrow<size_t>(X_shape[axis]);
+  const size_t inner = onnxruntime::narrow<size_t>(X_shape.SizeFromDimension(axis + 1));
 
-  bool is_transpose_required = false;
-  Tensor transposed_input;
-  std::vector<int64_t> transposed_input_dims;
-  Tensor intermediate_output;  // output that the softmax implementation will write into while using transposed input
-  std::vector<size_t> permutation(rank);
-
-  // The "semantic" meaning of axis has changed in opset-13.
-  // Please compare: https://github.com/onnx/onnx/blob/main/docs/Operators.md#Softmax
-  // with https://github.com/onnx/onnx/blob/main/docs/Changelog.md#Softmax-11 for detailed explanations
-  // To account for the opset-13 behavior, our plan will be to transpose the "axis" dim to the innermost dim
-  // and perform softmax and then reverse the transpose. We can skip the transposing aspect if the axis is already
-  // the innermost dim
-  if (axis != (rank - 1)) {
-    is_transpose_required = true;
+  if (inner == 1) {
+    return SoftmaxCPU<T>(outer, axis_dim, input.Data<T>(), output.MutableData<T>(), log_softmax_, thread_pool,
+                         mlas_backend_kernel_selector_config);
   }
 
-  if (is_transpose_required) {
-    AllocatorPtr alloc;
-    auto status = ctx->GetTempSpaceAllocator(&alloc);
-    if (!status.IsOK())
-      return status;
-
-    std::iota(std::begin(permutation), std::end(permutation), 0);
-
-    // swap the innermost dim with the dim corresponding to axis
-    permutation[axis] = rank - 1;
-    permutation[rank - 1] = axis;
-
-    transposed_input_dims.reserve(rank);
-    for (auto e : permutation) {
-      transposed_input_dims.push_back(X_shape[e]);
-    }
-
-    // Allocate a temporary tensor to hold transposed input
-    Tensor temp_input(input.DataType(), TensorShape(transposed_input_dims), alloc);
-
-    // Perform the transpose
-    ORT_RETURN_IF_ERROR(TransposeBase::DoTranspose(permutation, input, temp_input));
-    transposed_input = std::move(temp_input);
-
-    // Allocate memory for the intermediate output
-    Tensor temp_output(output.DataType(), TensorShape(transposed_input_dims), alloc);
-    intermediate_output = std::move(temp_output);
-  }
-
-  const size_t N = onnxruntime::narrow<size_t>(is_transpose_required ? TensorShape(transposed_input_dims).SizeToDimension(rank - 1) : X_shape.SizeToDimension(rank - 1));
-  const size_t D = onnxruntime::narrow<size_t>(is_transpose_required ? TensorShape(transposed_input_dims).SizeFromDimension(rank - 1) : X_shape.SizeFromDimension(rank - 1));
-
-  ORT_RETURN_IF_ERROR(SoftmaxCPU<T>(N, D,
-                                    is_transpose_required ? transposed_input.Data<T>() : input.Data<T>(),
-                                    is_transpose_required ? intermediate_output.MutableData<T>() : output.MutableData<T>(),
-                                    log_softmax_, thread_pool, mlas_backend_kernel_selector_config));
-
-  if (is_transpose_required) {
-    // Perform the transpose to get the axes back to the original ordering
-    ORT_RETURN_IF_ERROR(TransposeBase::DoTranspose(permutation, intermediate_output, output));
-  }
-
+  SoftmaxInnerStrided<T>(input.Data<T>(), output.MutableData<T>(), outer, axis_dim, inner, log_softmax_,
+                         thread_pool);
   return Status::OK();
 }
 
@@ -208,7 +275,7 @@ Status Softmax<T>::Compute(OpKernelContext* ctx) const {
   if (opset_ < 13) {
     return ComputeImpl(*X, *Y, axis, thread_pool, &mlas_backend_kernel_selector_config_);
   } else {
-    return ComputeImplOpset13(*X, *Y, axis, thread_pool, ctx, &mlas_backend_kernel_selector_config_);
+    return ComputeImplOpset13(*X, *Y, axis, thread_pool, &mlas_backend_kernel_selector_config_);
   }
 }
 

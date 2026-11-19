@@ -44,7 +44,7 @@ class Softmax final : public OpKernel {
                      concurrency::ThreadPool* thread_pool, const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) const;
 
   Status ComputeImplOpset13(const Tensor& input, Tensor& output, size_t axis,
-                            concurrency::ThreadPool* thread_pool, OpKernelContext* ctx, const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) const;
+                            concurrency::ThreadPool* thread_pool, const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) const;
 
   int axis_;
   int opset_;

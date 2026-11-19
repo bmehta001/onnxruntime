@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <algorithm>
 #include <cmath>
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -402,6 +403,55 @@ TEST(SoftmaxOperator, 2DInputReduceOnAxis1WithLargeDim) {
   std::vector<int64_t> dimensions = {1, 1025};
 
   RunTest(x_vals, expected_vals, dimensions);
+}
+
+// Exercises the opset-13 non-innermost-axis path: multiple and partial column blocks, outer > 1, and the case where
+// all trailing dims are 1.
+template <typename T>
+static void RunStridedAxisTest(const char* op, const std::vector<int64_t>& dims, int64_t axis) {
+  const bool log_softmax = std::string(op) == "LogSoftmax";
+  size_t total = 1;
+  for (auto d : dims) total *= static_cast<size_t>(d);
+  const size_t a = static_cast<size_t>(axis < 0 ? axis + static_cast<int64_t>(dims.size()) : axis);
+  size_t outer = 1, inner = 1;
+  for (size_t i = 0; i < a; ++i) outer *= static_cast<size_t>(dims[i]);
+  for (size_t i = a + 1; i < dims.size(); ++i) inner *= static_cast<size_t>(dims[i]);
+  const size_t axis_dim = static_cast<size_t>(dims[a]);
+
+  std::vector<T> x(total);
+  for (size_t i = 0; i < total; ++i) x[i] = static_cast<T>(5.0 * std::sin(0.37 * static_cast<double>(i)));
+
+  std::vector<T> expected(total);
+  for (size_t o = 0; o < outer; ++o) {
+    for (size_t j = 0; j < inner; ++j) {
+      const size_t base = o * axis_dim * inner + j;
+      double max_val = static_cast<double>(x[base]);
+      for (size_t k = 1; k < axis_dim; ++k) max_val = std::max(max_val, static_cast<double>(x[base + k * inner]));
+      double sum = 0.0;
+      for (size_t k = 0; k < axis_dim; ++k) sum += std::exp(static_cast<double>(x[base + k * inner]) - max_val);
+      for (size_t k = 0; k < axis_dim; ++k) {
+        const double shifted = static_cast<double>(x[base + k * inner]) - max_val;
+        expected[base + k * inner] = static_cast<T>(log_softmax ? shifted - std::log(sum) : std::exp(shifted) / sum);
+      }
+    }
+  }
+
+  OpTester test(op, 13);
+  test.AddAttribute("axis", axis);
+  test.AddInput<T>("X", dims, x);
+  test.AddOutput<T>("Y", dims, expected);
+  test.Run();
+}
+
+TEST(SoftmaxOperator, NonInnermostAxis_opset13) {
+  for (const char* op : {"Softmax", "LogSoftmax"}) {
+    RunStridedAxisTest<float>(op, {2, 37, 300}, 1);
+    RunStridedAxisTest<float>(op, {3, 5, 2, 600}, 0);
+    RunStridedAxisTest<float>(op, {3, 5, 2, 600}, -3);
+    RunStridedAxisTest<float>(op, {4, 7, 1, 1}, 1);
+    RunStridedAxisTest<double>(op, {2, 37, 300}, 1);
+    RunStridedAxisTest<double>(op, {3, 5, 2, 600}, 0);
+  }
 }
 
 // Regression test for NNAPI handling of a Softmax with opset < 13 where the input has been converted to NHWC.
