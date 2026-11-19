@@ -1162,7 +1162,9 @@ if(onnxruntime_USE_1DS_TELEMETRY)
     URL ${DEP_URL_cpp_client_telemetry}
     URL_HASH SHA1=${DEP_SHA1_cpp_client_telemetry}
     PATCH_COMMAND ${Patch_EXECUTABLE} --binary --ignore-whitespace -p1 <
-      ${PROJECT_SOURCE_DIR}/patches/cpp_client_telemetry/factory-static-storage.patch
+      ${PROJECT_SOURCE_DIR}/patches/cpp_client_telemetry/factory-static-storage.patch &&
+      ${Patch_EXECUTABLE} --binary --ignore-whitespace -p1 <
+      ${PROJECT_SOURCE_DIR}/patches/cpp_client_telemetry/curl-nonblocking-teardown.patch
     EXCLUDE_FROM_ALL
   )
   block(PROPAGATE cpp_client_telemetry_SOURCE_DIR cpp_client_telemetry_BINARY_DIR)
