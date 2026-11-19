@@ -1037,11 +1037,13 @@ if(onnxruntime_USE_KLEIDIAI)
 
   onnxruntime_fetchcontent_declare(kleidiai URL ${DEP_URL_kleidiai} URL_HASH SHA1=${DEP_SHA1_kleidiai} EXCLUDE_FROM_ALL)
   onnxruntime_fetchcontent_makeavailable(kleidiai)
+  onnxruntime_check_msvc_source_path_length(kleidiai)
   # Fetch Qualcomm's kleidiai library
   if(onnxruntime_USE_QMX_KLEIDIAI_COEXIST)
           onnxruntime_fetchcontent_declare(kleidiai-qmx URL ${DEP_URL_kleidiai-qmx} URL_HASH SHA1=${DEP_SHA1_kleidiai-qmx}
                   EXCLUDE_FROM_ALL)
           onnxruntime_fetchcontent_makeavailable(kleidiai-qmx)
+          onnxruntime_check_msvc_source_path_length(kleidiai-qmx)
   endif()
 endif()
 

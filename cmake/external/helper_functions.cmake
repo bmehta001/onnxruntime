@@ -13,6 +13,35 @@ function(onnxruntime_fetchcontent_declare contentName)
     endif()
 endfunction()
 
+# cl.exe is not long-path aware: it fails with C1083 for source paths of 260+ characters even when Windows long paths
+# are enabled. Fail at configure time with an actionable message instead of deep into the build.
+function(onnxruntime_check_msvc_source_path_length target)
+  if(NOT MSVC OR NOT TARGET ${target})
+    return()
+  endif()
+  get_target_property(target_sources ${target} SOURCES)
+  get_target_property(target_source_dir ${target} SOURCE_DIR)
+  set(longest_len 0)
+  set(longest_path "")
+  foreach(src IN LISTS target_sources)
+    if(src MATCHES "\\$<")
+      continue()
+    endif()
+    cmake_path(ABSOLUTE_PATH src BASE_DIRECTORY "${target_source_dir}" NORMALIZE OUTPUT_VARIABLE abs_src)
+    string(LENGTH "${abs_src}" src_len)
+    if(src_len GREATER longest_len)
+      set(longest_len ${src_len})
+      set(longest_path "${abs_src}")
+    endif()
+  endforeach()
+  if(longest_len GREATER_EQUAL 260)
+    math(EXPR excess "${longest_len} - 259")
+    message(FATAL_ERROR "Source path for target '${target}' is ${longest_len} characters, which MSVC cannot open "
+                        "(limit 259):\n  ${longest_path}\n"
+                        "Use a build directory at least ${excess} characters shorter (e.g. --build_dir C:\\b).")
+  endif()
+endfunction()
+
 macro(onnxruntime_fetchcontent_makeavailable)
     set(ONNXRUNTIME_CMAKE_SKIP_INSTALL_RULES_OLD_VALUE
       "${CMAKE_SKIP_INSTALL_RULES}")
