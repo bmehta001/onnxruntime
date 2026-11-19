@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <array>
 #include <random>
 #include <cmath>
 #include <limits>
@@ -11,6 +12,8 @@
 #include "test/providers/provider_test_utils.h"
 #include "test/providers/cpu/reduction/reduction_test_cases.h"
 #include "core/providers/cpu/reduction/reduction_ops.h"
+#include "core/platform/env.h"
+#include "core/util/thread_utils.h"
 #include "test/util/include/default_providers.h"
 
 namespace onnxruntime {
@@ -6037,6 +6040,97 @@ TEST(ReductionOpTest, ReduceSum_RK_keepdims) {
                         9.0f, 10.0f,
                         11.0f, 12.0f});
   test.AddOutput<float>("reduced", {1, 4}, {15.f, 18.f, 21.f, 24.f});
+  test.Run();
+}
+
+// Exercises the float RK/KRK fast paths with odd shapes that produce several column tiles and/or row blocks
+// (including a partial last block) for different thread pool sizes.
+TEST(ReductionOpTest, ReduceSumMean_RK_KRK_FastPath_RowAndColumnBlocks) {
+  // {batch, rows, cols}; batch == 1 is tested through both FastReduceRK and FastReduceKRK.
+  const std::vector<std::array<int64_t, 3>> shapes = {
+      {1, 1, 5},
+      {1, 5, 7},
+      {1, 4099, 3},
+      {1, 1031, 2053},
+      {1, 257, 4097},
+      {1, 40, 6151},
+      {1, 16385, 64},
+      {2, 1, 9},
+      {3, 1031, 37},
+      {2, 517, 2049},
+      {9, 7, 3},
+      {17, 300, 129},
+  };
+  auto allocator = std::make_shared<CPUAllocator>();
+  std::mt19937 gen(123);
+  std::uniform_real_distribution<float> dist(-1.f, 1.f);
+
+  for (int num_threads : {0, 1, 3, 8}) {
+    std::unique_ptr<concurrency::ThreadPool> tp;
+    if (num_threads > 0) {
+      OrtThreadPoolParams params;
+      params.thread_pool_size = num_threads;
+      tp = concurrency::CreateThreadPool(&Env::Default(), params, concurrency::ThreadPoolType::INTRA_OP);
+    }
+    for (const auto& [n_batch, n_rows, n_cols] : shapes) {
+      SCOPED_TRACE(MakeString("threads=", num_threads, " shape=[", n_batch, ",", n_rows, ",", n_cols, "]"));
+      Tensor input(DataTypeImpl::GetType<float>(), TensorShape({n_batch, n_rows, n_cols}), allocator);
+      float* in = input.MutableData<float>();
+      std::vector<double> expected(static_cast<size_t>(n_batch * n_cols), 0.0);
+      for (int64_t b = 0; b < n_batch; ++b) {
+        for (int64_t r = 0; r < n_rows; ++r) {
+          for (int64_t c = 0; c < n_cols; ++c) {
+            const int64_t i = (b * n_rows + r) * n_cols + c;
+            in[i] = dist(gen);
+            expected[static_cast<size_t>(b * n_cols + c)] += in[i];
+          }
+        }
+      }
+
+      auto check = [&](const Tensor& sum, const Tensor& mean) {
+        for (int64_t i = 0; i < n_batch * n_cols; ++i) {
+          const double e = expected[static_cast<size_t>(i)];
+          ASSERT_NEAR(sum.Data<float>()[i], e, 1e-3) << "index " << i;
+          ASSERT_NEAR(mean.Data<float>()[i], e / static_cast<double>(n_rows), 1e-6) << "index " << i;
+        }
+      };
+
+      Tensor sum(DataTypeImpl::GetType<float>(), TensorShape({n_batch, n_cols}), allocator);
+      Tensor mean(DataTypeImpl::GetType<float>(), TensorShape({n_batch, n_cols}), allocator);
+      const std::vector<int64_t> krk_shape = {n_batch, n_rows, n_cols};
+      ReduceAggregatorSum<float>::FastReduceKRK(input, krk_shape, sum, tp.get());
+      ReduceAggregatorMean<float>::FastReduceKRK(input, krk_shape, mean, tp.get());
+      check(sum, mean);
+
+      if (n_batch == 1) {
+        const std::vector<int64_t> rk_shape = {n_rows, n_cols};
+        ReduceAggregatorSum<float>::FastReduceRK(input, rk_shape, sum, tp.get());
+        ReduceAggregatorMean<float>::FastReduceRK(input, rk_shape, mean, tp.get());
+        check(sum, mean);
+      }
+    }
+  }
+}
+
+TEST(ReductionOpTest, ReduceMean_RK_keepdims_large_odd) {
+  OpTester test("ReduceMean");
+  test.AddAttribute("axes", std::vector<int64_t>{0});
+  test.AddAttribute("keepdims", (int64_t)1);
+  constexpr int64_t n_rows = 4099, n_cols = 5;
+  std::vector<float> in_data(n_rows * n_cols);
+  std::vector<float> expected(n_cols, 0.f);
+  for (size_t i = 0; i < in_data.size(); ++i) {
+    in_data[i] = static_cast<float>(i % 13) - 6.f;
+  }
+  for (int64_t c = 0; c < n_cols; ++c) {
+    double s = 0.0;
+    for (int64_t r = 0; r < n_rows; ++r) {
+      s += in_data[r * n_cols + c];
+    }
+    expected[c] = static_cast<float>(s / n_rows);
+  }
+  test.AddInput<float>("data", {n_rows, n_cols}, in_data);
+  test.AddOutput<float>("reduced", {1, n_cols}, expected);
   test.Run();
 }
 

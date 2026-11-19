@@ -780,6 +780,7 @@ bool CommonFastReduceSwitch(OpKernelContext* ctx,
                             TensorShapeVector& output_shape,
                             TensorShapeVector& fast_axes,
                             FastReduceKind which_fast_reduce,
+                            bool rk_krk_scale_to_any_shape,
                             fast_reduce_fct* case_kr,
                             fast_reduce_fct* case_rk,
                             fast_reduce_fct* case_krk,
@@ -806,9 +807,10 @@ bool CommonFastReduceSwitch(OpKernelContext* ctx,
         }
         case FastReduceKind::kRK: {
           ValidateFastReduceRK(fast_shape, *output);
-          if ((fast_shape[0] > concurrency::ThreadPool::DegreeOfParallelism(ctx->GetOperatorThreadPool()) * 16) &&
-              (std::max(fast_shape[0], fast_shape[1]) >
-               concurrency::ThreadPool::DegreeOfParallelism(ctx->GetOperatorThreadPool()) * 256)) {
+          if (rk_krk_scale_to_any_shape ||
+              ((fast_shape[0] > concurrency::ThreadPool::DegreeOfParallelism(ctx->GetOperatorThreadPool()) * 16) &&
+               (std::max(fast_shape[0], fast_shape[1]) >
+                concurrency::ThreadPool::DegreeOfParallelism(ctx->GetOperatorThreadPool()) * 256))) {
             // See benchmarks in PR #7719.
             case_rk(*input, fast_shape, *output, ctx->GetOperatorThreadPool());
             return true;
@@ -818,7 +820,8 @@ bool CommonFastReduceSwitch(OpKernelContext* ctx,
         }
         case FastReduceKind::kKRK:
           ValidateFastReduceKRK(fast_shape, *output);
-          if (fast_shape[0] >= std::max(2, concurrency::ThreadPool::DegreeOfParallelism(ctx->GetOperatorThreadPool()))) {
+          if (rk_krk_scale_to_any_shape ||
+              fast_shape[0] >= std::max(2, concurrency::ThreadPool::DegreeOfParallelism(ctx->GetOperatorThreadPool()))) {
             // See benchmarks in PR #7719.
             case_krk(*input, fast_shape, *output, ctx->GetOperatorThreadPool());
             return true;
@@ -856,7 +859,8 @@ bool CommonFastReduce(OpKernelContext* ctx,
                       TensorShapeVector& fast_axes) {
   return CommonFastReduceSwitch(ctx, axes_, keepdims_, noop_with_empty_axes,
                                 fast_kind, fast_shape, output_shape, fast_axes,
-                                AGG::WhichFastReduce(), &AGG::FastReduceKR, &AGG::FastReduceRK,
+                                AGG::WhichFastReduce(), AGG::FastReduceRKAndKRKScaleToAnyShape(),
+                                &AGG::FastReduceKR, &AGG::FastReduceRK,
                                 &AGG::FastReduceKRK, &AGG::FastReduceRKR);
 }
 
@@ -1150,8 +1154,9 @@ std::unique_ptr<Tensor> ReduceSum<T>::Impl(const Tensor& input, gsl::span<const 
       }
       case FastReduceKind::kRK:
         ValidateFastReduceRK(fast_shape, *output);
-        if (std::max(fast_shape[0], fast_shape[1]) >
-            concurrency::ThreadPool::DegreeOfParallelism(tp) * 256) {
+        if (ReduceAggregatorSum<T>::FastReduceRKAndKRKScaleToAnyShape() ||
+            std::max(fast_shape[0], fast_shape[1]) >
+                concurrency::ThreadPool::DegreeOfParallelism(tp) * 256) {
           // See benchmarks in PR #7719.
           ReduceAggregatorSum<T>::FastReduceRK(input, fast_shape, *output, tp);
           return output;
@@ -1160,7 +1165,8 @@ std::unique_ptr<Tensor> ReduceSum<T>::Impl(const Tensor& input, gsl::span<const 
         }
       case FastReduceKind::kKRK:
         ValidateFastReduceKRK(fast_shape, *output);
-        if (fast_shape[0] >= std::max(2, concurrency::ThreadPool::DegreeOfParallelism(tp))) {
+        if (ReduceAggregatorSum<T>::FastReduceRKAndKRKScaleToAnyShape() ||
+            fast_shape[0] >= std::max(2, concurrency::ThreadPool::DegreeOfParallelism(tp))) {
           // See benchmarks in PR #7719.
           ReduceAggregatorSum<T>::FastReduceKRK(input, fast_shape, *output, tp);
           return output;

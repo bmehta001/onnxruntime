@@ -4,9 +4,11 @@
 #ifndef CORE_PROVIDERS_CPU_REDUCTION_OPS_H
 #define CORE_PROVIDERS_CPU_REDUCTION_OPS_H
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <type_traits>
+#include <vector>
 
 #ifndef SHARED_PROVIDER
 #include "core/common/common.h"
@@ -165,6 +167,9 @@ class ReduceAggregatorBase {
  public:
   // Fast reduction: see OptimizeShapeForFastReduce's comment.
   static inline FastReduceKind WhichFastReduce() { return FastReduceKind::kNone; }
+  // When false, FastReduceRK and FastReduceKRK are only used for shapes large enough to amortize their
+  // parallelization overhead.
+  static inline bool FastReduceRKAndKRKScaleToAnyShape() { return false; }
   static void FastReduceKR(const Tensor&, const gsl::span<const int64_t>&, Tensor&, concurrency::ThreadPool*);
   static void FastReduceRK(const Tensor&, const gsl::span<const int64_t>&, Tensor&, concurrency::ThreadPool*);
   static void FastReduceKRK(const Tensor&, const gsl::span<const int64_t>&, Tensor&, concurrency::ThreadPool*);
@@ -301,6 +306,9 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
     return FastReduceKind::kKR | FastReduceKind::kRK | FastReduceKind::kKRK | FastReduceKind::kRKR;
   }
 
+  // The floating-point FastReduceRK/FastReduceKRK size their tasks from the shape and thread count.
+  static inline bool FastReduceRKAndKRKScaleToAnyShape() { return !std::is_integral_v<T>; }
+
   static void FastReduceKR(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
                            Tensor& output, concurrency::ThreadPool* tp) {
     const T* data = input.Data<T>();
@@ -344,27 +352,118 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
             }
           });
     } else {
-      memcpy(out, data, SafeInt<size_t>(N) * sizeof(T));
-      concurrency::ThreadPool::TryParallelFor(
-          tp, onnxruntime::narrow<std::ptrdiff_t>(N), ParallelReduceFastCost(1, n_rows, sizeof(T), 6),
-          [data, out, N, n_rows](ptrdiff_t begin, ptrdiff_t end) {
-            for (int64_t row = 1; row < n_rows; ++row) {
-              EigenVectorArrayMap<T>(out + begin, end - begin) += ConstEigenVectorArrayMap<T>(
-                  data + row * N + begin, end - begin);
+      FastReduceRKFloat(data, out, 1, n_rows, N, tp);
+    }
+  }
+
+ private:
+  // Reduces the middle axis of a [n_batch, n_rows, N] tensor into [n_batch, N] (RK is the n_batch == 1 case).
+  // The work is split into (batch, row block, column tile) tasks so that each task streams long contiguous
+  // row segments. Splitting only across columns gives each thread a short strided segment of every row,
+  // which defeats hardware prefetching and makes the multi-threaded reduction slower than one thread
+  // when the kept dimension is small. Partial sums of row blocks are combined in a second pass.
+  static void FastReduceRKFloat(const T* data, T* out, int64_t n_batch, int64_t n_rows, int64_t N,
+                                concurrency::ThreadPool* tp) {
+    // Column tile size in elements; keeps a task's accumulator tile resident in L1.
+    constexpr int64_t kMaxColTile = 2048;
+    // Minimum number of input elements per task so that small inputs are not over-split.
+    constexpr int64_t kMinElementsPerTask = 32768;
+
+    if (n_batch == 0 || n_rows == 0 || N == 0) {
+      return;
+    }
+    const bool is_small = n_batch * n_rows * N <= kMinElementsPerTask;
+    if (is_small) {
+      tp = nullptr;
+    }
+    const int64_t dop = concurrency::ThreadPool::DegreeOfParallelism(tp);
+    // Batches alone provide enough parallelism when n_batch >= dop; keep full rows so each GEMV is as long as
+    // possible. Otherwise split columns into tiles to create more tasks.
+    const int64_t n_col_tiles = n_batch >= dop ? 1 : (N + kMaxColTile - 1) / kMaxColTile;
+    const int64_t col_tile = (N + n_col_tiles - 1) / n_col_tiles;
+
+    int64_t n_row_blocks = 1;
+    if (n_batch * n_col_tiles < dop) {
+      const int64_t max_blocks_by_work = std::max<int64_t>(1, n_rows * col_tile / kMinElementsPerTask);
+      n_row_blocks = std::min({(dop + n_batch * n_col_tiles - 1) / (n_batch * n_col_tiles),
+                               max_blocks_by_work, n_rows});
+    }
+    const int64_t rows_per_block = (n_rows + n_row_blocks - 1) / n_row_blocks;
+    n_row_blocks = (n_rows + rows_per_block - 1) / rows_per_block;
+    const int64_t tasks_per_batch = n_row_blocks * n_col_tiles;
+
+    // Row block 0 accumulates directly into the output; the others use scratch buffers.
+    std::vector<T> partials(SafeInt<size_t>(n_batch) * (n_row_blocks - 1) * onnxruntime::narrow<size_t>(N));
+    T* partials_data = partials.data();
+    // Each task sums its rows as a GEMV with a vector of ones, which uses MLAS's M == 1 kernel. Small inputs use
+    // a plain loop to avoid the GEMV setup cost.
+    const bool use_gemv = !is_small && N <= std::numeric_limits<int>::max() &&
+                          rows_per_block <= std::numeric_limits<int>::max();
+    std::vector<T> ones(use_gemv ? onnxruntime::narrow<size_t>(rows_per_block) : 0, static_cast<T>(1));
+    const T* ones_data = ones.data();
+
+    concurrency::ThreadPool::TrySimpleParallelFor(
+        tp, onnxruntime::narrow<std::ptrdiff_t>(n_batch * tasks_per_batch),
+        [=](std::ptrdiff_t task) {
+          const int64_t batch = task / tasks_per_batch;
+          const int64_t row_block = (task % tasks_per_batch) / n_col_tiles;
+          const int64_t c0 = (task % n_col_tiles) * col_tile;
+          const int64_t width = std::min(col_tile, N - c0);
+          const int64_t r_begin = row_block * rows_per_block;
+          const int64_t r_end = std::min(n_rows, r_begin + rows_per_block);
+
+          T* acc_data = (row_block == 0 ? out + batch * N
+                                        : partials_data + (batch * (n_row_blocks - 1) + row_block - 1) * N) +
+                        c0;
+          const T* p = data + (batch * n_rows + r_begin) * N + c0;
+          if (use_gemv) {
+            const auto k = onnxruntime::narrow<int>(r_end - r_begin);
+            math::GemmEx<T, concurrency::ThreadPool>(CblasNoTrans, CblasNoTrans, 1, width, k, static_cast<T>(1),
+                                                     ones_data, k, p, onnxruntime::narrow<int>(N),
+                                                     static_cast<T>(0), acc_data, onnxruntime::narrow<int>(width),
+                                                     nullptr, nullptr);
+            return;
+          }
+          EigenVectorArrayMap<T> acc(acc_data, width);
+          acc = ConstEigenVectorArrayMap<T>(p, width);
+          int64_t r = r_begin + 1;
+          p += N;
+          // Add four rows per pass to cut accumulator loads/stores.
+          for (; r + 4 <= r_end; r += 4, p += 4 * N) {
+            acc += (ConstEigenVectorArrayMap<T>(p, width) + ConstEigenVectorArrayMap<T>(p + N, width)) +
+                   (ConstEigenVectorArrayMap<T>(p + 2 * N, width) + ConstEigenVectorArrayMap<T>(p + 3 * N, width));
+          }
+          for (; r < r_end; ++r, p += N) {
+            acc += ConstEigenVectorArrayMap<T>(p, width);
+          }
+        });
+
+    if (n_row_blocks > 1) {
+      concurrency::ThreadPool::TrySimpleParallelFor(
+          tp, onnxruntime::narrow<std::ptrdiff_t>(n_batch * n_col_tiles),
+          [=](std::ptrdiff_t task) {
+            const int64_t batch = task / n_col_tiles;
+            const int64_t c0 = (task % n_col_tiles) * col_tile;
+            const int64_t width = std::min(col_tile, N - c0);
+            EigenVectorArrayMap<T> acc(out + batch * N + c0, width);
+            const T* partial = partials_data + batch * (n_row_blocks - 1) * N + c0;
+            for (int64_t b = 0; b < n_row_blocks - 1; ++b, partial += N) {
+              acc += ConstEigenVectorArrayMap<T>(partial, width);
             }
           });
     }
   }
 
+ public:
   static void FastReduceKRK(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
                             Tensor& output, concurrency::ThreadPool* tp) {
     int64_t N = fast_shape[2];
     const T* data = input.Data<T>();
-    int64_t stridei = fast_shape[1] * fast_shape[2];
-    int64_t strideo = fast_shape[2];
     T* out = output.MutableData<T>();
 
     if constexpr (std::is_integral_v<T>) {
+      int64_t stridei = fast_shape[1] * fast_shape[2];
+      int64_t strideo = fast_shape[2];
       // Accumulate the middle dimension in double to avoid signed overflow UB.
       concurrency::ThreadPool::TryParallelFor(
           tp, onnxruntime::narrow<ptrdiff_t>(fast_shape[0]),
@@ -389,18 +488,7 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
             }
           });
     } else {
-      std::vector<T> one(onnxruntime::narrow<size_t>(fast_shape[1]), 1);
-      concurrency::ThreadPool::TryParallelFor(
-          tp, onnxruntime::narrow<ptrdiff_t>(fast_shape[0]),
-          ParallelReduceFastCost(fast_shape[1], fast_shape[2], sizeof(T), 6),
-          [one, data, fast_shape, stridei, strideo, out, N](ptrdiff_t begin, ptrdiff_t last) {
-            for (ptrdiff_t d = begin; d < last; ++d) {
-              math::MatMul<T>(1, onnxruntime::narrow<ptrdiff_t>(N),
-                              onnxruntime::narrow<ptrdiff_t>(fast_shape[1]),
-                              one.data(), data + stridei * d,
-                              out + strideo * d, nullptr, nullptr);
-            }
-          });
+      FastReduceRKFloat(data, out, fast_shape[0], fast_shape[1], N, tp);
     }
   }
 
