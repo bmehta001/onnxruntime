@@ -111,6 +111,9 @@ if(onnxruntime_USE_MIMALLOC)
   set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(MI_DEBUG_FULL OFF CACHE BOOL "" FORCE)
   set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+  # mimalloc >= 2.5 compiles arm64 with /arch:armv8.1 (-march=armv8.1-a) by default. Keep the ARMv8.0 baseline
+  # that ORT supports.
+  set(MI_NO_OPT_ARCH ON CACHE BOOL "" FORCE)
   onnxruntime_fetchcontent_declare(
     mimalloc
     URL ${DEP_URL_mimalloc}
