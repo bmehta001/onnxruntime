@@ -12,8 +12,8 @@ onnxruntime_fetchcontent_declare(
     Eigen3
     URL ${DEP_URL_eigen}
     URL_HASH SHA1=${DEP_SHA1_eigen}
-    PATCH_COMMAND ${Patch_EXECUTABLE} --binary --ignore-whitespace -p1 < ${PATCH_EIGEN_S390X_WERROR} &&
-                  ${Patch_EXECUTABLE} --binary --ignore-whitespace -p1 < ${PATCH_EIGEN_PCMP_INT64}
+    PATCH_COMMAND ${ONNXRUNTIME_APPLY_PATCH} --binary --ignore-whitespace -p1 -i ${PATCH_EIGEN_S390X_WERROR} &&
+                  ${ONNXRUNTIME_APPLY_PATCH} --binary --ignore-whitespace -p1 -i ${PATCH_EIGEN_PCMP_INT64}
     EXCLUDE_FROM_ALL
 )
 onnxruntime_fetchcontent_makeavailable(Eigen3)

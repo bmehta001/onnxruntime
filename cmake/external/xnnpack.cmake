@@ -84,8 +84,8 @@ endif()
 
 
 onnxruntime_fetchcontent_declare(googlexnnpack URL ${DEP_URL_googlexnnpack} URL_HASH SHA1=${DEP_SHA1_googlexnnpack}
-                     PATCH_COMMAND ${Patch_EXECUTABLE} --binary --ignore-whitespace -p1 < ${PROJECT_SOURCE_DIR}/patches/xnnpack/AddEmscriptenAndIosSupport.patch &&
-                                   ${Patch_EXECUTABLE} --ignore-whitespace -p1 < ${PROJECT_SOURCE_DIR}/patches/xnnpack/release_cpuinfo_after_hardware_config.patch
+                     PATCH_COMMAND ${ONNXRUNTIME_APPLY_PATCH} --binary --ignore-whitespace -p1 -i ${PROJECT_SOURCE_DIR}/patches/xnnpack/AddEmscriptenAndIosSupport.patch &&
+                                   ${ONNXRUNTIME_APPLY_PATCH} --ignore-whitespace -p1 -i ${PROJECT_SOURCE_DIR}/patches/xnnpack/release_cpuinfo_after_hardware_config.patch
 		     EXCLUDE_FROM_ALL
                     )
 onnxruntime_fetchcontent_makeavailable(googlexnnpack)

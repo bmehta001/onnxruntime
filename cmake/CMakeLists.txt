@@ -640,6 +640,10 @@ endif()
 if(Patch_FOUND)
   message("Patch found: ${Patch_EXECUTABLE}")
 endif()
+# Use as `${ONNXRUNTIME_APPLY_PATCH} [patch args...] -i <patch_file>` in a FetchContent PATCH_COMMAND so the patch
+# step is skipped instead of failing when it re-runs on an already patched source tree.
+set(ONNXRUNTIME_APPLY_PATCH
+    ${CMAKE_COMMAND} -P ${PROJECT_SOURCE_DIR}/external/onnxruntime_apply_patch.cmake -- ${Patch_EXECUTABLE})
 
 if (CMAKE_CROSSCOMPILING)
   message("Doing crosscompiling")
