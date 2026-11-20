@@ -1702,6 +1702,148 @@ TEST_F(GraphTransformationTests, SkipLayerNormFusion_3DGamma_NoFusion) {
                                         TransformerLevel::Level2, 1, nullptr, post_graph_checker));
 }
 
+namespace {
+const Node* FindNodeByOpType(const Graph& graph, std::string_view op_type) {
+  for (const auto& node : graph.Nodes()) {
+    if (node.OpType() == op_type) {
+      return &node;
+    }
+  }
+  return nullptr;
+}
+
+// Pre-norm residual block: sum = Add(input, skip) feeds the norm and a second residual Add, so the fused node
+// must re-emit sum through output 3. When with_bias is set, the skip is Add(skip, bias) (Format 2).
+enum class NormKind { kLayerNorm,
+                      kSimplified,
+                      kRmsNorm };
+void BuildPreNormResidualBlock(ModelTestBuilder& builder, NormKind kind, bool with_bias, bool set_epsilon,
+                               bool use_inv_std_output = false) {
+  constexpr int64_t hidden_size = 48;
+  auto* input = builder.MakeInput<float>({2, 5, hidden_size}, -1.0f, 1.0f);
+  auto* skip = builder.MakeInput<float>({2, 5, hidden_size}, -1.0f, 1.0f);
+  auto* residual = builder.MakeInput<float>({2, 5, hidden_size}, -1.0f, 1.0f);
+  auto* gamma = builder.MakeInitializer<float>({hidden_size}, 0.5f, 1.5f);
+  auto* sum = builder.MakeIntermediate();
+  auto* norm_out = builder.MakeOutput();
+  auto* next_sum = builder.MakeOutput();
+
+  NodeArg* skip_in = skip;
+  if (with_bias) {
+    auto* bias = builder.MakeInitializer<float>({hidden_size}, -0.5f, 0.5f);
+    skip_in = builder.MakeIntermediate();
+    builder.AddNode("Add", {skip, bias}, {skip_in});
+  }
+  builder.AddNode("Add", {input, skip_in}, {sum});
+  builder.AddNode("Add", {sum, residual}, {next_sum});
+
+  std::vector<NodeArg*> norm_outputs{norm_out};
+  if (use_inv_std_output) {
+    norm_outputs.push_back(builder.MakeOutput());
+  }
+  Node* norm = nullptr;
+  if (kind == NormKind::kLayerNorm) {
+    auto* beta = builder.MakeInitializer<float>({hidden_size}, -0.5f, 0.5f);
+    norm = &builder.AddNode("LayerNormalization", {sum, gamma, beta}, norm_outputs);
+  } else {
+    norm = &builder.AddNode(kind == NormKind::kRmsNorm ? "RMSNormalization" : "SimplifiedLayerNormalization",
+                            {sum, gamma}, norm_outputs);
+  }
+  norm->AddAttribute("axis", static_cast<int64_t>(-1));
+  if (set_epsilon) {
+    norm->AddAttribute("epsilon", 1e-3f);
+  }
+}
+
+void CheckFusedPreNormNode(const Graph& graph, std::string_view fused_op_type, size_t num_inputs,
+                           float epsilon) {
+  auto op_to_count = CountOpsInGraph(graph);
+  ASSERT_EQ(op_to_count[std::string("com.microsoft.") + std::string(fused_op_type)], 1);
+  ASSERT_EQ(op_to_count["Add"], 1);  // Only the downstream residual Add remains.
+  ASSERT_EQ(op_to_count["LayerNormalization"] + op_to_count["SimplifiedLayerNormalization"] +
+                op_to_count["RMSNormalization"],
+            0);
+  const Node* fused = FindNodeByOpType(graph, fused_op_type);
+  ASSERT_NE(fused, nullptr);
+  ASSERT_EQ(fused->InputDefs().size(), num_inputs);
+  ASSERT_EQ(fused->OutputDefs().size(), 4u);
+  ASSERT_TRUE(fused->OutputDefs()[3]->Exists());
+  const Node* residual_add = FindNodeByOpType(graph, "Add");
+  ASSERT_NE(residual_add, nullptr);
+  ASSERT_EQ(residual_add->InputDefs()[0], fused->OutputDefs()[3]);
+  const auto& attrs = fused->GetAttributes();
+  auto eps_it = attrs.find("epsilon");
+  ASSERT_NE(eps_it, attrs.end());
+  ASSERT_FLOAT_EQ(eps_it->second.f(), epsilon);
+}
+}  // namespace
+
+TEST_F(GraphTransformationTests, SkipSimplifiedLayerNormFusion_PreNormResidual) {
+  for (const bool with_bias : {false, true}) {
+    auto build_test_case = [with_bias](ModelTestBuilder& builder) {
+      BuildPreNormResidualBlock(builder, NormKind::kSimplified, with_bias, /*set_epsilon*/ true);
+    };
+    auto check_session = [with_bias](InferenceSessionWrapper& session) {
+      CheckFusedPreNormNode(session.GetGraph(), "SkipSimplifiedLayerNormalization", with_bias ? 4u : 3u, 1e-3f);
+    };
+    TransformerTester(build_test_case, check_session, TransformerLevel::Default, TransformerLevel::Level2, 17,
+                      1e-5, 1e-5);
+  }
+}
+
+TEST_F(GraphTransformationTests, SkipSimplifiedLayerNormFusion_RMSNormalizationDefaultEpsilon) {
+  auto build_test_case = [](ModelTestBuilder& builder) {
+    BuildPreNormResidualBlock(builder, NormKind::kRmsNorm, /*with_bias*/ false, /*set_epsilon*/ false);
+  };
+  auto check_session = [](InferenceSessionWrapper& session) {
+    CheckFusedPreNormNode(session.GetGraph(), "SkipSimplifiedLayerNormalization", 3u, 1e-5f);
+  };
+  TransformerTester(build_test_case, check_session, TransformerLevel::Default, TransformerLevel::Level2, 23,
+                    1e-5, 1e-5);
+}
+
+TEST_F(GraphTransformationTests, SkipLayerNormFusion_PreNormResidualDefaultEpsilon) {
+  auto build_test_case = [](ModelTestBuilder& builder) {
+    BuildPreNormResidualBlock(builder, NormKind::kLayerNorm, /*with_bias*/ true, /*set_epsilon*/ false);
+  };
+  auto check_session = [](InferenceSessionWrapper& session) {
+    CheckFusedPreNormNode(session.GetGraph(), "SkipLayerNormalization", 5u, 1e-5f);
+  };
+  TransformerTester(build_test_case, check_session, TransformerLevel::Default, TransformerLevel::Level2, 17,
+                    1e-5, 1e-5);
+}
+
+// inv_std_var is output 1 of SimplifiedLayerNormalization but output 2 of SkipSimplifiedLayerNormalization.
+TEST_F(GraphTransformationTests, SkipSimplifiedLayerNormFusion_NoFusion_InvStdVarUsed) {
+  auto build_test_case = [](ModelTestBuilder& builder) {
+    BuildPreNormResidualBlock(builder, NormKind::kSimplified, /*with_bias*/ false, /*set_epsilon*/ true,
+                              /*use_inv_std_output*/ true);
+  };
+  auto check_session = [](InferenceSessionWrapper& session) {
+    auto op_to_count = CountOpsInGraph(session.GetGraph());
+    ASSERT_EQ(op_to_count["com.microsoft.SkipSimplifiedLayerNormalization"], 0);
+    ASSERT_EQ(op_to_count["SimplifiedLayerNormalization"], 1);
+    ASSERT_EQ(op_to_count["Add"], 2);
+  };
+  TransformerTester(build_test_case, check_session, TransformerLevel::Default, TransformerLevel::Level2, 17,
+                    1e-5, 1e-5);
+}
+
+// The simplified-norm and residual-sum variants are restricted to the CPU EP.
+TEST_F(GraphTransformationTests, SkipSimplifiedLayerNormFusion_NoFusion_NonCpuEp) {
+  auto build_test_case = [](ModelTestBuilder& builder) {
+    BuildPreNormResidualBlock(builder, NormKind::kSimplified, /*with_bias*/ false, /*set_epsilon*/ true);
+  };
+  auto post_graph_checker = [](Graph& graph) {
+    auto op_to_count = CountOpsInGraph(graph);
+    TEST_RETURN_IF_NOT(op_to_count["com.microsoft.SkipSimplifiedLayerNormalization"] == 0);
+    TEST_RETURN_IF_NOT(op_to_count["SimplifiedLayerNormalization"] == 1);
+    return Status::OK();
+  };
+  ASSERT_STATUS_OK(TestGraphTransformer(build_test_case, 17, *logger_, std::make_unique<SkipLayerNormFusion>(),
+                                        TransformerLevel::Level2, 1, nullptr, post_graph_checker));
+}
+
 TEST_F(GraphTransformationTests, GroupQueryAttentionFusionTest) {
   TestGQAFusion(
       MODEL_FOLDER "fusion/gqa_fusion_quantized_simple.onnx", 1, 0, logger_.get(),

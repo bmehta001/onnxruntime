@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <algorithm>
 #include <limits>
 
 #include "core/common/float16.h"
@@ -65,6 +66,29 @@ void ComputeJob(
   const T* p_skip = skip_data + (offset % skip_size);
   T* p_output = output_data + offset;
   T* p_skip_input_bias_add_output = skip_input_bias_add_output_data == nullptr ? nullptr : skip_input_bias_add_output_data + offset;
+
+  if constexpr (std::is_same_v<T, float>) {
+    // Materialize the residual sum in the output row (hot in L1), then normalize it in place with the
+    // vectorized MLAS kernel. Falls through to the scalar path when MLAS declines (e.g. short rows).
+    const size_t n = static_cast<size_t>(hidden_size);
+    MlasEltwiseAdd<float>(p_input, p_skip, p_output, n);
+    if (nullptr != bias_data) {
+      MlasEltwiseAdd<float>(p_output, bias_data, p_output, n);
+    }
+    if (nullptr != p_skip_input_bias_add_output) {
+      std::copy_n(p_output, n, p_skip_input_bias_add_output);
+    }
+    if (MlasLayerNormF32(p_output, gamma_data, simplified ? nullptr : beta_data, p_output,
+                         (simplified || mean_data == nullptr) ? nullptr : &mean_data[task_idx],
+                         inv_std_var_data == nullptr ? nullptr : &inv_std_var_data[task_idx],
+                         n, epsilon, simplified)) {
+      if (simplified && mean_data != nullptr) {
+        mean_data[task_idx] = 0.0f;
+      }
+      return;
+    }
+    // MLAS declined: the scalar loop below recomputes the (already materialized) sum.
+  }
 
   T mean(0.0f);
   T M2(0.0f);

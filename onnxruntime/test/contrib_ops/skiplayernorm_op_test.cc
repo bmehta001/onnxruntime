@@ -615,6 +615,78 @@ TEST(SkipLayerNormTest, SkipSimplifiedLayerNormStatistics) {
   test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
 }
 
+// Wide rows with an odd hidden size exercise the vectorized CPU path together with its scalar tail, plus every
+// optional output (mean, inv_std_var, input_skip_bias_sum).
+static void RunCpuWideRowTest(bool simplified, bool with_bias) {
+  constexpr int64_t rows = 3;
+  constexpr int64_t hidden_size = 1027;
+  constexpr float epsilon = 1e-5f;
+  const size_t size = static_cast<size_t>(rows * hidden_size);
+
+  std::vector<float> input_data(size), skip_data(size), gamma_data(hidden_size), beta_data(hidden_size),
+      bias_data(hidden_size);
+  for (size_t i = 0; i < size; ++i) {
+    input_data[i] = static_cast<float>(i % 7) * 0.25f - 0.5f + static_cast<float>(i / hidden_size);
+    skip_data[i] = static_cast<float>(i % 5) * 0.125f - 0.25f;
+  }
+  for (int64_t j = 0; j < hidden_size; ++j) {
+    gamma_data[j] = 1.0f + 0.01f * static_cast<float>(j % 10);
+    beta_data[j] = 0.05f * static_cast<float>(j % 3);
+    bias_data[j] = 0.02f * static_cast<float>(j % 11) - 0.1f;
+  }
+
+  std::vector<float> output_data(size), sum_output_data(size), mean_data(rows), inv_std_data(rows);
+  for (int64_t r = 0; r < rows; ++r) {
+    double mean = 0.0, mean_square = 0.0;
+    for (int64_t j = 0; j < hidden_size; ++j) {
+      const size_t k = static_cast<size_t>(r * hidden_size + j);
+      sum_output_data[k] = input_data[k] + skip_data[k] + (with_bias ? bias_data[j] : 0.0f);
+      mean += sum_output_data[k];
+      mean_square += static_cast<double>(sum_output_data[k]) * sum_output_data[k];
+    }
+    mean /= hidden_size;
+    mean_square /= hidden_size;
+    const double inv_std_dev = 1.0 / std::sqrt((simplified ? mean_square : mean_square - mean * mean) + epsilon);
+    mean_data[r] = simplified ? 0.0f : static_cast<float>(mean);
+    inv_std_data[r] = static_cast<float>(inv_std_dev);
+    for (int64_t j = 0; j < hidden_size; ++j) {
+      const size_t k = static_cast<size_t>(r * hidden_size + j);
+      const double normalized = (sum_output_data[k] - (simplified ? 0.0 : mean)) * inv_std_dev;
+      output_data[k] = static_cast<float>(normalized * gamma_data[j] + (simplified ? 0.0f : beta_data[j]));
+    }
+  }
+
+  OpTester test(simplified ? "SkipSimplifiedLayerNormalization" : "SkipLayerNormalization", 1, onnxruntime::kMSDomain);
+  test.AddInput<float>("input", {1, rows, hidden_size}, input_data);
+  test.AddInput<float>("skip", {1, rows, hidden_size}, skip_data);
+  test.AddInput<float>("gamma", {hidden_size}, gamma_data);
+  if (!simplified) {
+    test.AddInput<float>("beta", {hidden_size}, beta_data);
+  }
+  if (with_bias) {
+    test.AddInput<float>("bias", {hidden_size}, bias_data);
+  }
+  test.AddAttribute("epsilon", epsilon);
+  test.AddOutput<float>("output", {1, rows, hidden_size}, output_data, false, 1e-4f, 1e-4f);
+  test.AddOutput<float>("mean", {1, rows, 1}, mean_data, false, 1e-4f, 1e-4f);
+  test.AddOutput<float>("inv_std_var", {1, rows, 1}, inv_std_data, false, 1e-4f, 1e-4f);
+  test.AddOutput<float>("skip_input_bias_add_output", {1, rows, hidden_size}, sum_output_data);
+
+  std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+  execution_providers.push_back(DefaultCpuExecutionProvider());
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+}
+
+TEST(SkipLayerNormTest, SkipLayerNormCpuWideRow) {
+  RunCpuWideRowTest(/*simplified*/ false, /*with_bias*/ false);
+  RunCpuWideRowTest(/*simplified*/ false, /*with_bias*/ true);
+}
+
+TEST(SkipLayerNormTest, SkipSimplifiedLayerNormCpuWideRow) {
+  RunCpuWideRowTest(/*simplified*/ true, /*with_bias*/ false);
+  RunCpuWideRowTest(/*simplified*/ true, /*with_bias*/ true);
+}
+
 TEST(SkipLayerNormTest, SkipLayerNormBatch1_Float16) {
   int batch_size = 1;
   int sequence_length = 2;
