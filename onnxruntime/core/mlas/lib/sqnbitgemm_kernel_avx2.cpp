@@ -929,7 +929,7 @@ SQ4BitGemmM1Kernel_BlkLen16_CompFp32_avx2(
     }
 }
 
-// acc += a * (scale * (b - zp)) for 32 4-bit weights already widened to int32 lanes and 32 floats of A.
+// acc += a * (b - zp) for 32 4-bit weights already widened to int32 lanes and 32 floats of A.
 MLAS_FORCEINLINE void
 AccumulateQ4x32_CompFp32_avx2(
     __m256& acc,
@@ -938,14 +938,13 @@ AccumulateQ4x32_CompFp32_avx2(
     const __m256i& bv2_8_epi32,
     const __m256i& bv3_8_epi32,
     const __m256i& zp,
-    const __m256& scale_ps,
     const float* a_ptr
 )
 {
-    const __m256 bv0_8_ps = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(bv0_8_epi32, zp)), scale_ps);
-    const __m256 bv1_8_ps = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(bv1_8_epi32, zp)), scale_ps);
-    const __m256 bv2_8_ps = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(bv2_8_epi32, zp)), scale_ps);
-    const __m256 bv3_8_ps = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(bv3_8_epi32, zp)), scale_ps);
+    const __m256 bv0_8_ps = _mm256_cvtepi32_ps(_mm256_sub_epi32(bv0_8_epi32, zp));
+    const __m256 bv1_8_ps = _mm256_cvtepi32_ps(_mm256_sub_epi32(bv1_8_epi32, zp));
+    const __m256 bv2_8_ps = _mm256_cvtepi32_ps(_mm256_sub_epi32(bv2_8_epi32, zp));
+    const __m256 bv3_8_ps = _mm256_cvtepi32_ps(_mm256_sub_epi32(bv3_8_epi32, zp));
 
     acc = _mm256_fmadd_ps(bv0_8_ps, _mm256_loadu_ps(a_ptr), acc);
     acc = _mm256_fmadd_ps(bv1_8_ps, _mm256_loadu_ps(a_ptr + 8), acc);
@@ -1020,6 +1019,12 @@ ComputeDotProducts_BlkLen32Plus_CompFp32_avx2(
             });
         }
 
+        // sum(a * (b - zp)) over the block; the block scale is applied once per block after the kk loop.
+        __m256 blk_acc[NCols];
+        UnrolledLoop<NCols>([&](size_t i) {
+            blk_acc[i] = _mm256_setzero_ps();
+        });
+
         // 32 weights per subblock. The 64-weight packs of the BlkLen >= 64 layout are consumed whole so that
         // both nibbles of each loaded byte are used.
         constexpr size_t KStep = IsBlkLen64Layout ? 2 * SubBlkLen32 : SubBlkLen32;
@@ -1041,7 +1046,6 @@ ComputeDotProducts_BlkLen32Plus_CompFp32_avx2(
                     zp_value = offset[i];
                 }
                 const __m256i zp = _mm256_set1_epi32(zp_value);
-                const __m256 scale_ps = _mm256_set1_ps(scale_v[i]);
 
                 // Zero-extend each packed byte straight into an int32 lane, so a nibble is isolated with a single
                 // and/shift instead of an int8 -> int16 -> int32 widening chain.
@@ -1055,14 +1059,13 @@ ComputeDotProducts_BlkLen32Plus_CompFp32_avx2(
                     b_blk_data_col_ptr[i] += 2 * SubBlkStep16;
 
                     AccumulateQ4x32_CompFp32_avx2(
-                        acc[i], _mm256_and_si256(x0, lowMask32), _mm256_and_si256(x1, lowMask32),
-                        _mm256_and_si256(x2, lowMask32), _mm256_and_si256(x3, lowMask32), zp, scale_ps, a_ptr
+                        blk_acc[i], _mm256_and_si256(x0, lowMask32), _mm256_and_si256(x1, lowMask32),
+                        _mm256_and_si256(x2, lowMask32), _mm256_and_si256(x3, lowMask32), zp, a_ptr
                     );
                     if (kklen > (int)SubBlkLen32) {
                         AccumulateQ4x32_CompFp32_avx2(
-                            acc[i], _mm256_srli_epi32(x0, 4), _mm256_srli_epi32(x1, 4),
-                            _mm256_srli_epi32(x2, 4), _mm256_srli_epi32(x3, 4), zp, scale_ps,
-                            a_ptr + SubBlkLen32
+                            blk_acc[i], _mm256_srli_epi32(x0, 4), _mm256_srli_epi32(x1, 4),
+                            _mm256_srli_epi32(x2, 4), _mm256_srli_epi32(x3, 4), zp, a_ptr + SubBlkLen32
                         );
                     }
                 } else {
@@ -1070,12 +1073,16 @@ ComputeDotProducts_BlkLen32Plus_CompFp32_avx2(
                     b_blk_data_col_ptr[i] += SubBlkStep16;
 
                     AccumulateQ4x32_CompFp32_avx2(
-                        acc[i], _mm256_and_si256(x0, lowMask32), _mm256_and_si256(x1, lowMask32),
-                        _mm256_srli_epi32(x0, 4), _mm256_srli_epi32(x1, 4), zp, scale_ps, a_ptr
+                        blk_acc[i], _mm256_and_si256(x0, lowMask32), _mm256_and_si256(x1, lowMask32),
+                        _mm256_srli_epi32(x0, 4), _mm256_srli_epi32(x1, 4), zp, a_ptr
                     );
                 }
             });
         }  // kk
+
+        UnrolledLoop<NCols>([&](size_t i) {
+            acc[i] = _mm256_fmadd_ps(blk_acc[i], _mm256_set1_ps(scale_v[i]), acc[i]);
+        });
 
         b_blk_data_ptr += MlasQNBitBlkDataSizeInBytes(BlkBitWidth4, BlkLen);
         s++;
