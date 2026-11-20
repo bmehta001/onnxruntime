@@ -10,8 +10,8 @@ Module Name:
 
 Abstract:
 
-    This module implements a kernel for computing the error function for a
-    buffer of elements.
+    This module implements kernels for computing the error function and the
+    exact (erf based) Gelu function for a buffer of elements.
 
     This implementation uses AVX fused multiply/add instructions.
 
@@ -62,19 +62,26 @@ Abstract:
         .equ    Exp_C, 48 + ExpConstOffset
         .equ    Exp_X7F, 52 + ExpConstOffset
 
+        .equ    Gelu_Half, 56 + ExpConstOffset
+        .equ    Gelu_InvSqrt2, 60 + ExpConstOffset
+
 //
 // Stack frame layout for the erf kernel.
 //
         .equ    ErfBuffer0, 0
         .equ    ErfBuffer1, 128
-        .equ    ErfKernelFrame_CountN, 256
-        .equ    ErfKernelFrame_ReturnAddress, 256+8
+        .equ    GeluBuffer, 256
+        .equ    ErfKernelFrame_CountN, 384
+        .equ    ErfKernelFrame_ReturnAddress, 384+8
 
 /*++
 
 Routine Description:
 
-    This routine implements a vectorized kernel for the error function.
+    This macro generates a vectorized kernel for the error function or, if
+    IsGelu is nonzero, for exact Gelu: 0.5 * x * (1 + erf(x / sqrt(2))).
+    The Gelu kernel performs the scale, erf, and final steps in one pass
+    with the same operation order as the multi-pass formulation.
 
 Arguments:
 
@@ -90,20 +97,38 @@ Return Value:
 
 --*/
 
-        .globl  C_UNDERSCORE(MlasErfKernelFma3)
-C_UNDERSCORE(MlasErfKernelFma3):
+        .macro ErfKernelFunction FunctionName, IsGelu
+
+        FUNCTION_ENTRY \FunctionName\()
+
         sub     rsp,ErfKernelFrame_ReturnAddress
         lea     rax,C_UNDERSCORE(MlasErfConstants)[rip]
 
         sub     rdx,8*4
-        jb      .LErfProcessRemainingCount
+        jb      .LErfProcessRemainingCount\@
 
-.LComputeErf4x8Loop:
+.LComputeErf4x8Loop\@:
         vbroadcastss ymm15,ErfNegZero[rax]
         vmovups ymm0,YMMWORD PTR [rdi]          # original input vx0
         vmovups ymm1,YMMWORD PTR [rdi+32]       # original input vx1
         vmovups ymm2,YMMWORD PTR [rdi+64]       # original input vx2
         vmovups ymm3,YMMWORD PTR [rdi+96]       # original input vx3
+        .if \IsGelu
+        vbroadcastss ymm14,Gelu_Half[rax]
+        vmulps  ymm4,ymm0,ymm14                 # 0.5 * x
+        vmulps  ymm5,ymm1,ymm14
+        vmulps  ymm6,ymm2,ymm14
+        vmulps  ymm7,ymm3,ymm14
+        vbroadcastss ymm14,Gelu_InvSqrt2[rax]
+        vmovups YMMWORD PTR GeluBuffer[rsp],ymm4
+        vmovups YMMWORD PTR GeluBuffer[rsp+32],ymm5
+        vmovups YMMWORD PTR GeluBuffer[rsp+64],ymm6
+        vmovups YMMWORD PTR GeluBuffer[rsp+96],ymm7
+        vmulps  ymm0,ymm0,ymm14                 # x / sqrt(2)
+        vmulps  ymm1,ymm1,ymm14
+        vmulps  ymm2,ymm2,ymm14
+        vmulps  ymm3,ymm3,ymm14
+        .endif
 
         vandps  ymm4,ymm0,ymm15                 # vsign0
         vandps  ymm5,ymm1,ymm15                 # vsign1
@@ -186,7 +211,7 @@ C_UNDERSCORE(MlasErfKernelFma3):
         vmovups YMMWORD PTR ErfBuffer1[rsp+64],ymm10
         vmovups YMMWORD PTR ErfBuffer1[rsp+96],ymm11
 
-.BiggerNumbers:
+.BiggerNumbers\@:
         vbroadcastss ymm8,ErfBIG_P0[rax]
         vandps  ymm0,ymm4,ymm0
         vandps  ymm1,ymm5,ymm1
@@ -360,6 +385,16 @@ C_UNDERSCORE(MlasErfKernelFma3):
         vorps   ymm1,ymm9,YMMWORD PTR ErfBuffer0[rsp+32]
         vorps   ymm2,ymm10,YMMWORD PTR ErfBuffer0[rsp+64]
         vorps   ymm3,ymm11,YMMWORD PTR ErfBuffer0[rsp+96]
+        .if \IsGelu
+        vaddps  ymm0,ymm0,ymm15                 # (erf + 1) * (0.5 * x)
+        vaddps  ymm1,ymm1,ymm15
+        vaddps  ymm2,ymm2,ymm15
+        vaddps  ymm3,ymm3,ymm15
+        vmulps  ymm0,ymm0,YMMWORD PTR GeluBuffer[rsp]
+        vmulps  ymm1,ymm1,YMMWORD PTR GeluBuffer[rsp+32]
+        vmulps  ymm2,ymm2,YMMWORD PTR GeluBuffer[rsp+64]
+        vmulps  ymm3,ymm3,YMMWORD PTR GeluBuffer[rsp+96]
+        .endif
 
         vmovups YMMWORD PTR [rsi],ymm0
         vmovups YMMWORD PTR [rsi+32],ymm1
@@ -369,19 +404,26 @@ C_UNDERSCORE(MlasErfKernelFma3):
         add     rdi,32*4                        # advance by 4*8 elements
         add     rsi,32*4
         sub     rdx,32
-        jae     .LComputeErf4x8Loop
+        jae     .LComputeErf4x8Loop\@
 
-.LErfProcessRemainingCount:
+.LErfProcessRemainingCount\@:
         add     rdx,32                          # correct for over-subtract above
-        jz      .LErfBatchExp
+        jz      .LErfBatchExp\@
 
-.LErfProcess1x8:
+.LErfProcess1x8\@:
         mov     DWORD PTR ErfKernelFrame_CountN[rsp],edx
         vbroadcastss ymm3,DWORD PTR ErfKernelFrame_CountN[rsp]
 
         vpcmpgtd ymm3,ymm3,YMMWORD PTR C_UNDERSCORE(MlasMaskMoveAvx)[rip]
         vbroadcastss ymm15,ErfNegZero[rax]
         vmaskmovps ymm0,ymm3,YMMWORD PTR [rdi]  # original input vx0
+        .if \IsGelu
+        vbroadcastss ymm14,Gelu_Half[rax]
+        vmulps  ymm4,ymm0,ymm14                 # 0.5 * x
+        vbroadcastss ymm14,Gelu_InvSqrt2[rax]
+        vmovups YMMWORD PTR GeluBuffer[rsp],ymm4
+        vmulps  ymm0,ymm0,ymm14                 # x / sqrt(2)
+        .endif
 
         vandps  ymm4,ymm0,ymm15                 # vsign0
         vandnps ymm0,ymm15,ymm0                 # abs(vx0)  va0
@@ -418,7 +460,7 @@ C_UNDERSCORE(MlasErfKernelFma3):
 
         vmovups YMMWORD PTR ErfBuffer1[rsp],ymm8
 
-.BiggerNumbersRemaining:
+.BiggerNumbersRemaining\@:
         vbroadcastss ymm15,ErfBIG_P1[rax]
         vbroadcastss ymm8,ErfBIG_P0[rax]
         vandps  ymm0,ymm4,ymm0
@@ -502,16 +544,29 @@ C_UNDERSCORE(MlasErfKernelFma3):
         # copy sign
         vorps   ymm0,ymm8,YMMWORD PTR ErfBuffer0[rsp]
 
+        .if \IsGelu
+        vaddps  ymm0,ymm0,ymm15                 # (erf + 1) * (0.5 * x)
+        vmulps  ymm0,ymm0,YMMWORD PTR GeluBuffer[rsp]
+        .endif
         vmaskmovps YMMWORD PTR [rsi],ymm3,ymm0
 
         add     rdi,8*4
         add     rsi,8*4
         sub     rdx,8
-        jg      .LErfProcess1x8
+        jg      .LErfProcess1x8\@
 
-.LErfBatchExp:
+.LErfBatchExp\@:
         vzeroupper
         add     rsp,ErfKernelFrame_ReturnAddress
         ret
+
+        .endm
+
+//
+// Generate the erf and exact Gelu kernels.
+//
+
+        ErfKernelFunction MlasErfKernelFma3, 0
+        ErfKernelFunction MlasGeluErfKernelFma3, 1
 
         .end

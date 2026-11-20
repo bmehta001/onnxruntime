@@ -703,6 +703,7 @@ Return Value:
                 this->LogisticKernelRoutine = MlasComputeLogisticF32KernelFma3;
                 this->TanhKernelRoutine = MlasComputeTanhF32KernelFma3;
                 this->ErfKernelRoutine = MlasErfKernelFma3;
+                this->GeluErfKernelRoutine = MlasGeluErfKernelFma3;
                 this->QLinearAddS8Kernel = MlasQLinearAddS8KernelAvx2;
                 this->QLinearAddU8Kernel = MlasQLinearAddU8KernelAvx2;
                 this->ConvDepthwiseU8S8Kernel = MlasConvDepthwiseKernelAvx2<uint8_t, int8_t>;

@@ -47,10 +47,13 @@ DispatchedUnaryPathInfo GetGeluErfDispatchPathInfo() {
   if (GetMlasPlatform().GeluErfKernelRoutine == MlasGeluErfKernelAvx512F) {
     return {kFusedBytesPerElement, "avx512_fused"};
   }
+  if (GetMlasPlatform().GeluErfKernelRoutine == MlasGeluErfKernelFma3) {
+    return {kFusedBytesPerElement, "fma3_fused"};
+  }
 #endif
 
-  // The current non-AVX512 dispatch target falls back to the generic exact
-  // GELU(erf) implementation, which uses separate scale, erf, and final passes.
+  // Otherwise the generic exact GELU(erf) implementation uses separate scale,
+  // erf, and final passes.
   return {kGeluUnfusedBytesPerElement, "generic_fallback"};
 }
 
@@ -122,7 +125,8 @@ void RunUnfusedUnaryBenchmark(benchmark::State& state,
 }
 
 static void UnaryKernelArgs(benchmark::Benchmark* b) {
-  for (int n : {1, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256, 511, 512, 1024, 4096, 16384, 65536, 262144}) {
+  for (int n : {1, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256, 511, 512, 1024, 4096, 16384, 65536, 262144,
+                1048576, 16777216}) {
     b->Arg(n);
   }
 }
@@ -162,6 +166,11 @@ void BM_GeluErfDispatchExact(benchmark::State& state) {
       GetGeluErfDispatchPathInfo());
 }
 
+void BM_GeluErfGenericKernel(benchmark::State& state) {
+  // Generic multi-pass MLAS kernel (scale, dispatched erf, combine).
+  RunUnfusedUnaryBenchmark(state, MlasGeluErfKernel, kGeluMinValue, kGeluMaxValue, kGeluUnfusedBytesPerElement);
+}
+
 void BM_GeluErfUnfusedExact(benchmark::State& state) {
   // Unfused exact GELU(erf) baseline: scale by 1/sqrt(2), run erf, then apply the
   // final 0.5 * x * (erf(x / sqrt(2)) + 1) transform in a separate pass.
@@ -188,4 +197,5 @@ void BM_GeluErfUnfusedExact(benchmark::State& state) {
 BENCHMARK(BM_SiluDispatch)->Apply(UnaryKernelArgs)->UseRealTime();
 BENCHMARK(BM_SiluUnfusedDispatch)->Apply(UnaryKernelArgs)->UseRealTime();
 BENCHMARK(BM_GeluErfDispatchExact)->Apply(UnaryKernelArgs)->UseRealTime();
+BENCHMARK(BM_GeluErfGenericKernel)->Apply(UnaryKernelArgs)->UseRealTime();
 BENCHMARK(BM_GeluErfUnfusedExact)->Apply(UnaryKernelArgs)->UseRealTime();

@@ -62,6 +62,10 @@ MLAS_INTERNAL_DATA const MLAS_ERF_CONSTANTS MlasErfConstants = {
     1.00000000e+0f,
     1.25829120e+7f,
     127,
+
+    // Parameters for the fused exact Gelu kernel.
+    0.5f,
+    0.70710678118654752440f,
 };
 
 void

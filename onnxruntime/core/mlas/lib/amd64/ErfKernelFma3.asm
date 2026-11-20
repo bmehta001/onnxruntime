@@ -10,8 +10,8 @@
 ;
 ; Abstract:
 ;
-;   This module implements a kernel for computing the error function for a
-;   buffer of elements.
+;   This module implements kernels for computing the error function and the
+;   exact (erf based) Gelu function for a buffer of elements.
 ;
 ;   This implementation uses AVX fused multiply/add instructions.
 ;
@@ -64,6 +64,9 @@ ErfConstants STRUCT
         Exp_C DWORD ?
         Exp_X7F DWORD ?
 
+        Gelu_Half DWORD ?
+        Gelu_InvSqrt2 DWORD ?
+
 ErfConstants ENDS
 
 ;
@@ -74,6 +77,7 @@ ErfKernelFrame STRUCT
 
         ErfBuffer0 OWORD 8 DUP(?)
         ErfBuffer1 OWORD 8 DUP(?)
+        GeluBuffer OWORD 8 DUP(?)
         SavedXmm6 OWORD ?
         SavedXmm7 OWORD ?
         SavedXmm8 OWORD ?
@@ -99,7 +103,10 @@ ErfKernelFrame ENDS
 ;
 ; Routine Description:
 ;
-;   This routine implements a vectorized kernel for the error function.
+;   This macro generates a vectorized kernel for the error function or, if
+;   IsGelu is nonzero, for exact Gelu: 0.5 * x * (1 + erf(x / sqrt(2))).
+;   The Gelu kernel performs the scale, erf, and final steps in one pass
+;   with the same operation order as the multi-pass formulation.
 ;
 ; Arguments:
 ;
@@ -115,7 +122,9 @@ ErfKernelFrame ENDS
 ;
 ;--
 
-        NESTED_ENTRY MlasErfKernelFma3, _TEXT
+ErfKernelFunction MACRO FunctionName, IsGelu
+
+        NESTED_ENTRY FunctionName, _TEXT
 
         alloc_stack (ErfKernelFrame.ReturnAddress)
 
@@ -142,6 +151,22 @@ LComputeErf4x8Loop:
         vmovups ymm1,YMMWORD PTR [rcx+32]       ; original input vx1
         vmovups ymm2,YMMWORD PTR [rcx+64]       ; original input vx2
         vmovups ymm3,YMMWORD PTR [rcx+96]       ; original input vx3
+IF IsGelu
+        vbroadcastss ymm14,ErfConstants.Gelu_Half[rax]
+        vmulps  ymm4,ymm0,ymm14                 ; 0.5 * x
+        vmulps  ymm5,ymm1,ymm14
+        vmulps  ymm6,ymm2,ymm14
+        vmulps  ymm7,ymm3,ymm14
+        vbroadcastss ymm14,ErfConstants.Gelu_InvSqrt2[rax]
+        vmovups YMMWORD PTR ErfKernelFrame.GeluBuffer[rsp],ymm4
+        vmovups YMMWORD PTR ErfKernelFrame.GeluBuffer[rsp+32],ymm5
+        vmovups YMMWORD PTR ErfKernelFrame.GeluBuffer[rsp+64],ymm6
+        vmovups YMMWORD PTR ErfKernelFrame.GeluBuffer[rsp+96],ymm7
+        vmulps  ymm0,ymm0,ymm14                 ; x / sqrt(2)
+        vmulps  ymm1,ymm1,ymm14
+        vmulps  ymm2,ymm2,ymm14
+        vmulps  ymm3,ymm3,ymm14
+ENDIF
 
         vandps  ymm4,ymm0,ymm15                 ; vsign0
         vandps  ymm5,ymm1,ymm15                 ; vsign1
@@ -397,6 +422,16 @@ LBiggerNumbers:
         vorps   ymm1,ymm9,YMMWORD PTR 32+ErfKernelFrame.ErfBuffer0[rsp]
         vorps   ymm2,ymm10,YMMWORD PTR 64+ErfKernelFrame.ErfBuffer0[rsp]
         vorps   ymm3,ymm11,YMMWORD PTR 96+ErfKernelFrame.ErfBuffer0[rsp]
+IF IsGelu
+        vaddps  ymm0,ymm0,ymm15                 ; (erf + 1) * (0.5 * x)
+        vaddps  ymm1,ymm1,ymm15
+        vaddps  ymm2,ymm2,ymm15
+        vaddps  ymm3,ymm3,ymm15
+        vmulps  ymm0,ymm0,YMMWORD PTR ErfKernelFrame.GeluBuffer[rsp]
+        vmulps  ymm1,ymm1,YMMWORD PTR ErfKernelFrame.GeluBuffer[rsp+32]
+        vmulps  ymm2,ymm2,YMMWORD PTR ErfKernelFrame.GeluBuffer[rsp+64]
+        vmulps  ymm3,ymm3,YMMWORD PTR ErfKernelFrame.GeluBuffer[rsp+96]
+ENDIF
 
         vmovups YMMWORD PTR [rdx],ymm0
         vmovups YMMWORD PTR [rdx+32],ymm1
@@ -419,6 +454,13 @@ LErfProcess1x8:
         vpcmpgtd ymm3,ymm3,YMMWORD PTR [MlasMaskMoveAvx]
         vbroadcastss ymm15,ErfConstants.ErfNegZero[rax]
         vmaskmovps ymm0,ymm3,YMMWORD PTR [rcx]  ; original input vx0
+IF IsGelu
+        vbroadcastss ymm14,ErfConstants.Gelu_Half[rax]
+        vmulps  ymm4,ymm0,ymm14                 ; 0.5 * x
+        vbroadcastss ymm14,ErfConstants.Gelu_InvSqrt2[rax]
+        vmovups YMMWORD PTR ErfKernelFrame.GeluBuffer[rsp],ymm4
+        vmulps  ymm0,ymm0,ymm14                 ; x / sqrt(2)
+ENDIF
 
         vandps  ymm4,ymm0,ymm15                 ; vsign0
         vandnps ymm0,ymm15,ymm0                 ; abs(vx0)  va0
@@ -539,6 +581,10 @@ LBiggerNumbersRemaining:
         ; copy sign
         vorps   ymm0,ymm8,YMMWORD PTR ErfKernelFrame.ErfBuffer0[rsp]
 
+IF IsGelu
+        vaddps  ymm0,ymm0,ymm15                 ; (erf + 1) * (0.5 * x)
+        vmulps  ymm0,ymm0,YMMWORD PTR ErfKernelFrame.GeluBuffer[rsp]
+ENDIF
         vmaskmovps YMMWORD PTR [rdx],ymm3,ymm0
 
         add     rcx,8*4
@@ -564,6 +610,15 @@ LErfBatchExp:
 
         ret
 
-        NESTED_END MlasErfKernelFma3, _TEXT
+        NESTED_END FunctionName, _TEXT
+
+        ENDM
+
+;
+; Generate the erf and exact Gelu kernels.
+;
+
+        ErfKernelFunction MlasErfKernelFma3, 0
+        ErfKernelFunction MlasGeluErfKernelFma3, 1
 
         END

@@ -60,6 +60,9 @@ struct MLAS_ERF_CONSTANTS {
     float Exp_P6;
     float Exp_C;
     int32_t Exp_X7F;
+
+    float Gelu_Half;
+    float Gelu_InvSqrt2;
 };
 
 struct MLAS_LOGISTIC_CONSTANTS {
