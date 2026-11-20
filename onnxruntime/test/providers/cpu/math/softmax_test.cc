@@ -3,11 +3,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
+#include "core/framework/session_options.h"
 #include "core/session/environment.h"
 #include "test/providers/provider_test_utils.h"
+#include "test/util/include/default_providers.h"
 #include "test/common/cuda_op_test_utils.h"
 #include "test/common/dnnl_op_test_utils.h"
 
@@ -408,7 +411,8 @@ TEST(SoftmaxOperator, 2DInputReduceOnAxis1WithLargeDim) {
 // Exercises the opset-13 non-innermost-axis path: multiple and partial column blocks, outer > 1, and the case where
 // all trailing dims are 1.
 template <typename T>
-static void RunStridedAxisTest(const char* op, const std::vector<int64_t>& dims, int64_t axis) {
+static void RunStridedAxisTest(const char* op, const std::vector<int64_t>& dims, int64_t axis,
+                               int thread_pool_size = 0, std::vector<T>* actual = nullptr) {
   const bool log_softmax = std::string(op) == "LogSoftmax";
   size_t total = 1;
   for (auto d : dims) total *= static_cast<size_t>(d);
@@ -440,7 +444,30 @@ static void RunStridedAxisTest(const char* op, const std::vector<int64_t>& dims,
   test.AddAttribute("axis", axis);
   test.AddInput<T>("X", dims, x);
   test.AddOutput<T>("Y", dims, expected);
-  test.Run();
+  if (thread_pool_size == 0) {
+    test.Run();
+    return;
+  }
+
+  SessionOptions so;
+  so.intra_op_param.thread_pool_size = thread_pool_size;
+  test.Config(so).ConfigEp(DefaultCpuExecutionProvider()).RunWithConfig();
+  const auto y = test.GetFetches()[0].Get<Tensor>().DataAsSpan<T>();
+  actual->assign(y.begin(), y.end());
+}
+
+// The column blocking depends on the thread count, but each column is reduced in the same order regardless.
+TEST(SoftmaxOperator, NonInnermostAxisSameResultForAnyThreadCount) {
+  for (const char* op : {"Softmax", "LogSoftmax"}) {
+    for (const auto& dims : {std::vector<int64_t>{3, 150, 70}, std::vector<int64_t>{1, 21, 33, 40},
+                             std::vector<int64_t>{64, 40, 4}}) {
+      std::vector<float> y1, y8;
+      RunStridedAxisTest<float>(op, dims, 1, 1, &y1);
+      RunStridedAxisTest<float>(op, dims, 1, 8, &y8);
+      ASSERT_EQ(y1.size(), y8.size());
+      EXPECT_EQ(0, memcmp(y1.data(), y8.data(), y1.size() * sizeof(float))) << op;
+    }
+  }
 }
 
 TEST(SoftmaxOperator, NonInnermostAxis_opset13) {
@@ -451,6 +478,11 @@ TEST(SoftmaxOperator, NonInnermostAxis_opset13) {
     RunStridedAxisTest<float>(op, {4, 7, 1, 1}, 1);
     RunStridedAxisTest<double>(op, {2, 37, 300}, 1);
     RunStridedAxisTest<double>(op, {3, 5, 2, 600}, 0);
+    // Small inner dims, including rows longer than one gathered tile.
+    RunStridedAxisTest<float>(op, {3, 40, 6}, 1);
+    RunStridedAxisTest<float>(op, {5, 3, 7, 2}, -3);
+    RunStridedAxisTest<float>(op, {2, 20000, 3}, 1);
+    RunStridedAxisTest<double>(op, {3, 40, 6}, 1);
   }
 }
 
