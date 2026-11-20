@@ -52,9 +52,8 @@ DispatchedUnaryPathInfo GetGeluErfDispatchPathInfo() {
   }
 #endif
 
-  // Otherwise the generic exact GELU(erf) implementation uses separate scale,
-  // erf, and final passes.
-  return {kGeluUnfusedBytesPerElement, "generic_fallback"};
+  // Otherwise the portable single-pass MLAS_FLOAT32X4 kernel is used.
+  return {kFusedBytesPerElement, "generic_fused"};
 }
 
 std::vector<float> MakeInput(size_t n, float min_value, float max_value) {
@@ -167,8 +166,30 @@ void BM_GeluErfDispatchExact(benchmark::State& state) {
 }
 
 void BM_GeluErfGenericKernel(benchmark::State& state) {
-  // Generic multi-pass MLAS kernel (scale, dispatched erf, combine).
-  RunUnfusedUnaryBenchmark(state, MlasGeluErfKernel, kGeluMinValue, kGeluMaxValue, kGeluUnfusedBytesPerElement);
+  // Portable single-pass MLAS_FLOAT32X4 kernel used on platforms without a
+  // specialized GELU(erf) implementation (SSE-only x86, ARM64, WASM, POWER).
+  RunUnfusedUnaryBenchmark(state, MlasGeluErfKernel, kGeluMinValue, kGeluMaxValue, kFusedBytesPerElement);
+}
+
+void BM_GeluErfMultiPassGenericErf(benchmark::State& state) {
+  // Multi-pass GELU(erf) built on the portable erf kernel (scale, erf, combine),
+  // i.e. the generic GELU(erf) path before it was fused into a single pass.
+  RunUnfusedUnaryBenchmark(
+      state,
+      [](const float* input, float* output, size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+          output[i] = input[i] * kInvSqrt2;
+        }
+
+        MlasErfKernel(output, output, n);
+
+        for (size_t i = 0; i < n; ++i) {
+          output[i] = 0.5f * input[i] * (output[i] + 1.0f);
+        }
+      },
+      kGeluMinValue,
+      kGeluMaxValue,
+      kGeluUnfusedBytesPerElement);
 }
 
 void BM_GeluErfUnfusedExact(benchmark::State& state) {
@@ -198,4 +219,5 @@ BENCHMARK(BM_SiluDispatch)->Apply(UnaryKernelArgs)->UseRealTime();
 BENCHMARK(BM_SiluUnfusedDispatch)->Apply(UnaryKernelArgs)->UseRealTime();
 BENCHMARK(BM_GeluErfDispatchExact)->Apply(UnaryKernelArgs)->UseRealTime();
 BENCHMARK(BM_GeluErfGenericKernel)->Apply(UnaryKernelArgs)->UseRealTime();
+BENCHMARK(BM_GeluErfMultiPassGenericErf)->Apply(UnaryKernelArgs)->UseRealTime();
 BENCHMARK(BM_GeluErfUnfusedExact)->Apply(UnaryKernelArgs)->UseRealTime();

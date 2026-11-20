@@ -9,8 +9,6 @@
 #include <limits>
 #include <vector>
 
-#if defined(MLAS_TARGET_AMD64)
-
 namespace {
 
 // Same tolerances as the AVX512F GELU(erf) kernel test.
@@ -90,6 +88,18 @@ void FillInput(float* input, size_t size, uint32_t seed, float min_value, float 
   }
 }
 
+// Unfused GELU(erf) built from the portable erf kernel; this is what the
+// generic GELU(erf) kernel computed before it was fused into a single pass.
+void ComputeMultiPassGeluErf(const float* input, float* output, size_t size) {
+  for (size_t i = 0; i < size; ++i) {
+    output[i] = input[i] * 0.70710678118654752440f;
+  }
+  MlasErfKernel(output, output, size);
+  for (size_t i = 0; i < size; ++i) {
+    output[i] = 0.5f * input[i] * (output[i] + 1.0f);
+  }
+}
+
 // Checks a GELU(erf) kernel against an expected MLAS result and a double-precision erf reference.
 void CheckGeluErf(const char* name, const float* input, const float* actual, const float* expected, size_t size) {
   ASSERT_EQ(actual[size], kTailSentinel) << name << " wrote past the end, size=" << size;
@@ -119,6 +129,43 @@ void RunGeluErfCases(Runner&& run) {
     }
   }
 }
+
+class MlasGeluErfGenericTest : public MlasTestBase {
+ private:
+  MatrixGuardBuffer<float> input_buffer_;
+  MatrixGuardBuffer<float> expected_buffer_;
+  MatrixGuardBuffer<float> output_buffer_;
+
+  void Execute(size_t size, uint32_t seed, float min_value, float max_value) {
+    // Allocate one extra element to detect writes past the tail.
+    float* input = input_buffer_.GetBuffer(size + 1);
+    float* expected = expected_buffer_.GetBuffer(size + 1);
+    float* output = output_buffer_.GetBuffer(size + 1);
+
+    FillInput(input, size, seed, min_value, max_value);
+    for (size_t i = 0; i < size + 1; ++i) {
+      output[i] = kTailSentinel;
+    }
+
+    ComputeMultiPassGeluErf(input, expected, size);
+    MlasGeluErfKernel(input, output, size);
+
+    CheckGeluErf("Generic GELU(erf)", input, output, expected, size);
+  }
+
+ public:
+  static const char* GetTestSuiteName() {
+    return "GeluErfGeneric";
+  }
+
+  void ExecuteShort() override {
+    RunGeluErfCases([this](size_t size, uint32_t seed, float min_value, float max_value) {
+      Execute(size, seed, min_value, max_value);
+    });
+  }
+};
+
+#if defined(MLAS_TARGET_AMD64)
 
 class MlasGeluErfFma3Test : public MlasTestBase {
  private:
@@ -177,21 +224,18 @@ class MlasGeluErfFma3DispatchTest : public MlasTestBase {
   }
 };
 
+#endif
+
 }  // namespace
 
 static UNUSED_VARIABLE bool added_to_main = AddTestRegister([](bool is_short_execute) {
   size_t count = 0;
   if (is_short_execute) {
+    count += MlasDirectShortExecuteTests<MlasGeluErfGenericTest>::RegisterShortExecute();
+#if defined(MLAS_TARGET_AMD64)
     count += MlasDirectShortExecuteTests<MlasGeluErfFma3Test>::RegisterShortExecute();
     count += MlasDirectShortExecuteTests<MlasGeluErfFma3DispatchTest>::RegisterShortExecute();
+#endif
   }
   return count;
 });
-
-#else
-
-static UNUSED_VARIABLE bool added_to_main = AddTestRegister([](bool) {
-  return size_t{0};
-});
-
-#endif
