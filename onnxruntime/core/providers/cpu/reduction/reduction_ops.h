@@ -12,6 +12,7 @@
 
 #ifndef SHARED_PROVIDER
 #include "core/common/common.h"
+#include "core/common/cpuid_info.h"
 #include "core/common/optional.h"
 #include "core/framework/op_kernel.h"
 #include "core/providers/cpu/containers.h"
@@ -306,7 +307,7 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
     return FastReduceKind::kKR | FastReduceKind::kRK | FastReduceKind::kKRK | FastReduceKind::kRKR;
   }
 
-  // The floating-point FastReduceRK/FastReduceKRK size their tasks from the shape and thread count.
+  // The floating-point FastReduceRK/FastReduceKRK split any shape into tasks of bounded size.
   static inline bool FastReduceRKAndKRKScaleToAnyShape() { return !std::is_integral_v<T>; }
 
   static void FastReduceKR(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
@@ -366,8 +367,13 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
                                 concurrency::ThreadPool* tp) {
     // Column tile size in elements; keeps a task's accumulator tile resident in L1.
     constexpr int64_t kMaxColTile = 2048;
-    // Minimum number of input elements per task so that small inputs are not over-split.
+    // Inputs with at most this many elements are reduced by a single task.
     constexpr int64_t kMinElementsPerTask = 32768;
+    // Input elements per (row block, column tile) task: about kTargetTasks tasks for mid-sized inputs, clamped so
+    // tasks stay long enough to amortize their overhead and short enough to keep large inputs well balanced.
+    constexpr int64_t kTargetTasks = 16;
+    constexpr int64_t kMinTaskElements = 65536;
+    constexpr int64_t kMaxTaskElements = 262144;
 
     if (n_batch == 0 || n_rows == 0 || N == 0) {
       return;
@@ -376,29 +382,43 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
     if (is_small) {
       tp = nullptr;
     }
-    const int64_t dop = concurrency::ThreadPool::DegreeOfParallelism(tp);
-    // Batches alone provide enough parallelism when n_batch >= dop; keep full rows so each GEMV is as long as
-    // possible. Otherwise split columns into tiles to create more tasks.
-    const int64_t n_col_tiles = n_batch >= dop ? 1 : (N + kMaxColTile - 1) / kMaxColTile;
-    const int64_t col_tile = (N + n_col_tiles - 1) / n_col_tiles;
+    // The row partition depends only on the shape so that the summation order, and therefore the result, does not
+    // depend on the number of threads.
+    const int64_t canonical_col_tiles = is_small ? 1 : (N + kMaxColTile - 1) / kMaxColTile;
+    const int64_t canonical_col_tile = (N + canonical_col_tiles - 1) / canonical_col_tiles;
+    const int64_t elements_per_task =
+        std::clamp(n_batch * n_rows * N / kTargetTasks, kMinTaskElements, kMaxTaskElements);
+    const int64_t rows_per_block =
+        is_small ? n_rows : std::min(n_rows, std::max<int64_t>(1, elements_per_task / canonical_col_tile));
+    const int64_t n_row_blocks = (n_rows + rows_per_block - 1) / rows_per_block;
 
-    int64_t n_row_blocks = 1;
-    if (n_batch * n_col_tiles < dop) {
-      const int64_t max_blocks_by_work = std::max<int64_t>(1, n_rows * col_tile / kMinElementsPerTask);
-      n_row_blocks = std::min({(dop + n_batch * n_col_tiles - 1) / (n_batch * n_col_tiles),
-                               max_blocks_by_work, n_rows});
+    // Each task sums its rows as a GEMV with a vector of ones, which uses MLAS's M == 1 kernel. Small inputs use
+    // a plain loop to avoid the GEMV setup cost.
+    const bool use_gemv = !is_small && N <= std::numeric_limits<int>::max() &&
+                          rows_per_block <= std::numeric_limits<int>::max();
+
+    // Column tiling may follow the thread count only where a column's result does not depend on how the columns
+    // are grouped: the plain loop and the second pass are element-wise, and the MLAS AVX M == 1 SGEMM kernel
+    // accumulates each column in the same order regardless of the GEMV width. Other GEMV paths (SSE-only and
+    // non-x86 SGEMM, DGEMM) may block K by N, so they keep the canonical tiles.
+    bool col_grouping_invariant = !use_gemv;
+#if (defined(_M_AMD64) || defined(__x86_64__)) && !defined(FORCE_GENERIC_ALGORITHMS)
+    if constexpr (std::is_same_v<T, float>) {
+      col_grouping_invariant = col_grouping_invariant || CPUIDInfo::GetCPUIDInfo().HasAVX();
     }
-    const int64_t rows_per_block = (n_rows + n_row_blocks - 1) / n_row_blocks;
-    n_row_blocks = (n_rows + rows_per_block - 1) / rows_per_block;
+#endif
+    // Full rows give each GEMV the longest contiguous stream when batches and row blocks already provide enough
+    // tasks for the available threads.
+    const int64_t n_col_tiles =
+        col_grouping_invariant && n_batch * n_row_blocks >= concurrency::ThreadPool::DegreeOfParallelism(tp)
+            ? 1
+            : canonical_col_tiles;
+    const int64_t col_tile = (N + n_col_tiles - 1) / n_col_tiles;
     const int64_t tasks_per_batch = n_row_blocks * n_col_tiles;
 
     // Row block 0 accumulates directly into the output; the others use scratch buffers.
     std::vector<T> partials(SafeInt<size_t>(n_batch) * (n_row_blocks - 1) * onnxruntime::narrow<size_t>(N));
     T* partials_data = partials.data();
-    // Each task sums its rows as a GEMV with a vector of ones, which uses MLAS's M == 1 kernel. Small inputs use
-    // a plain loop to avoid the GEMV setup cost.
-    const bool use_gemv = !is_small && N <= std::numeric_limits<int>::max() &&
-                          rows_per_block <= std::numeric_limits<int>::max();
     std::vector<T> ones(use_gemv ? onnxruntime::narrow<size_t>(rows_per_block) : 0, static_cast<T>(1));
     const T* ones_data = ones.data();
 
@@ -426,14 +446,9 @@ class ReduceAggregatorSum : public ReduceAggregator<T, T> {
           }
           EigenVectorArrayMap<T> acc(acc_data, width);
           acc = ConstEigenVectorArrayMap<T>(p, width);
-          int64_t r = r_begin + 1;
           p += N;
-          // Add four rows per pass to cut accumulator loads/stores.
-          for (; r + 4 <= r_end; r += 4, p += 4 * N) {
-            acc += (ConstEigenVectorArrayMap<T>(p, width) + ConstEigenVectorArrayMap<T>(p + N, width)) +
-                   (ConstEigenVectorArrayMap<T>(p + 2 * N, width) + ConstEigenVectorArrayMap<T>(p + 3 * N, width));
-          }
-          for (; r < r_end; ++r, p += N) {
+          // Add rows one at a time, in order, so small inputs give bitwise the same result as the generic path.
+          for (int64_t r = r_begin + 1; r < r_end; ++r, p += N) {
             acc += ConstEigenVectorArrayMap<T>(p, width);
           }
         });

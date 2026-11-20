@@ -4,6 +4,7 @@
 #include <array>
 #include <random>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 #include "gtest/gtest.h"
@@ -6110,6 +6111,59 @@ TEST(ReductionOpTest, ReduceSumMean_RK_KRK_FastPath_RowAndColumnBlocks) {
       }
     }
   }
+}
+
+TEST(ReductionOpTest, ReduceSumMean_RK_KRK_FastPath_ThreadCountInvariant) {
+  // Shapes that are split into several row blocks and/or column tiles.
+  const std::vector<std::array<int64_t, 3>> shapes = {
+      {1, 2048, 1024}, {1, 16384, 64}, {1, 65536, 16}, {1, 64, 65536}, {4, 1024, 256}, {3, 300, 4100}};
+  auto allocator = std::make_shared<CPUAllocator>();
+
+  auto run = [&](auto type_tag) {
+    using T = decltype(type_tag);
+    std::mt19937 gen(321);
+    std::uniform_real_distribution<T> dist(static_cast<T>(-1), static_cast<T>(1));
+    std::vector<std::unique_ptr<concurrency::ThreadPool>> pools;
+    for (int num_threads : {2, 3, 8}) {
+      OrtThreadPoolParams params;
+      params.thread_pool_size = num_threads;
+      pools.push_back(concurrency::CreateThreadPool(&Env::Default(), params, concurrency::ThreadPoolType::INTRA_OP));
+    }
+    for (const auto& [n_batch, n_rows, n_cols] : shapes) {
+      SCOPED_TRACE(MakeString("shape=[", n_batch, ",", n_rows, ",", n_cols, "]"));
+      Tensor input(DataTypeImpl::GetType<T>(), TensorShape({n_batch, n_rows, n_cols}), allocator);
+      T* in = input.MutableData<T>();
+      for (int64_t i = 0; i < input.Shape().Size(); ++i) {
+        in[i] = dist(gen);
+      }
+      const std::vector<int64_t> krk_shape = {n_batch, n_rows, n_cols};
+      const std::vector<int64_t> rk_shape = {n_rows, n_cols};
+      auto reduce = [&](concurrency::ThreadPool* tp, bool rk, bool mean) {
+        Tensor out(DataTypeImpl::GetType<T>(), TensorShape({n_batch, n_cols}), allocator);
+        if (rk) {
+          mean ? ReduceAggregatorMean<T>::FastReduceRK(input, rk_shape, out, tp)
+               : ReduceAggregatorSum<T>::FastReduceRK(input, rk_shape, out, tp);
+        } else {
+          mean ? ReduceAggregatorMean<T>::FastReduceKRK(input, krk_shape, out, tp)
+               : ReduceAggregatorSum<T>::FastReduceKRK(input, krk_shape, out, tp);
+        }
+        return std::vector<T>(out.Data<T>(), out.Data<T>() + out.Shape().Size());
+      };
+      for (bool rk : {false, true}) {
+        if (rk && n_batch != 1) continue;
+        for (bool mean : {false, true}) {
+          const auto expected = reduce(nullptr, rk, mean);
+          for (auto& pool : pools) {
+            const auto actual = reduce(pool.get(), rk, mean);
+            ASSERT_EQ(0, std::memcmp(expected.data(), actual.data(), expected.size() * sizeof(T)))
+                << "rk=" << rk << " mean=" << mean << " dop=" << concurrency::ThreadPool::DegreeOfParallelism(pool.get());
+          }
+        }
+      }
+    }
+  };
+  run(float{});
+  run(double{});
 }
 
 TEST(ReductionOpTest, ReduceMean_RK_keepdims_large_odd) {
