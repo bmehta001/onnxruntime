@@ -1,7 +1,9 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <algorithm>
 #include <cmath>
+#include <string_view>
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -403,6 +405,94 @@ TEST(SoftmaxOperator, 2DInputReduceOnAxis1WithLargeDim) {
 
   RunTest(x_vals, expected_vals, dimensions);
 }
+
+// Reference opset-13 Softmax/LogSoftmax over `axis` of a row-major tensor, viewed as [outer, axis_dim, inner].
+static std::vector<float> ReferenceSoftmaxOverAxis(const std::vector<float>& x, const std::vector<int64_t>& dims,
+                                                   int64_t axis, bool log_softmax) {
+  int64_t outer = 1, inner = 1;
+  for (int64_t i = 0; i < axis; ++i) outer *= dims[i];
+  for (size_t i = static_cast<size_t>(axis) + 1; i < dims.size(); ++i) inner *= dims[i];
+  const int64_t axis_dim = dims[axis];
+  std::vector<float> y(x.size());
+  for (int64_t o = 0; o < outer; ++o) {
+    for (int64_t c = 0; c < inner; ++c) {
+      const auto at = [&](int64_t d) { return static_cast<size_t>((o * axis_dim + d) * inner + c); };
+      double max_val = x[at(0)];
+      for (int64_t d = 1; d < axis_dim; ++d) max_val = std::max(max_val, static_cast<double>(x[at(d)]));
+      double sum = 0.0;
+      for (int64_t d = 0; d < axis_dim; ++d) sum += std::exp(x[at(d)] - max_val);
+      for (int64_t d = 0; d < axis_dim; ++d) {
+        y[at(d)] = static_cast<float>(log_softmax ? x[at(d)] - max_val - std::log(sum)
+                                                  : std::exp(x[at(d)] - max_val) / sum);
+      }
+    }
+  }
+  return y;
+}
+
+static std::vector<float> MakeSoftmaxTestInput(size_t size) {
+  std::vector<float> x(size);
+  for (size_t i = 0; i < size; ++i) {
+    // Deterministic values in [-5, 5] plus an occasional large offset to exercise max subtraction.
+    x[i] = static_cast<float>((i * 37) % 101) / 10.0f - 5.0f + ((i % 97) == 0 ? 60.0f : 0.0f);
+  }
+  return x;
+}
+
+static void RunNonInnermostAxisTest(const char* op_type, const std::vector<int64_t>& dims, int64_t axis) {
+  size_t size = 1;
+  for (auto d : dims) size *= static_cast<size_t>(d);
+  const auto x = MakeSoftmaxTestInput(size);
+  const auto y = ReferenceSoftmaxOverAxis(x, dims, axis, std::string_view(op_type) == "LogSoftmax");
+
+  OpTester test(op_type, 13);
+  test.AddAttribute("axis", axis);
+  test.AddInput<float>("X", dims, x);
+  test.AddOutput<float>("Y", dims, y);
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider, kOpenVINOExecutionProvider});
+}
+
+// Opset-13 softmax over a non-innermost axis. The shapes cover partial column tiles (inner not a multiple of 32),
+// an axis longer than one thread-block stride, tiny inner dims, a trailing dim of 1, and outer > 65535 (grid-stride).
+TEST(SoftmaxOperator, NonInnermostAxis_opset13) {
+  for (const char* op_type : {"Softmax", "LogSoftmax"}) {
+    SCOPED_TRACE(op_type);
+    RunNonInnermostAxisTest(op_type, {3, 70, 37}, 1);
+    RunNonInnermostAxisTest(op_type, {600, 3}, 0);
+    RunNonInnermostAxisTest(op_type, {2, 3, 4, 5}, 0);
+    RunNonInnermostAxisTest(op_type, {2, 3, 4, 5}, 1);
+    RunNonInnermostAxisTest(op_type, {2, 3, 4, 5}, 2);
+    RunNonInnermostAxisTest(op_type, {4, 5, 1}, 1);
+    RunNonInnermostAxisTest(op_type, {70000, 2, 2}, 1);
+  }
+}
+
+#if defined(USE_CUDA)
+TEST(SoftmaxOperator, NonInnermostAxis_fp16_opset13) {
+  if (!HasCudaEnvironment(530)) {
+    GTEST_SKIP() << "CUDA FP16 not supported";
+  }
+  const std::vector<int64_t> dims = {8, 64, 40};
+  const int64_t axis = 1;
+  const size_t size = 8 * 64 * 40;
+  const auto x = MakeSoftmaxTestInput(size);
+  for (const char* op_type : {"Softmax", "LogSoftmax"}) {
+    SCOPED_TRACE(op_type);
+    const auto y = ReferenceSoftmaxOverAxis(x, dims, axis, std::string_view(op_type) == "LogSoftmax");
+    std::vector<MLFloat16> x_fp16(size), y_fp16(size);
+    ConvertFloatToMLFloat16(x.data(), x_fp16.data(), size);
+    ConvertFloatToMLFloat16(y.data(), y_fp16.data(), size);
+
+    OpTester test(op_type, 13);
+    test.AddAttribute("axis", axis);
+    test.AddInput<MLFloat16>("X", dims, x_fp16);
+    test.AddOutput<MLFloat16>("Y", dims, y_fp16);
+    std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+    execution_providers.push_back(DefaultCudaExecutionProvider());
+    test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+  }
+}
+#endif  // USE_CUDA
 
 // Regression test for NNAPI handling of a Softmax with opset < 13 where the input has been converted to NHWC.
 // The NNAPI handling of the axis is different so we need to manually coerce the input to 2D, which will negate the

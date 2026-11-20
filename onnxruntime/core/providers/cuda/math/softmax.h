@@ -27,6 +27,11 @@ template <typename input_t, typename output_t, typename acc_t, bool is_log_softm
 Status dispatch_blockwise_softmax_forward(SoftmaxComputeStreamT stream, output_t* output, const input_t* input,
                                           int softmax_elements, int input_stride, int output_stride, int batch_count);
 
+// Softmax over the middle dim of an [outer, axis_dim, inner] tensor without transposing.
+template <typename input_t, typename output_t, typename acc_t, bool is_log_softmax>
+Status dispatch_strided_softmax_forward(SoftmaxComputeStreamT stream, output_t* dst, const input_t* src,
+                                        int64_t outer, int64_t axis_dim, int64_t inner);
+
 template <typename T>
 class Softmax final : public CudaKernel {
  public:

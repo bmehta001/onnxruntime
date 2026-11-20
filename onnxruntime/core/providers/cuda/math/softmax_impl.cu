@@ -147,5 +147,128 @@ SPECIALIZED_BLOCKWISE_SOFTMAX_IMPL(half, half, float)
 SPECIALIZED_BLOCKWISE_SOFTMAX_IMPL(half, float, float)
 SPECIALIZED_BLOCKWISE_SOFTMAX_IMPL(double, double, double)
 SPECIALIZED_BLOCKWISE_SOFTMAX_IMPL(BFloat16, BFloat16, float)
+
+namespace {
+
+// Merges two online-softmax partials (running max m, running sum s of exp(x - m)).
+// The running max starts at lowest() rather than -inf so that merging two empty partials yields 0, not NaN.
+template <typename acc_t>
+__device__ __forceinline__ void OnlineSoftmaxMerge(acc_t& m, acc_t& s, acc_t other_m, acc_t other_s) {
+  const acc_t new_m = m > other_m ? m : other_m;
+  s = s * std::exp(m - new_m) + other_s * std::exp(other_m - new_m);
+  m = new_m;
+}
+
+// Each block handles blockDim.x adjacent inner columns of one or more outer slices. threadIdx.x walks the
+// contiguous inner dim (coalesced loads) and threadIdx.y strides over the softmax axis. Partials are combined
+// with a shared-memory tree over threadIdx.y, so blockDim.y must be a power of two.
+template <typename input_t, typename output_t, typename acc_t, bool is_log_softmax>
+__global__ void softmax_strided_forward(output_t* dst, const input_t* src, int64_t outer, int64_t axis_dim,
+                                        int64_t inner) {
+  extern __shared__ unsigned char softmax_strided_smem[];
+  acc_t* smem_m = reinterpret_cast<acc_t*>(softmax_strided_smem);
+  acc_t* smem_s = smem_m + blockDim.x * blockDim.y;
+
+  const int64_t col = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const bool active = col < inner;
+  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+
+  for (int64_t o = blockIdx.y; o < outer; o += gridDim.y) {
+    const int64_t base = o * axis_dim * inner + col;
+
+    acc_t m = std::numeric_limits<acc_t>::lowest();
+    acc_t s = acc_t(0);
+    if (active) {
+#pragma unroll 4
+      for (int64_t d = threadIdx.y; d < axis_dim; d += blockDim.y) {
+        const acc_t x = static_cast<acc_t>(src[base + d * inner]);
+        if (x > m) {
+          s = s * std::exp(m - x) + acc_t(1);
+          m = x;
+        } else {
+          s += std::exp(x - m);
+        }
+      }
+    }
+
+    smem_m[tid] = m;
+    smem_s[tid] = s;
+    __syncthreads();
+    for (unsigned int stride = blockDim.y / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.y < stride) {
+        const int other = tid + stride * blockDim.x;
+        OnlineSoftmaxMerge(m, s, smem_m[other], smem_s[other]);
+        smem_m[tid] = m;
+        smem_s[tid] = s;
+      }
+      __syncthreads();
+    }
+    m = smem_m[threadIdx.x];
+    s = smem_s[threadIdx.x];
+    // The next outer iteration overwrites shared memory.
+    __syncthreads();
+
+    if (active) {
+      if constexpr (is_log_softmax) {
+        const acc_t shift = m + std::log(s);
+#pragma unroll 4
+        for (int64_t d = threadIdx.y; d < axis_dim; d += blockDim.y) {
+          const int64_t idx = base + d * inner;
+          dst[idx] = static_cast<output_t>(static_cast<acc_t>(src[idx]) - shift);
+        }
+      } else {
+        const acc_t inv_s = acc_t(1) / s;
+#pragma unroll 4
+        for (int64_t d = threadIdx.y; d < axis_dim; d += blockDim.y) {
+          const int64_t idx = base + d * inner;
+          dst[idx] = static_cast<output_t>(std::exp(static_cast<acc_t>(src[idx]) - m) * inv_s);
+        }
+      }
+    }
+  }
+}
+
+int NextPowerOfTwo(int64_t v) {
+  int p = 1;
+  while (p < v && p < (1 << 30)) p <<= 1;
+  return p;
+}
+
+}  // namespace
+
+template <typename input_t, typename output_t, typename acc_t, bool is_log_softmax>
+Status dispatch_strided_softmax_forward(SoftmaxComputeStreamT stream, output_t* dst, const input_t* src,
+                                        int64_t outer, int64_t axis_dim, int64_t inner) {
+  if (outer == 0 || axis_dim == 0 || inner == 0) {
+    return Status::OK();
+  }
+
+  constexpr int kMaxThreadsPerBlock = 512;
+  constexpr int64_t kMaxGridDimY = 65535;
+  const int block_x = std::min(GPU_WARP_SIZE_HOST, NextPowerOfTwo(inner));
+  const int block_y = std::min(kMaxThreadsPerBlock / block_x, NextPowerOfTwo(axis_dim));
+  const int64_t grid_x = (inner + block_x - 1) / block_x;
+  ORT_RETURN_IF(grid_x > std::numeric_limits<int>::max(), "Softmax inner dimension is too large: ", inner);
+
+  const dim3 block(block_x, block_y);
+  const dim3 grid(static_cast<unsigned int>(grid_x), static_cast<unsigned int>(std::min(outer, kMaxGridDimY)));
+  const size_t smem_bytes = 2 * static_cast<size_t>(block_x) * block_y * sizeof(acc_t);
+  softmax_strided_forward<input_t, output_t, acc_t, is_log_softmax>
+      <<<grid, block, smem_bytes, stream>>>(dst, src, outer, axis_dim, inner);
+  return CUDA_CALL(cudaGetLastError());
+}
+
+#define SPECIALIZED_STRIDED_SOFTMAX_IMPL(input_t, output_t, acc_t)                                  \
+  template Status dispatch_strided_softmax_forward<input_t, output_t, acc_t, false>(              \
+      SoftmaxComputeStreamT stream, output_t * dst, const input_t* src, int64_t outer,            \
+      int64_t axis_dim, int64_t inner);                                                           \
+  template Status dispatch_strided_softmax_forward<input_t, output_t, acc_t, true>(               \
+      SoftmaxComputeStreamT stream, output_t * dst, const input_t* src, int64_t outer,            \
+      int64_t axis_dim, int64_t inner);
+
+SPECIALIZED_STRIDED_SOFTMAX_IMPL(float, float, float)
+SPECIALIZED_STRIDED_SOFTMAX_IMPL(half, half, float)
+SPECIALIZED_STRIDED_SOFTMAX_IMPL(double, double, double)
+SPECIALIZED_STRIDED_SOFTMAX_IMPL(BFloat16, BFloat16, float)
 }  // namespace cuda
 }  // namespace onnxruntime
