@@ -1020,9 +1020,15 @@ ComputeDotProducts_BlkLen32Plus_CompFp32_avx2(
         }
 
         // sum(a * (b - zp)) over the block; the block scale is applied once per block after the kk loop.
+        // The BlkLen >= 64 layout keeps the low and high halves of each 64-weight pack in separate accumulators so
+        // that long blocks are not bound by the latency of a single FMA dependency chain.
         __m256 blk_acc[NCols];
+        [[maybe_unused]] __m256 blk_acc_hi[NCols];
         UnrolledLoop<NCols>([&](size_t i) {
             blk_acc[i] = _mm256_setzero_ps();
+            if constexpr (IsBlkLen64Layout) {
+                blk_acc_hi[i] = _mm256_setzero_ps();
+            }
         });
 
         // 32 weights per subblock. The 64-weight packs of the BlkLen >= 64 layout are consumed whole so that
@@ -1064,7 +1070,7 @@ ComputeDotProducts_BlkLen32Plus_CompFp32_avx2(
                     );
                     if (kklen > (int)SubBlkLen32) {
                         AccumulateQ4x32_CompFp32_avx2(
-                            blk_acc[i], _mm256_srli_epi32(x0, 4), _mm256_srli_epi32(x1, 4),
+                            blk_acc_hi[i], _mm256_srli_epi32(x0, 4), _mm256_srli_epi32(x1, 4),
                             _mm256_srli_epi32(x2, 4), _mm256_srli_epi32(x3, 4), zp, a_ptr + SubBlkLen32
                         );
                     }
@@ -1081,6 +1087,9 @@ ComputeDotProducts_BlkLen32Plus_CompFp32_avx2(
         }  // kk
 
         UnrolledLoop<NCols>([&](size_t i) {
+            if constexpr (IsBlkLen64Layout) {
+                blk_acc[i] = _mm256_add_ps(blk_acc[i], blk_acc_hi[i]);
+            }
             acc[i] = _mm256_fmadd_ps(blk_acc[i], _mm256_set1_ps(scale_v[i]), acc[i]);
         });
 
