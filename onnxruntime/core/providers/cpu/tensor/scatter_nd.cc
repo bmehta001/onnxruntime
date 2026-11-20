@@ -25,6 +25,7 @@ ONNX_CPU_OPERATOR_VERSIONED_KERNEL(
     11,
     12,
     KernelDefBuilder()
+        .MayInplace(0, 0)
         .TypeConstraint("T",
                         BuildKernelDefConstraintsFromTypeList<EnabledScatterNDDataTypes>()),
     ScatterND);
@@ -34,6 +35,7 @@ ONNX_CPU_OPERATOR_VERSIONED_KERNEL(
     13,
     15,
     KernelDefBuilder()
+        .MayInplace(0, 0)
         .TypeConstraint("T",
                         BuildKernelDefConstraintsFromTypeList<EnabledScatterNDDataTypes>()),
     ScatterND);
@@ -43,6 +45,7 @@ ONNX_CPU_OPERATOR_VERSIONED_KERNEL(
     16,
     17,
     KernelDefBuilder()
+        .MayInplace(0, 0)
         .TypeConstraint("T",
                         BuildKernelDefConstraintsFromTypeList<EnabledScatterNDDataTypes>()),
     ScatterND);
@@ -51,6 +54,7 @@ ONNX_CPU_OPERATOR_KERNEL(
     ScatterND,
     18,
     KernelDefBuilder()
+        .MayInplace(0, 0)
         .TypeConstraint("T",
                         BuildKernelDefConstraintsFromTypeList<EnabledScatterNDDataTypes>()),
     ScatterND);

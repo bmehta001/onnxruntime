@@ -439,6 +439,27 @@ TEST(GatherOpTest, Gather_perf) {
   test.Run();
 }
 
+// Large enough to be split across threads at positions that are not batch aligned.
+TEST(GatherOpTest, Gather_axis1_small_blocks_many_batches) {
+  constexpr int64_t rows = 512, cols = 700, num_indices = 333;
+  std::vector<int32_t> input(rows * cols);
+  for (size_t i = 0; i < input.size(); ++i) input[i] = static_cast<int32_t>(i);
+  std::vector<int64_t> indices(num_indices);
+  for (int64_t i = 0; i < num_indices; ++i) indices[i] = (i * 37) % cols - (i % 3 == 0 ? cols : 0);
+  std::vector<int32_t> output;
+  output.reserve(rows * num_indices);
+  for (int64_t r = 0; r < rows; ++r) {
+    for (int64_t idx : indices) output.push_back(input[r * cols + (idx < 0 ? idx + cols : idx)]);
+  }
+
+  OpTester test("Gather", 13);
+  test.AddAttribute<int64_t>("axis", 1LL);
+  test.AddInput<int32_t>("data", {rows, cols}, input);
+  test.AddInput<int64_t>("indices", {num_indices}, indices);
+  test.AddOutput<int32_t>("output", {rows, num_indices}, output);
+  test.ConfigEp(DefaultCpuExecutionProvider()).RunWithConfig();
+}
+
 TEST(GatherOpTest, Gather_axis1_neg_indices2d_int8) {
   OpTester test("Gather", 11);
   test.AddAttribute<int64_t>("axis", 1LL);
