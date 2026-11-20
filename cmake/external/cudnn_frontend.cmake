@@ -1,8 +1,8 @@
 
-# The cudnn_frontend shim only loads the CUDA runtime / driver libraries with
-# their Linux names (libcudart.so.*, libcuda.so.1) when NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
-# is enabled. On Windows this always fails (dlopen is mapped to LoadLibrary), so patch the
-# shim to use the Windows DLL names (cudart64_*.dll, nvcuda.dll).
+# With NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING, the cudnn_frontend shim resolves CUDA runtime calls by
+# loading cudart itself, and on Windows it only accepts the CUDA 13 runtime (cudart64_13.dll). ORT links
+# cudart directly, so patch the shim to call the linked runtime and, for the remaining dlopen-based
+# lookups, to load the cudart DLL of the major ORT was built with.
 onnxruntime_fetchcontent_declare(
   cudnn_frontend
   URL ${DEP_URL_cudnn_frontend}

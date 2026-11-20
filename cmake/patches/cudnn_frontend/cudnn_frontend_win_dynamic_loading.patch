@@ -1,53 +1,37 @@
---- a/include/cudnn_frontend_shim.h	2026-06-26 15:06:33.854043748 -0700
-+++ b/include/cudnn_frontend_shim.h	2026-06-26 15:06:33.966044710 -0700
-@@ -69,7 +69,14 @@
-     dlerror();
+--- a/include/cudnn_frontend_shim.h
++++ b/include/cudnn_frontend_shim.h
+@@ -184,8 +184,9 @@ validate_cuda13_runtime(HMODULE handle, const char *library) {
+     }
+     int version = 0;
+     auto status = reinterpret_cast<decltype(&cudaRuntimeGetVersion)>(symbol)(&version);
+-    if (status != cudaSuccess || version / 1000 != 13) {
+-        throw std::runtime_error("CUDA 13 runtime required; " + std::string(library) + " reported version " +
++    if (status != cudaSuccess || version / 1000 != CUDART_VERSION / 1000) {
++        throw std::runtime_error("CUDA " + std::to_string(CUDART_VERSION / 1000) + " runtime required; " +
++                                 std::string(library) + " reported version " +
+                                  std::to_string(version) + " (cudaRuntimeGetVersion status " +
+                                  std::to_string(static_cast<int>(status)) + ")");
+     }
+@@ -223,12 +224,16 @@ load_cudart_so() {
+     }
  
-     // Attempt to open the cuda library
-+#ifdef _WIN32
-+    // Reset the thread error state so the GetLastError()-based success check
-+    // below is not tripped by a stale error from an earlier call.
-+    SetLastError(0);
-+    HMODULE handle    = dlopen("nvcuda.dll", RTLD_NOW);
+ #ifdef _WIN32
+-    // Windows dynamic loading currently supports CUDA 13 only.
++    // ONNX Runtime links the CUDA runtime DLL of the major it was built with, so load that same DLL.
++#if CUDART_VERSION >= 13000
+     constexpr const char *library = "cudart64_13.dll";
 +#else
-     HMODULE handle    = dlopen("libcuda.so.1", RTLD_NOW);
++    constexpr const char *library = "cudart64_12.dll";
 +#endif
-     const char *error = reinterpret_cast<const char *>(dlerror());
+     HMODULE handle                = dlopen(library, RTLD_NOW);
+     const char *error             = reinterpret_cast<const char *>(dlerror());
      if (!handle || error) {
-         // If opening the library fails, throw an exception with the error message
-@@ -82,5 +89,8 @@
-      if (user_lib) {
-           if (user_lib[0] != '\0') {
-+#ifdef _WIN32
-+            SetLastError(0);
-+#endif
-                HMODULE handle    = dlopen(user_lib, RTLD_NOW);
-                const char *error = reinterpret_cast<const char *>(dlerror());
-                if (!handle || error) {
-@@ -85,13 +95,22 @@
-     dlerror();
- 
-     // List of potential libcudart libraries (Adding major version to support python package)
-+#ifdef _WIN32
-+    constexpr const char *libs[] = {"cudart64_12.dll", "cudart64_13.dll"};
-+#else
-     constexpr const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
-+#endif
-     constexpr size_t num_libs    = sizeof(libs) / sizeof(libs[0]);
- 
-     HMODULE lib_handle = nullptr;
-     int loaded_index   = -1;
- 
-     for (size_t i = 0; i < num_libs; ++i) {
-+#ifdef _WIN32
-+        // Reset the thread error state so the GetLastError()-based success check
-+        // below is not tripped by a stale error from a previous failed attempt.
-+        SetLastError(0);
-+#endif
-         HMODULE handle    = dlopen(libs[i], RTLD_NOW);
-         const char *error = reinterpret_cast<const char *>(dlerror());
- 
-@@ -182,10 +200,10 @@
+-        throw std::runtime_error("CUDA 13 runtime unavailable: unable to load " + std::string(library) + ": " +
++        throw std::runtime_error("CUDA runtime unavailable: unable to load " + std::string(library) + ": " +
+                                  std::string(error ? error : "Unknown error"));
+     }
+     return validate_cuda13_runtime(handle, library);
+@@ -342,9 +347,9 @@ get_cuda_symbol(CudaLibrary library, const char *function_name) {
  #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
  
  #define NV_FE_CALL_TO_CUDA(function_name, cuda_symbol, ...) \
