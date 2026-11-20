@@ -8,6 +8,13 @@
 #include "core/common/span_utils.h"
 #include "core/mlas/inc/mlas.h"
 #include "core/providers/common.h"
+
+#if (defined(_M_AMD64) && !defined(_M_ARM64EC)) || defined(__x86_64__)
+#include <emmintrin.h>
+#define REDUCTION_OPS_USE_SSE2 1
+#else
+#define REDUCTION_OPS_USE_SSE2 0
+#endif
 // TODO: fix the warnings
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma warning(disable : 26451)
@@ -575,6 +582,212 @@ template void LogSumExpFastReduceRK<float>(const float*, float*, int64_t, int64_
                                            concurrency::ThreadPool*);
 template void LogSumExpFastReduceRK<double>(const double*, double*, int64_t, int64_t, int64_t,
                                             concurrency::ThreadPool*);
+
+namespace {
+
+// acc = IsMax ? ((acc < p) ? p : acc) : ((acc > p) ? p : acc), element-wise. This is the update used by the generic
+// ReduceMax/ReduceMin loops: a NaN accumulator is kept, a NaN input is ignored, and ties keep the accumulator, so
+// the first of +0/-0 wins.
+template <typename T, bool IsMax>
+inline void MaxMinFold(T* acc, const T* p, int64_t w) {
+  int64_t j = 0;
+#if REDUCTION_OPS_USE_SSE2
+  // _mm_max_ps(b, a) returns (b > a) ? b : a, which is exactly the update above.
+  if constexpr (std::is_same_v<T, float>) {
+    for (; j + 4 <= w; j += 4) {
+      const __m128 a = _mm_loadu_ps(acc + j);
+      const __m128 b = _mm_loadu_ps(p + j);
+      _mm_storeu_ps(acc + j, IsMax ? _mm_max_ps(b, a) : _mm_min_ps(b, a));
+    }
+  } else if constexpr (std::is_same_v<T, double>) {
+    for (; j + 2 <= w; j += 2) {
+      const __m128d a = _mm_loadu_pd(acc + j);
+      const __m128d b = _mm_loadu_pd(p + j);
+      _mm_storeu_pd(acc + j, IsMax ? _mm_max_pd(b, a) : _mm_min_pd(b, a));
+    }
+  }
+#endif
+  for (; j < w; ++j) {
+    if constexpr (IsMax) {
+      acc[j] = acc[j] < p[j] ? p[j] : acc[j];
+    } else {
+      acc[j] = acc[j] > p[j] ? p[j] : acc[j];
+    }
+  }
+}
+
+// Folding a row block that does not start at row 0 from -inf (+inf for min) and then folding the block results in
+// order gives the same result as one left fold over all rows: NaN only sticks when it is in row 0, and the first of
+// several equal values (e.g. +0/-0) is kept.
+template <typename T, bool IsMax>
+struct MaxMinRowOp {
+  static void Init(T* acc, const T* p, int64_t w, bool first_block) {
+    if (first_block) {
+      std::copy_n(p, w, acc);
+    } else {
+      std::fill_n(acc, w, IsMax ? -std::numeric_limits<T>::infinity() : std::numeric_limits<T>::infinity());
+      MaxMinFold<T, IsMax>(acc, p, w);
+    }
+  }
+  static void Accumulate(T* acc, const T* p, int64_t w) { MaxMinFold<T, IsMax>(acc, p, w); }
+  static void Merge(T* acc, const T* partial, int64_t w) { MaxMinFold<T, IsMax>(acc, partial, w); }
+  static void Finalize(T*, int64_t) {}
+};
+
+enum class RowSumKind { kAbs,
+                        kSquare };
+
+template <typename T, RowSumKind Kind>
+inline T RowSumTransform(T v) {
+  if constexpr (Kind == RowSumKind::kAbs) {
+    return std::abs(v);
+  } else {
+    return v * v;
+  }
+}
+
+template <typename T, RowSumKind Kind, bool Sqrt>
+struct RowSumOp {
+  static void Init(T* acc, const T* p, int64_t w, bool) {
+    for (int64_t j = 0; j < w; ++j) {
+      acc[j] = RowSumTransform<T, Kind>(p[j]);
+    }
+  }
+  static void Accumulate(T* acc, const T* p, int64_t w) {
+    for (int64_t j = 0; j < w; ++j) {
+      acc[j] += RowSumTransform<T, Kind>(p[j]);
+    }
+  }
+  static void Merge(T* acc, const T* partial, int64_t w) {
+    for (int64_t j = 0; j < w; ++j) {
+      acc[j] += partial[j];
+    }
+  }
+  static void Finalize(T* acc, int64_t w) {
+    if constexpr (Sqrt) {
+      for (int64_t j = 0; j < w; ++j) {
+        acc[j] = std::sqrt(acc[j]);
+      }
+    }
+  }
+};
+
+// Reduces the middle axis of a [n_batch, n_rows, N] tensor into [n_batch, N] with an element-wise row operation.
+// The work is split into (batch, row block, column tile) tasks whose partition depends only on the shape, and the
+// row block results are merged in a fixed order, so the result does not depend on the number of threads.
+template <typename T, typename Op>
+void TiledRowReduceRK(const T* data, T* out, int64_t n_batch, int64_t n_rows, int64_t N,
+                      concurrency::ThreadPool* tp) {
+  constexpr int64_t kMaxColTile = 1024;
+  constexpr int64_t kMinElementsPerTask = 32768;
+  // About kTargetTasks tasks for mid-sized inputs, with the task size clamped to [kMinTaskElements, kMaxTaskElements].
+  constexpr int64_t kTargetTasks = 16;
+  constexpr int64_t kMinTaskElements = 65536;
+  constexpr int64_t kMaxTaskElements = 262144;
+  if (n_batch == 0 || n_rows == 0 || N == 0) {
+    return;
+  }
+  if (n_batch * n_rows * N <= kMinElementsPerTask) {
+    tp = nullptr;
+  }
+  const int64_t n_col_tiles = (N + kMaxColTile - 1) / kMaxColTile;
+  const int64_t col_tile = (N + n_col_tiles - 1) / n_col_tiles;
+  const int64_t elements_per_task =
+      std::clamp(n_batch * n_rows * N / kTargetTasks, kMinTaskElements, kMaxTaskElements);
+  const int64_t rows_per_block = std::min(n_rows, std::max<int64_t>(1, elements_per_task / col_tile));
+  const int64_t n_row_blocks = (n_rows + rows_per_block - 1) / rows_per_block;
+  const int64_t tasks_per_batch = n_row_blocks * n_col_tiles;
+  const auto n_tasks = onnxruntime::narrow<std::ptrdiff_t>(n_batch * tasks_per_batch);
+
+  // With a single row block, tasks write the output directly.
+  std::vector<T> partials;
+  if (n_row_blocks > 1) {
+    partials.resize(SafeInt<size_t>(n_batch) * n_row_blocks * onnxruntime::narrow<size_t>(N));
+  }
+  T* partials_data = partials.data();
+
+  concurrency::ThreadPool::TrySimpleParallelFor(tp, n_tasks, [=](std::ptrdiff_t task) {
+    const int64_t batch = task / tasks_per_batch;
+    const int64_t row_block = (task % tasks_per_batch) / n_col_tiles;
+    const int64_t c0 = (task % n_col_tiles) * col_tile;
+    const int64_t width = std::min(col_tile, N - c0);
+    const int64_t r_begin = row_block * rows_per_block;
+    const int64_t r_end = std::min(n_rows, r_begin + rows_per_block);
+    T* acc = n_row_blocks > 1 ? partials_data + (batch * n_row_blocks + row_block) * N + c0 : out + batch * N + c0;
+    const T* p = data + (batch * n_rows + r_begin) * N + c0;
+    Op::Init(acc, p, width, row_block == 0);
+    for (int64_t r = r_begin + 1; r < r_end; ++r) {
+      p += N;
+      Op::Accumulate(acc, p, width);
+    }
+    if (n_row_blocks == 1) {
+      Op::Finalize(acc, width);
+    }
+  });
+
+  if (n_row_blocks == 1) {
+    return;
+  }
+
+  concurrency::ThreadPool::TrySimpleParallelFor(
+      tp, onnxruntime::narrow<std::ptrdiff_t>(n_batch * n_col_tiles), [=](std::ptrdiff_t task) {
+        const int64_t batch = task / n_col_tiles;
+        const int64_t c0 = (task % n_col_tiles) * col_tile;
+        const int64_t width = std::min(col_tile, N - c0);
+        T* o = out + batch * N + c0;
+        const T* partial = partials_data + batch * n_row_blocks * N + c0;
+        std::copy_n(partial, width, o);
+        for (int64_t b = 1; b < n_row_blocks; ++b) {
+          partial += N;
+          Op::Merge(o, partial, width);
+        }
+        Op::Finalize(o, width);
+      });
+}
+
+}  // namespace
+
+template <typename T>
+void MaxFastReduceRK(const T* data, T* out, int64_t n_batch, int64_t n_rows, int64_t N,
+                     concurrency::ThreadPool* tp) {
+  TiledRowReduceRK<T, MaxMinRowOp<T, true>>(data, out, n_batch, n_rows, N, tp);
+}
+
+template <typename T>
+void MinFastReduceRK(const T* data, T* out, int64_t n_batch, int64_t n_rows, int64_t N,
+                     concurrency::ThreadPool* tp) {
+  TiledRowReduceRK<T, MaxMinRowOp<T, false>>(data, out, n_batch, n_rows, N, tp);
+}
+
+template <typename T>
+void SumAbsFastReduceRK(const T* data, T* out, int64_t n_batch, int64_t n_rows, int64_t N,
+                        concurrency::ThreadPool* tp) {
+  TiledRowReduceRK<T, RowSumOp<T, RowSumKind::kAbs, false>>(data, out, n_batch, n_rows, N, tp);
+}
+
+template <typename T>
+void SumSquareFastReduceRK(const T* data, T* out, int64_t n_batch, int64_t n_rows, int64_t N,
+                           concurrency::ThreadPool* tp) {
+  TiledRowReduceRK<T, RowSumOp<T, RowSumKind::kSquare, false>>(data, out, n_batch, n_rows, N, tp);
+}
+
+template <typename T>
+void L2NormFastReduceRK(const T* data, T* out, int64_t n_batch, int64_t n_rows, int64_t N,
+                        concurrency::ThreadPool* tp) {
+  TiledRowReduceRK<T, RowSumOp<T, RowSumKind::kSquare, true>>(data, out, n_batch, n_rows, N, tp);
+}
+
+#define INSTANTIATE_ROW_REDUCE_RK(fn)                                                                 \
+  template void fn<float>(const float*, float*, int64_t, int64_t, int64_t, concurrency::ThreadPool*); \
+  template void fn<double>(const double*, double*, int64_t, int64_t, int64_t, concurrency::ThreadPool*);
+
+INSTANTIATE_ROW_REDUCE_RK(MaxFastReduceRK)
+INSTANTIATE_ROW_REDUCE_RK(MinFastReduceRK)
+INSTANTIATE_ROW_REDUCE_RK(SumAbsFastReduceRK)
+INSTANTIATE_ROW_REDUCE_RK(SumSquareFastReduceRK)
+INSTANTIATE_ROW_REDUCE_RK(L2NormFastReduceRK)
+
+#undef INSTANTIATE_ROW_REDUCE_RK
 
 void NoTransposePrepareForReduce(const TensorShape& new_input_shape,
                                  gsl::span<const int64_t> reduced_axes,

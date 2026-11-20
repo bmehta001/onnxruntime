@@ -7103,6 +7103,267 @@ TEST(ReductionOpTest, ReduceLogSumExp_FastPaths_AccuracyAndThreadCountInvariance
   run(double{});
 }
 
+namespace {
+std::vector<std::unique_ptr<concurrency::ThreadPool>> MakeReductionTestThreadPools() {
+  std::vector<std::unique_ptr<concurrency::ThreadPool>> pools;
+  pools.push_back(nullptr);
+  for (int num_threads : {2, 3, 8}) {
+    OrtThreadPoolParams params;
+    params.thread_pool_size = num_threads;
+    pools.push_back(concurrency::CreateThreadPool(&Env::Default(), params, concurrency::ThreadPoolType::INTRA_OP));
+  }
+  return pools;
+}
+
+// {batch, rows, cols}; several use more than one row block and column tile in the fast paths.
+const std::vector<std::array<int64_t, 3>>& RowReduceTestShapes() {
+  // Several of these use multiple row blocks and/or column tiles in the fast path.
+  static const std::vector<std::array<int64_t, 3>> shapes = {
+      {1, 1, 7}, {1, 20000, 16}, {1, 600, 1025}, {3, 70, 2000}, {2, 90000, 3}, {1, 600, 1024}, {4, 600, 256}};
+  return shapes;
+}
+}  // namespace
+
+// The float/double Max/Min RK/KRK fast paths split rows into blocks, but must give bit-identical results to the
+// left fold used by the generic ReduceMax/ReduceMin loops: a NaN in the first row is the result, a later NaN is
+// ignored, and the first of equal values (+0/-0) is kept.
+TEST(ReductionOpTest, ReduceMaxMin_RK_KRK_FastPath_MatchesSequentialFold) {
+  auto pools = MakeReductionTestThreadPools();
+  auto run = [&](auto type_tag) {
+    using T = decltype(type_tag);
+    const T inf = std::numeric_limits<T>::infinity();
+    const T nan = std::numeric_limits<T>::quiet_NaN();
+    const std::array<T, 9> values = {-2, -1, static_cast<T>(-0.0), 0, 1, 2, nan, inf, -inf};
+    std::mt19937 gen(11);
+    std::uniform_int_distribution<size_t> pick(0, values.size() - 1);
+    std::uniform_int_distribution<int> percent(0, 99);
+    for (const auto& [n_batch, n_rows, n_cols] : RowReduceTestShapes()) {
+      SCOPED_TRACE(MakeString("shape=[", n_batch, ",", n_rows, ",", n_cols, "]"));
+      std::vector<T> in(static_cast<size_t>(n_batch * n_rows * n_cols));
+      for (int64_t b = 0; b < n_batch; ++b) {
+        for (int64_t r = 0; r < n_rows; ++r) {
+          for (int64_t c = 0; c < n_cols; ++c) {
+            T v;
+            switch (c % 5) {
+              case 0:  // NaN in the first row only.
+                v = r == 0 ? nan : values[pick(gen) % 6];
+                break;
+              case 1:  // NaN in later rows, including the last one.
+                v = r != 0 && (r == n_rows / 2 || r == n_rows - 1 || percent(gen) < 5) ? nan : values[pick(gen) % 6];
+                break;
+              case 2:
+                v = -inf;
+                break;
+              case 3:  // Only signed zeros.
+                v = percent(gen) < 50 ? static_cast<T>(-0.0) : static_cast<T>(0.0);
+                break;
+              default:
+                v = values[pick(gen)];
+                break;
+            }
+            in[static_cast<size_t>((b * n_rows + r) * n_cols + c)] = v;
+          }
+        }
+      }
+      for (bool is_max : {true, false}) {
+        std::vector<T> expected(static_cast<size_t>(n_batch * n_cols));
+        for (int64_t b = 0; b < n_batch; ++b) {
+          for (int64_t c = 0; c < n_cols; ++c) {
+            T acc = in[static_cast<size_t>(b * n_rows * n_cols + c)];
+            for (int64_t r = 1; r < n_rows; ++r) {
+              const T v = in[static_cast<size_t>((b * n_rows + r) * n_cols + c)];
+              acc = is_max ? (v > acc ? v : acc) : (v < acc ? v : acc);
+            }
+            expected[static_cast<size_t>(b * n_cols + c)] = acc;
+          }
+        }
+        for (auto& pool : pools) {
+          std::vector<T> out(expected.size());
+          if (is_max) {
+            MaxFastReduceRK(in.data(), out.data(), n_batch, n_rows, n_cols, pool.get());
+          } else {
+            MinFastReduceRK(in.data(), out.data(), n_batch, n_rows, n_cols, pool.get());
+          }
+          for (size_t i = 0; i < out.size(); ++i) {
+            ASSERT_EQ(0, std::memcmp(&out[i], &expected[i], sizeof(T)))
+                << "is_max=" << is_max << " index " << i << " got " << out[i] << " expected " << expected[i];
+          }
+        }
+      }
+    }
+  };
+  run(float{});
+  run(double{});
+}
+
+TEST(ReductionOpTest, ReduceL1L2SumSquare_RK_KRK_FastPath_AccuracyAndThreadCountInvariance) {
+  auto pools = MakeReductionTestThreadPools();
+  auto run = [&](auto type_tag) {
+    using T = decltype(type_tag);
+    std::mt19937 gen(13);
+    std::uniform_real_distribution<T> dist(static_cast<T>(-4), static_cast<T>(4));
+    for (const auto& [n_batch, n_rows, n_cols] : RowReduceTestShapes()) {
+      SCOPED_TRACE(MakeString("shape=[", n_batch, ",", n_rows, ",", n_cols, "]"));
+      std::vector<T> in(static_cast<size_t>(n_batch * n_rows * n_cols));
+      for (auto& v : in) v = dist(gen);
+      // Column 1 holds a NaN and column 2 an infinity in the last row.
+      if (n_cols > 2) {
+        for (int64_t b = 0; b < n_batch; ++b) {
+          in[static_cast<size_t>(((b + 1) * n_rows - 1) * n_cols + 1)] = std::numeric_limits<T>::quiet_NaN();
+          in[static_cast<size_t>(((b + 1) * n_rows - 1) * n_cols + 2)] = -std::numeric_limits<T>::infinity();
+        }
+      }
+      for (int kind = 0; kind < 3; ++kind) {  // 0: L1, 1: SumSquare, 2: L2
+        std::vector<double> expected(static_cast<size_t>(n_batch * n_cols));
+        for (int64_t b = 0; b < n_batch; ++b) {
+          for (int64_t c = 0; c < n_cols; ++c) {
+            double acc = 0;
+            for (int64_t r = 0; r < n_rows; ++r) {
+              const double v = in[static_cast<size_t>((b * n_rows + r) * n_cols + c)];
+              acc += kind == 0 ? std::abs(v) : v * v;
+            }
+            expected[static_cast<size_t>(b * n_cols + c)] = kind == 2 ? std::sqrt(acc) : acc;
+          }
+        }
+        std::vector<T> first;
+        for (auto& pool : pools) {
+          std::vector<T> out(expected.size());
+          if (kind == 0) {
+            SumAbsFastReduceRK(in.data(), out.data(), n_batch, n_rows, n_cols, pool.get());
+          } else if (kind == 1) {
+            SumSquareFastReduceRK(in.data(), out.data(), n_batch, n_rows, n_cols, pool.get());
+          } else {
+            L2NormFastReduceRK(in.data(), out.data(), n_batch, n_rows, n_cols, pool.get());
+          }
+          for (size_t i = 0; i < out.size(); ++i) {
+            if (std::isnan(expected[i])) {
+              ASSERT_TRUE(std::isnan(out[i])) << "kind=" << kind << " index " << i;
+            } else if (std::isinf(expected[i])) {
+              ASSERT_EQ(static_cast<double>(out[i]), expected[i]) << "kind=" << kind << " index " << i;
+            } else {
+              ASSERT_NEAR(out[i], expected[i], 1e-4 * std::max(1.0, expected[i]))
+                  << "kind=" << kind << " index " << i;
+            }
+          }
+          if (first.empty()) {
+            first = out;
+          } else {
+            ASSERT_EQ(0, std::memcmp(first.data(), out.data(), out.size() * sizeof(T))) << "kind=" << kind;
+          }
+        }
+      }
+    }
+  };
+  run(float{});
+  run(double{});
+}
+
+namespace {
+template <typename T>
+void RunReduceMaxMinSpecialValues(const char* op) {
+  const bool is_max = std::string(op) == "ReduceMax";
+  const T inf = std::numeric_limits<T>::infinity();
+  const T nan = std::numeric_limits<T>::quiet_NaN();
+  // [rows=4, cols=5]: NaN first in column 0, NaN later in column 1, infinities in 2, -0/+0 in 3, mixed in 4.
+  const std::vector<T> data = {
+      nan, 1, -inf, static_cast<T>(-0.0), 3,
+      1, nan, inf, 0, -5,
+      2, 0, -inf, static_cast<T>(-0.0), nan,
+      -1, nan, 0, 0, 7};
+  const std::vector<T> expected = is_max ? std::vector<T>{nan, 1, inf, static_cast<T>(-0.0), 7}
+                                         : std::vector<T>{nan, 0, -inf, static_cast<T>(-0.0), -5};
+  for (int64_t keepdims : {0, 1}) {
+    SCOPED_TRACE(MakeString(op, " keepdims=", keepdims));
+    {  // RK
+      OpTester test(op, 18);
+      test.AddAttribute("keepdims", keepdims);
+      test.AddInput<T>("data", {4, 5}, data);
+      test.AddInput<int64_t>("axes", {1}, {0});
+      test.AddOutput<T>("reduced", keepdims ? std::vector<int64_t>{1, 5} : std::vector<int64_t>{5}, expected);
+      test.ConfigEp(DefaultCpuExecutionProvider()).RunWithConfig();
+    }
+    {  // KRK with two identical batches.
+      std::vector<T> krk = data;
+      krk.insert(krk.end(), data.begin(), data.end());
+      std::vector<T> expected_krk = expected;
+      expected_krk.insert(expected_krk.end(), expected.begin(), expected.end());
+      OpTester test(op, 18);
+      test.AddAttribute("keepdims", keepdims);
+      test.AddInput<T>("data", {2, 4, 5}, krk);
+      test.AddInput<int64_t>("axes", {1}, {1});
+      test.AddOutput<T>("reduced", keepdims ? std::vector<int64_t>{2, 1, 5} : std::vector<int64_t>{2, 5},
+                        expected_krk);
+      test.ConfigEp(DefaultCpuExecutionProvider()).RunWithConfig();
+    }
+  }
+  {  // noop_with_empty_axes keeps the input unchanged.
+    OpTester test(op, 18);
+    test.AddAttribute("noop_with_empty_axes", static_cast<int64_t>(1));
+    test.AddInput<T>("data", {4, 5}, data);
+    test.AddOutput<T>("reduced", {4, 5}, data);
+    test.ConfigEp(DefaultCpuExecutionProvider()).RunWithConfig();
+  }
+}
+
+template <typename T>
+void RunReduceNormsSpecialValues() {
+  const T inf = std::numeric_limits<T>::infinity();
+  const T nan = std::numeric_limits<T>::quiet_NaN();
+  // [rows=3, cols=4]: NaN in column 0, -inf in column 1, signed zeros in column 2.
+  const std::vector<T> data = {
+      1, 2, static_cast<T>(-0.0), 3,
+      nan, -inf, static_cast<T>(-0.0), -4,
+      2, 1, 0, 12};
+  struct Case {
+    const char* op;
+    std::vector<T> expected;
+  };
+  const std::vector<Case> cases = {
+      {"ReduceL1", {nan, inf, 0, 19}},
+      {"ReduceL2", {nan, inf, 0, 13}},
+      {"ReduceSumSquare", {nan, inf, 0, 169}},
+      {"ReduceLogSum", {nan, nan, -inf, static_cast<T>(std::log(11.0))}}};
+  for (const auto& c : cases) {
+    for (int64_t keepdims : {0, 1}) {
+      SCOPED_TRACE(MakeString(c.op, " keepdims=", keepdims));
+      {  // RK
+        OpTester test(c.op, 18);
+        test.AddAttribute("keepdims", keepdims);
+        test.AddInput<T>("data", {3, 4}, data);
+        test.AddInput<int64_t>("axes", {1}, {0});
+        test.AddOutput<T>("reduced", keepdims ? std::vector<int64_t>{1, 4} : std::vector<int64_t>{4}, c.expected);
+        test.ConfigEp(DefaultCpuExecutionProvider()).RunWithConfig();
+      }
+      {  // KRK with two identical batches.
+        std::vector<T> krk = data;
+        krk.insert(krk.end(), data.begin(), data.end());
+        std::vector<T> expected_krk = c.expected;
+        expected_krk.insert(expected_krk.end(), c.expected.begin(), c.expected.end());
+        OpTester test(c.op, 18);
+        test.AddAttribute("keepdims", keepdims);
+        test.AddInput<T>("data", {2, 3, 4}, krk);
+        test.AddInput<int64_t>("axes", {1}, {1});
+        test.AddOutput<T>("reduced", keepdims ? std::vector<int64_t>{2, 1, 4} : std::vector<int64_t>{2, 4},
+                          expected_krk);
+        test.ConfigEp(DefaultCpuExecutionProvider()).RunWithConfig();
+      }
+    }
+  }
+}
+}  // namespace
+
+TEST(ReductionOpTest, ReduceMaxMin_SpecialValues_FastPaths) {
+  RunReduceMaxMinSpecialValues<float>("ReduceMax");
+  RunReduceMaxMinSpecialValues<float>("ReduceMin");
+  RunReduceMaxMinSpecialValues<double>("ReduceMax");
+  RunReduceMaxMinSpecialValues<double>("ReduceMin");
+}
+
+TEST(ReductionOpTest, ReduceL1L2SumSquareLogSum_SpecialValues_FastPaths) {
+  RunReduceNormsSpecialValues<float>();
+  RunReduceNormsSpecialValues<double>();
+}
+
 TEST(ReductionOpTest, ReduceSumSquare_NoopWithAxesNotProvided_ElementwiseSquare) {
   OpTester test("ReduceSumSquare", 18);
   test.AddInput<float>("data", {2}, {2.f, 3.f});
