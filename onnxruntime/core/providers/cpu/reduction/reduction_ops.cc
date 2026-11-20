@@ -6,6 +6,7 @@
 #include "core/common/inlined_containers.h"
 #include "core/common/narrow.h"
 #include "core/common/span_utils.h"
+#include "core/mlas/inc/mlas.h"
 #include "core/providers/common.h"
 // TODO: fix the warnings
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -381,6 +382,199 @@ void ReduceAggregatorBase::FastReduceKRK(const Tensor&, const gsl::span<const in
 void ReduceAggregatorBase::FastReduceRKR(const Tensor&, const gsl::span<const int64_t>&, Tensor&, concurrency::ThreadPool*) {
   ValidateMustBeOverloaded();
 }
+
+namespace {
+
+// Number of elements passed to one exp call. The scratch buffers live on the stack.
+constexpr int64_t kLogSumExpChunk = 1024;
+
+template <typename T>
+void ExpInPlace(T* buf, int64_t n) {
+  if constexpr (std::is_same_v<T, float>) {
+    MlasComputeExp(buf, buf, onnxruntime::narrow<size_t>(n));
+  } else {
+    EigenVectorArrayMap<T> a(buf, onnxruntime::narrow<size_t>(n));
+    a = a.exp();
+  }
+}
+
+// Combines the maximum m and sum(exp(x - m)) into log(sum(exp(x))). A NaN or infinite maximum is the result:
+// any NaN gives NaN, otherwise any +inf gives +inf, and all -inf gives -inf.
+template <typename T>
+inline T FinishLogSumExp(T m, T sum) {
+  return std::isfinite(m) ? static_cast<T>(std::log(sum)) + m : m;
+}
+
+template <typename T>
+inline T MaxPropagateNaN(const T* p, int64_t n) {
+  return ConstEigenVectorArrayMap<T>(p, onnxruntime::narrow<size_t>(n)).template maxCoeff<Eigen::PropagateNaN>();
+}
+
+}  // namespace
+
+// Rows are processed in groups whose layout in the scratch buffer depends only on the shape, so the result does
+// not depend on the number of threads.
+template <typename T>
+void LogSumExpFastReduceKR(const T* data, T* out, int64_t n_rows, int64_t N, concurrency::ThreadPool* tp) {
+  if (n_rows == 0 || N == 0) {
+    return;
+  }
+  const int64_t rows_per_group = std::max<int64_t>(1, kLogSumExpChunk / N);
+  const int64_t n_groups = (n_rows + rows_per_group - 1) / rows_per_group;
+  const TensorOpCost cost{static_cast<double>(rows_per_group * N * sizeof(T)),
+                          static_cast<double>(rows_per_group * sizeof(T)),
+                          static_cast<double>(rows_per_group * N * 16)};
+  concurrency::ThreadPool::TryParallelFor(
+      tp, onnxruntime::narrow<std::ptrdiff_t>(n_groups), cost, [=](std::ptrdiff_t first, std::ptrdiff_t last) {
+        alignas(64) T buf[kLogSumExpChunk];
+        alignas(64) T maxes[kLogSumExpChunk];
+        for (std::ptrdiff_t g = first; g < last; ++g) {
+          const int64_t r0 = g * rows_per_group;
+          const int64_t nr = std::min(rows_per_group, n_rows - r0);
+          if (N > kLogSumExpChunk) {
+            const T* x = data + r0 * N;
+            const T m = MaxPropagateNaN(x, N);
+            T sum = 0;
+            if (std::isfinite(m)) {
+              for (int64_t c0 = 0; c0 < N; c0 += kLogSumExpChunk) {
+                const int64_t w = std::min(kLogSumExpChunk, N - c0);
+                EigenVectorArrayMap<T>(buf, w) = ConstEigenVectorArrayMap<T>(x + c0, w) - m;
+                ExpInPlace(buf, w);
+                sum += ConstEigenVectorArrayMap<T>(buf, w).sum();
+              }
+            }
+            out[r0] = FinishLogSumExp(m, sum);
+            continue;
+          }
+          for (int64_t i = 0; i < nr; ++i) {
+            const T* x = data + (r0 + i) * N;
+            maxes[i] = MaxPropagateNaN(x, N);
+            const T shift = std::isfinite(maxes[i]) ? maxes[i] : static_cast<T>(0);
+            EigenVectorArrayMap<T>(buf + i * N, N) = ConstEigenVectorArrayMap<T>(x, N) - shift;
+          }
+          ExpInPlace(buf, nr * N);
+          for (int64_t i = 0; i < nr; ++i) {
+            out[r0 + i] = FinishLogSumExp(maxes[i], ConstEigenVectorArrayMap<T>(buf + i * N, N).sum());
+          }
+        }
+      });
+}
+
+// Reduces the middle axis of a [n_batch, n_rows, N] tensor into [n_batch, N]. Like ReduceSum's RK path, the work is
+// split into (batch, row block, column tile) tasks whose partition depends only on the shape. The first pass computes
+// partial column maxima, the second pass partial sums of exp(x - max), and the last pass merges them in a fixed order.
+template <typename T>
+void LogSumExpFastReduceRK(const T* data, T* out, int64_t n_batch, int64_t n_rows, int64_t N,
+                           concurrency::ThreadPool* tp) {
+  constexpr int64_t kMinElementsPerTask = 32768;
+  constexpr int64_t kElementsPerTask = 65536;
+  if (n_batch == 0 || n_rows == 0 || N == 0) {
+    return;
+  }
+  if (n_batch * n_rows * N <= kMinElementsPerTask) {
+    tp = nullptr;
+  }
+  const int64_t n_col_tiles = (N + kLogSumExpChunk - 1) / kLogSumExpChunk;
+  const int64_t col_tile = (N + n_col_tiles - 1) / n_col_tiles;
+  const int64_t rows_per_block = std::min(n_rows, std::max<int64_t>(1, kElementsPerTask / col_tile));
+  const int64_t n_row_blocks = (n_rows + rows_per_block - 1) / rows_per_block;
+  const int64_t tasks_per_batch = n_row_blocks * n_col_tiles;
+  const auto n_tasks = onnxruntime::narrow<std::ptrdiff_t>(n_batch * tasks_per_batch);
+
+  // partials[batch][row_block][N] holds the partial maxima and then the partial sums.
+  std::vector<T> partials(SafeInt<size_t>(n_batch) * n_row_blocks * onnxruntime::narrow<size_t>(N));
+  std::vector<T> col_max(SafeInt<size_t>(n_batch) * onnxruntime::narrow<size_t>(N));
+  // Per-column shift for exp; equal to the maximum where it is finite.
+  std::vector<T> shift(col_max.size());
+  T* partials_data = partials.data();
+  T* col_max_data = col_max.data();
+  T* shift_data = shift.data();
+
+  struct Task {
+    int64_t batch, row_block, c0, width, r_begin, r_end;
+  };
+  auto get_task = [=](std::ptrdiff_t task) {
+    Task t;
+    t.batch = task / tasks_per_batch;
+    t.row_block = (task % tasks_per_batch) / n_col_tiles;
+    t.c0 = (task % n_col_tiles) * col_tile;
+    t.width = std::min(col_tile, N - t.c0);
+    t.r_begin = t.row_block * rows_per_block;
+    t.r_end = std::min(n_rows, t.r_begin + rows_per_block);
+    return t;
+  };
+
+  concurrency::ThreadPool::TrySimpleParallelFor(tp, n_tasks, [=](std::ptrdiff_t task) {
+    const Task t = get_task(task);
+    EigenVectorArrayMap<T> acc(partials_data + (t.batch * n_row_blocks + t.row_block) * N + t.c0, t.width);
+    const T* p = data + (t.batch * n_rows + t.r_begin) * N + t.c0;
+    acc = ConstEigenVectorArrayMap<T>(p, t.width);
+    for (int64_t r = t.r_begin + 1; r < t.r_end; ++r) {
+      p += N;
+      acc = acc.template max<Eigen::PropagateNaN>(ConstEigenVectorArrayMap<T>(p, t.width));
+    }
+  });
+
+  concurrency::ThreadPool::TrySimpleParallelFor(
+      tp, onnxruntime::narrow<std::ptrdiff_t>(n_batch * n_col_tiles), [=](std::ptrdiff_t task) {
+        const int64_t batch = task / n_col_tiles;
+        const int64_t c0 = (task % n_col_tiles) * col_tile;
+        const int64_t width = std::min(col_tile, N - c0);
+        EigenVectorArrayMap<T> m(col_max_data + batch * N + c0, width);
+        const T* partial = partials_data + batch * n_row_blocks * N + c0;
+        m = ConstEigenVectorArrayMap<T>(partial, width);
+        for (int64_t b = 1; b < n_row_blocks; ++b) {
+          partial += N;
+          m = m.template max<Eigen::PropagateNaN>(ConstEigenVectorArrayMap<T>(partial, width));
+        }
+        // Non-finite maxima are the final result, so any finite shift works for those columns.
+        EigenVectorArrayMap<T>(shift_data + batch * N + c0, width) = m.isFinite().select(m, static_cast<T>(0));
+      });
+
+  concurrency::ThreadPool::TrySimpleParallelFor(tp, n_tasks, [=](std::ptrdiff_t task) {
+    const Task t = get_task(task);
+    alignas(64) T buf[kLogSumExpChunk];
+    EigenVectorArrayMap<T> acc(partials_data + (t.batch * n_row_blocks + t.row_block) * N + t.c0, t.width);
+    ConstEigenVectorArrayMap<T> m(shift_data + t.batch * N + t.c0, t.width);
+    acc.setZero();
+    const int64_t rows_per_chunk = kLogSumExpChunk / t.width;
+    const T* p = data + (t.batch * n_rows + t.r_begin) * N + t.c0;
+    for (int64_t r = t.r_begin; r < t.r_end; r += rows_per_chunk) {
+      const int64_t nr = std::min(rows_per_chunk, t.r_end - r);
+      for (int64_t i = 0; i < nr; ++i, p += N) {
+        EigenVectorArrayMap<T>(buf + i * t.width, t.width) = ConstEigenVectorArrayMap<T>(p, t.width) - m;
+      }
+      ExpInPlace(buf, nr * t.width);
+      for (int64_t i = 0; i < nr; ++i) {
+        acc += ConstEigenVectorArrayMap<T>(buf + i * t.width, t.width);
+      }
+    }
+  });
+
+  concurrency::ThreadPool::TrySimpleParallelFor(
+      tp, onnxruntime::narrow<std::ptrdiff_t>(n_batch * n_col_tiles), [=](std::ptrdiff_t task) {
+        const int64_t batch = task / n_col_tiles;
+        const int64_t c0 = (task % n_col_tiles) * col_tile;
+        const int64_t width = std::min(col_tile, N - c0);
+        const T* m = col_max_data + batch * N + c0;
+        const T* partial = partials_data + batch * n_row_blocks * N + c0;
+        T* o = out + batch * N + c0;
+        for (int64_t c = 0; c < width; ++c) {
+          T sum = partial[c];
+          for (int64_t b = 1; b < n_row_blocks; ++b) {
+            sum += partial[b * N + c];
+          }
+          o[c] = FinishLogSumExp(m[c], sum);
+        }
+      });
+}
+
+template void LogSumExpFastReduceKR<float>(const float*, float*, int64_t, int64_t, concurrency::ThreadPool*);
+template void LogSumExpFastReduceKR<double>(const double*, double*, int64_t, int64_t, concurrency::ThreadPool*);
+template void LogSumExpFastReduceRK<float>(const float*, float*, int64_t, int64_t, int64_t,
+                                           concurrency::ThreadPool*);
+template void LogSumExpFastReduceRK<double>(const double*, double*, int64_t, int64_t, int64_t,
+                                            concurrency::ThreadPool*);
 
 void NoTransposePrepareForReduce(const TensorShape& new_input_shape,
                                  gsl::span<const int64_t> reduced_axes,

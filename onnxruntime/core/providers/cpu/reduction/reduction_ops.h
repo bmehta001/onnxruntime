@@ -1493,6 +1493,12 @@ class ReduceAggregatorLogSum : public ReduceAggregator<T, T> {
 };
 
 template <typename T>
+void LogSumExpFastReduceKR(const T* data, T* out, int64_t n_rows, int64_t N, concurrency::ThreadPool* tp);
+template <typename T>
+void LogSumExpFastReduceRK(const T* data, T* out, int64_t n_batch, int64_t n_rows, int64_t N,
+                           concurrency::ThreadPool* tp);
+
+template <typename T>
 class ReduceAggregatorLogSumExp : public ReduceAggregator<T, T> {
  protected:
   T max_;
@@ -1500,7 +1506,9 @@ class ReduceAggregatorLogSumExp : public ReduceAggregator<T, T> {
 
  public:
   inline ReduceAggregatorLogSumExp(int64_t N, const T& init) : ReduceAggregator<T, T>(N, 0) {
-    max_ = reduce_isinf(init) ? this->accumulator_ : init;
+    // update0 skips infinite values. Starting from lowest() rather than 0 keeps a leading infinite value from
+    // forcing the maximum to 0, which would make exp(x - max_) underflow when all finite values are very negative.
+    max_ = reduce_isinf(init) ? std::numeric_limits<T>::lowest() : init;
   }
   inline T aggall(const T* from_data) {
     max_ = Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, 1>>(
@@ -1576,6 +1584,46 @@ class ReduceAggregatorLogSumExp : public ReduceAggregator<T, T> {
       EigenMap<T>(output).array() = std::numeric_limits<T>::min();
     } else {
       EigenMap<T>(output).array() = -std::numeric_limits<T>::infinity();
+    }
+  }
+
+  static inline FastReduceKind WhichFastReduce() {
+    if constexpr (std::is_floating_point_v<T>) {
+      return FastReduceKind::kKR | FastReduceKind::kRK | FastReduceKind::kKRK;
+    } else {
+      return FastReduceKind::kNone;
+    }
+  }
+
+  // The partition of the floating-point fast paths depends only on the shape, so the result does not depend on
+  // the number of threads.
+  static inline bool FastReduceRKAndKRKScaleToAnyShape() { return std::is_floating_point_v<T>; }
+
+  static void FastReduceKR(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
+                           Tensor& output, concurrency::ThreadPool* tp) {
+    if constexpr (std::is_floating_point_v<T>) {
+      LogSumExpFastReduceKR(input.Data<T>(), output.MutableData<T>(), fast_shape[0], fast_shape[1], tp);
+    } else {
+      ReduceAggregatorBase::FastReduceKR(input, fast_shape, output, tp);
+    }
+  }
+
+  static void FastReduceRK(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
+                           Tensor& output, concurrency::ThreadPool* tp) {
+    if constexpr (std::is_floating_point_v<T>) {
+      LogSumExpFastReduceRK(input.Data<T>(), output.MutableData<T>(), 1, fast_shape[0], fast_shape[1], tp);
+    } else {
+      ReduceAggregatorBase::FastReduceRK(input, fast_shape, output, tp);
+    }
+  }
+
+  static void FastReduceKRK(const Tensor& input, const gsl::span<const int64_t>& fast_shape,
+                            Tensor& output, concurrency::ThreadPool* tp) {
+    if constexpr (std::is_floating_point_v<T>) {
+      LogSumExpFastReduceRK(input.Data<T>(), output.MutableData<T>(), fast_shape[0], fast_shape[1], fast_shape[2],
+                            tp);
+    } else {
+      ReduceAggregatorBase::FastReduceKRK(input, fast_shape, output, tp);
     }
   }
 };

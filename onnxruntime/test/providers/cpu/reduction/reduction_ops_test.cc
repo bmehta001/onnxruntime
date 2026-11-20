@@ -6921,6 +6921,188 @@ TEST(ReductionOpTest, ReduceLogSumExp_AllNegInf_Double) {
   test.Run();
 }
 
+namespace {
+template <typename T>
+T ReferenceLogSumExp(const std::vector<T>& values) {
+  bool has_pos_inf = false;
+  double m = -std::numeric_limits<double>::infinity();
+  for (T v : values) {
+    if (std::isnan(v)) return std::numeric_limits<T>::quiet_NaN();
+    has_pos_inf |= v == std::numeric_limits<T>::infinity();
+    m = std::max(m, static_cast<double>(v));
+  }
+  if (has_pos_inf || m == -std::numeric_limits<double>::infinity()) return static_cast<T>(m);
+  double sum = 0.0;
+  for (T v : values) sum += std::exp(static_cast<double>(v) - m);
+  return static_cast<T>(std::log(sum) + m);
+}
+
+template <typename T>
+void RunReduceLogSumExpSpecialValues() {
+  const T inf = std::numeric_limits<T>::infinity();
+  const T nan = std::numeric_limits<T>::quiet_NaN();
+  constexpr int64_t kRows = 7, kCols = 5;
+  const std::vector<T> data = {
+      1, 2, 3, 4, 5,
+      -inf, -100, -inf, -200, -300,
+      nan, 1, inf, 2, 3,
+      -inf, -inf, -inf, -inf, -inf,
+      inf, -1000, 0, -inf, 7,
+      -1000, -1000, -1000, -1000, -1000,
+      inf, -inf, nan, 0, -inf};
+  std::vector<T> transposed(data.size());
+  for (int64_t r = 0; r < kRows; ++r) {
+    for (int64_t c = 0; c < kCols; ++c) {
+      transposed[c * kRows + r] = data[r * kCols + c];
+    }
+  }
+  auto row = [](const std::vector<T>& d, int64_t r, int64_t n) {
+    return std::vector<T>(d.begin() + r * n, d.begin() + (r + 1) * n);
+  };
+
+  // Reduces each row of `data` (an n_rows x n_cols matrix) through the given layout.
+  std::vector<T> expected;
+  for (int64_t r = 0; r < kRows; ++r) expected.push_back(ReferenceLogSumExp(row(data, r, kCols)));
+  std::vector<T> expected_t;
+  for (int64_t c = 0; c < kCols; ++c) expected_t.push_back(ReferenceLogSumExp(row(transposed, c, kRows)));
+  // Hand-checked values for rows without special results.
+  EXPECT_NEAR(expected[1], -100.0, 1e-5);
+  EXPECT_NEAR(expected[5], -1000.0 + std::log(5.0), 1e-3);
+
+  for (int64_t keepdims : {0, 1}) {
+    SCOPED_TRACE(MakeString("keepdims=", keepdims));
+    {  // KR
+      OpTester test("ReduceLogSumExp", 18);
+      test.AddAttribute("keepdims", keepdims);
+      test.AddInput<T>("data", {kRows, kCols}, data);
+      test.AddInput<int64_t>("axes", {1}, {1});
+      test.AddOutput<T>("reduced", keepdims ? std::vector<int64_t>{kRows, 1} : std::vector<int64_t>{kRows},
+                        expected);
+      test.ConfigEp(DefaultCpuExecutionProvider()).RunWithConfig();
+    }
+    {  // RK: column c of the transposed data is row c of data.
+      OpTester test("ReduceLogSumExp", 18);
+      test.AddAttribute("keepdims", keepdims);
+      test.AddInput<T>("data", {kCols, kRows}, transposed);
+      test.AddInput<int64_t>("axes", {1}, {0});
+      test.AddOutput<T>("reduced", keepdims ? std::vector<int64_t>{1, kRows} : std::vector<int64_t>{kRows},
+                        expected);
+      test.ConfigEp(DefaultCpuExecutionProvider()).RunWithConfig();
+    }
+    {  // KRK: two batches, the second one with the rows reversed.
+      std::vector<T> krk = transposed;
+      std::vector<T> expected_krk = expected;
+      for (int64_t c = 0; c < kCols; ++c) {
+        for (int64_t r = 0; r < kRows; ++r) krk.push_back(transposed[c * kRows + (kRows - 1 - r)]);
+      }
+      for (int64_t r = 0; r < kRows; ++r) expected_krk.push_back(expected[kRows - 1 - r]);
+      OpTester test("ReduceLogSumExp", 18);
+      test.AddAttribute("keepdims", keepdims);
+      test.AddInput<T>("data", {2, kCols, kRows}, krk);
+      test.AddInput<int64_t>("axes", {1}, {1});
+      test.AddOutput<T>("reduced", keepdims ? std::vector<int64_t>{2, 1, kRows} : std::vector<int64_t>{2, kRows},
+                        expected_krk);
+      test.ConfigEp(DefaultCpuExecutionProvider()).RunWithConfig();
+    }
+    {  // KR over the transposed data.
+      OpTester test("ReduceLogSumExp", 18);
+      test.AddAttribute("keepdims", keepdims);
+      test.AddInput<T>("data", {kCols, kRows}, transposed);
+      test.AddInput<int64_t>("axes", {1}, {1});
+      test.AddOutput<T>("reduced", keepdims ? std::vector<int64_t>{kCols, 1} : std::vector<int64_t>{kCols},
+                        expected_t);
+      test.ConfigEp(DefaultCpuExecutionProvider()).RunWithConfig();
+    }
+  }
+}
+}  // namespace
+
+TEST(ReductionOpTest, ReduceLogSumExp_SpecialValues_FastPaths) {
+  RunReduceLogSumExpSpecialValues<float>();
+}
+
+TEST(ReductionOpTest, ReduceLogSumExp_SpecialValues_FastPaths_Double) {
+  RunReduceLogSumExpSpecialValues<double>();
+}
+
+// A leading infinite value must not force the running maximum to 0 in the generic (non fast path) reduction,
+// which would make exp(x - max) underflow for very negative finite values.
+TEST(ReductionOpTest, ReduceLogSumExp_LeadingInf_GenericPath) {
+  OpTester test("ReduceLogSumExp", 18);
+  test.AddAttribute("keepdims", static_cast<int64_t>(0));
+  const float neg_inf = -std::numeric_limits<float>::infinity();
+  // Reducing axes {0, 2} of a [2, 2, 2] tensor is not one of the fast reduction patterns.
+  test.AddInput<float>("data", {2, 2, 2}, {neg_inf, -200.f, 1.f, 2.f, -200.f, -200.f, 3.f, 4.f});
+  test.AddInput<int64_t>("axes", {2}, {0, 2});
+  test.AddOutput<float>("reduced", {2},
+                        {-200.f + std::log(3.f), static_cast<float>(4.0 + std::log(1.0 + std::exp(-1.0) +
+                                                                                   std::exp(-2.0) +
+                                                                                   std::exp(-3.0)))});
+  test.ConfigEp(DefaultCpuExecutionProvider()).RunWithConfig();
+}
+
+TEST(ReductionOpTest, ReduceLogSumExp_FastPaths_AccuracyAndThreadCountInvariance) {
+  auto run = [&](auto type_tag) {
+    using T = decltype(type_tag);
+    std::mt19937 gen(7);
+    std::uniform_real_distribution<T> dist(static_cast<T>(-20), static_cast<T>(20));
+    std::vector<std::unique_ptr<concurrency::ThreadPool>> pools;
+    pools.push_back(nullptr);
+    for (int num_threads : {2, 3, 8}) {
+      OrtThreadPoolParams params;
+      params.thread_pool_size = num_threads;
+      pools.push_back(concurrency::CreateThreadPool(&Env::Default(), params, concurrency::ThreadPoolType::INTRA_OP));
+    }
+    // {batch, rows, cols}: KR reduces cols of [batch * rows, cols]; RK/KRK reduces rows.
+    const std::vector<std::array<int64_t, 3>> shapes = {
+        {1, 1, 1}, {1, 3, 5000}, {1, 1000, 7}, {1, 513, 1024}, {1, 5000, 3}, {1, 300, 2500}, {3, 1031, 37}, {2, 7, 1}, {4, 600, 256}, {2, 40, 1025}};
+    for (const auto& [n_batch, n_rows, n_cols] : shapes) {
+      SCOPED_TRACE(MakeString("shape=[", n_batch, ",", n_rows, ",", n_cols, "]"));
+      std::vector<T> in(static_cast<size_t>(n_batch * n_rows * n_cols));
+      for (size_t i = 0; i < in.size(); ++i) {
+        in[i] = (i % 97 == 5) ? -std::numeric_limits<T>::infinity() : dist(gen);
+      }
+      auto at = [&](int64_t b, int64_t r, int64_t c) { return in[static_cast<size_t>((b * n_rows + r) * n_cols + c)]; };
+      std::vector<T> expected_kr, expected_rk;
+      for (int64_t b = 0; b < n_batch; ++b) {
+        for (int64_t r = 0; r < n_rows; ++r) {
+          std::vector<T> v;
+          for (int64_t c = 0; c < n_cols; ++c) v.push_back(at(b, r, c));
+          expected_kr.push_back(ReferenceLogSumExp(v));
+        }
+        for (int64_t c = 0; c < n_cols; ++c) {
+          std::vector<T> v;
+          for (int64_t r = 0; r < n_rows; ++r) v.push_back(at(b, r, c));
+          expected_rk.push_back(ReferenceLogSumExp(v));
+        }
+      }
+      for (bool kr : {true, false}) {
+        std::vector<T> first;
+        for (auto& pool : pools) {
+          std::vector<T> out(kr ? expected_kr.size() : expected_rk.size());
+          if (kr) {
+            LogSumExpFastReduceKR(in.data(), out.data(), n_batch * n_rows, n_cols, pool.get());
+          } else {
+            LogSumExpFastReduceRK(in.data(), out.data(), n_batch, n_rows, n_cols, pool.get());
+          }
+          const auto& expected = kr ? expected_kr : expected_rk;
+          for (size_t i = 0; i < out.size(); ++i) {
+            ASSERT_NEAR(out[i], expected[i], 1e-5 * std::max<double>(1.0, std::abs(expected[i])))
+                << "kr=" << kr << " index " << i;
+          }
+          if (first.empty()) {
+            first = out;
+          } else {
+            ASSERT_EQ(0, std::memcmp(first.data(), out.data(), out.size() * sizeof(T))) << "kr=" << kr;
+          }
+        }
+      }
+    }
+  };
+  run(float{});
+  run(double{});
+}
+
 TEST(ReductionOpTest, ReduceSumSquare_NoopWithAxesNotProvided_ElementwiseSquare) {
   OpTester test("ReduceSumSquare", 18);
   test.AddInput<float>("data", {2}, {2.f, 3.f});
