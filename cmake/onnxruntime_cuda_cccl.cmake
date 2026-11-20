@@ -54,6 +54,7 @@ endfunction()
 #    compiler. nvcc adds it by itself, so this only matters for targets that compile host C++.
 #  * On CUDA 13.3, generate the patched CCCL headers described above into ${CMAKE_BINARY_DIR}
 #    (and remove stale ones), then put that directory first on the include path.
+#  * On MSVC, define CCCL_DISABLE_NVTX (any CUDA version) to avoid an nvcc C4193 bug, see below.
 #
 # Note that this generates files in the build tree as a side effect, not just include flags.
 # It must be called for every target that compiles CUDA or CUTLASS-including host sources;
@@ -61,6 +62,17 @@ endfunction()
 # covered by the parent call, but only because that generator expression is evaluated after
 # configuration - see the call in onnxruntime_providers_cuda_plugin.cmake.
 function(ort_configure_cuda_cccl target)
+  if (MSVC)
+    # CCCL includes the NVTX3 headers (for CUB/Thrust profiling ranges) with NVTX_AS_SYSTEM_HEADER
+    # defined, so they use '#pragma system_header'. When the host compile uses MSVC external headers
+    # (/external:I, which our build passes), nvcc 13.5's cudafe++ rewrites those into unbalanced
+    # '#pragma external_header(push/pop)' (more pops than pushes) in the generated host code. MSVC 14.51
+    # reports the extra pops as C4193, which /WX makes fatal. cl.exe alone compiles the same headers
+    # cleanly, so this is an nvcc bug. ORT does not use CCCL's NVTX ranges (ORT's NVTX profiling includes
+    # NVTX3 directly), so turning them off has no functional impact.
+    target_compile_definitions(${target} PRIVATE CCCL_DISABLE_NVTX)
+  endif()
+
   if (CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
     return()
   endif()
