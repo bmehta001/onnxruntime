@@ -255,6 +255,13 @@ Status SkipLayerNormFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
     }
     const size_t first_node_to_remove = nodes_to_remove.size();
 
+    // SkipLayerNormalization only normalizes over the last axis. CheckFirstAdd guarantees a rank-3 input, and an
+    // ORT LayerNormalization with an earlier axis can still have a 1D gamma/beta via broadcasting.
+    if (const auto axis_attr = ln_node.GetAttributes().find("axis");
+        axis_attr != ln_node.GetAttributes().end() && axis_attr->second.i() != -1 && axis_attr->second.i() != 2) {
+      continue;
+    }
+
     // SkipLayerNormalization kernel requires gamma and beta to be 1D.
     // Skip fusion if gamma or beta have more than 1 dimension.
     const NodeArg* gamma_arg = ln_node.MutableInputDefs()[1];

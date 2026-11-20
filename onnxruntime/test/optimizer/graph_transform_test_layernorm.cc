@@ -1702,6 +1702,35 @@ TEST_F(GraphTransformationTests, SkipLayerNormFusion_3DGamma_NoFusion) {
                                         TransformerLevel::Level2, 1, nullptr, post_graph_checker));
 }
 
+// A LayerNormalization over a non-last axis may still have 1D gamma/beta (broadcast to X.shape[axis:]), but
+// SkipLayerNormalization only normalizes the last axis, so fusing it would change the result.
+TEST_F(GraphTransformationTests, SkipLayerNormFusion_NonLastAxis_NoFusion) {
+  for (const int64_t axis : {int64_t{1}, int64_t{-2}}) {
+    auto build_test_case = [axis](ModelTestBuilder& builder) {
+      auto* input_a = builder.MakeInput<float>({2, 4, 8}, -1.0f, 1.0f);
+      auto* input_b = builder.MakeInput<float>({2, 4, 8}, -1.0f, 1.0f);
+      auto* gamma = builder.MakeInitializer<float>({8}, 0.5f, 1.5f);
+      auto* beta = builder.MakeInitializer<float>({8}, -0.5f, 0.5f);
+      auto* add_out = builder.MakeIntermediate();
+      auto* ln_out = builder.MakeOutput();
+
+      builder.AddNode("Add", {input_a, input_b}, {add_out});
+      builder.AddNode("LayerNormalization", {add_out, gamma, beta}, {ln_out}).AddAttribute("axis", axis);
+    };
+
+    auto check_graph = [](InferenceSessionWrapper& session) {
+      auto op_to_count = CountOpsInGraph(session.GetGraph());
+      EXPECT_EQ(op_to_count["Add"], 1);
+      EXPECT_EQ(op_to_count["LayerNormalization"], 1);
+      EXPECT_EQ(op_to_count["com.microsoft.SkipLayerNormalization"], 0);
+    };
+
+    // Also compares the Level2-optimized outputs against the unoptimized model.
+    TransformerTester(build_test_case, check_graph, TransformerLevel::Default, TransformerLevel::Level2, 17,
+                      1e-5, 1e-5);
+  }
+}
+
 TEST_F(GraphTransformationTests, GroupQueryAttentionFusionTest) {
   TestGQAFusion(
       MODEL_FOLDER "fusion/gqa_fusion_quantized_simple.onnx", 1, 0, logger_.get(),
