@@ -929,6 +929,30 @@ SQ4BitGemmM1Kernel_BlkLen16_CompFp32_avx2(
     }
 }
 
+// acc += a * (scale * (b - zp)) for 32 4-bit weights already widened to int32 lanes and 32 floats of A.
+MLAS_FORCEINLINE void
+AccumulateQ4x32_CompFp32_avx2(
+    __m256& acc,
+    const __m256i& bv0_8_epi32,
+    const __m256i& bv1_8_epi32,
+    const __m256i& bv2_8_epi32,
+    const __m256i& bv3_8_epi32,
+    const __m256i& zp,
+    const __m256& scale_ps,
+    const float* a_ptr
+)
+{
+    const __m256 bv0_8_ps = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(bv0_8_epi32, zp)), scale_ps);
+    const __m256 bv1_8_ps = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(bv1_8_epi32, zp)), scale_ps);
+    const __m256 bv2_8_ps = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(bv2_8_epi32, zp)), scale_ps);
+    const __m256 bv3_8_ps = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(bv3_8_epi32, zp)), scale_ps);
+
+    acc = _mm256_fmadd_ps(bv0_8_ps, _mm256_loadu_ps(a_ptr), acc);
+    acc = _mm256_fmadd_ps(bv1_8_ps, _mm256_loadu_ps(a_ptr + 8), acc);
+    acc = _mm256_fmadd_ps(bv2_8_ps, _mm256_loadu_ps(a_ptr + 16), acc);
+    acc = _mm256_fmadd_ps(bv3_8_ps, _mm256_loadu_ps(a_ptr + 24), acc);
+}
+
 // TODO: flow MlasQ4GemmKernelBlkLen32PlusAvx512f to improve perf
 template <size_t NCols, bool HasZeroPoint, bool IsBlkLen64Layout>
 MLAS_FORCEINLINE void
@@ -957,7 +981,7 @@ ComputeDotProducts_BlkLen32Plus_CompFp32_avx2(
     constexpr size_t SubBlkStep16 = MlasQNBitBlkDataSizeInBytes(BlkBitWidth4, SubBlkLen32);
     static_assert(SubBlkStep16 == 16);  // 32 * 4 / 8
 
-    __m256i lowMask = _mm256_set1_epi8(0x0F);
+    const __m256i lowMask32 = _mm256_set1_epi32(0x0F);
 
     __m256 acc[NCols];
     UnrolledLoop<NCols>([&](size_t i) {
@@ -968,7 +992,6 @@ ComputeDotProducts_BlkLen32Plus_CompFp32_avx2(
     const float* s = QuantBScaleColPtr;
 
     [[maybe_unused]] size_t QuantBZeroPointIdx = 0;  // track half byte increments with this index instead of a pointer
-    [[maybe_unused]] int count_half_4 = 0;
     // only used if HasZeroPoint == true
 
     for (size_t k = 0; k < CountK; k += BlkLen) {
@@ -997,81 +1020,60 @@ ComputeDotProducts_BlkLen32Plus_CompFp32_avx2(
             });
         }
 
-        for (size_t kk = 0; kk < ck; kk += SubBlkLen32) {
-            int kklen = std::min((int)SubBlkLen32, (int)(ck - kk));
-
-            // Load 4 float8 from A
-            int n_to_read = std::min(kklen, 8);
-            __m256 av0_8_ps = load_float_n_avx2(ARowPtr + k + kk, n_to_read);
-
-            n_to_read = std::min(kklen - 8, 8);
-            __m256 av1_8_ps = load_float_n_avx2(ARowPtr + k + kk + 8, n_to_read);
-
-            n_to_read = std::min(kklen - 16, 8);
-            __m256 av2_8_ps = load_float_n_avx2(ARowPtr + k + kk + 16, n_to_read);
-
-            n_to_read = std::min(kklen - 24, 8);
-            __m256 av3_8_ps = load_float_n_avx2(ARowPtr + k + kk + 24, n_to_read);
-
-            if constexpr (IsBlkLen64Layout) {
-                count_half_4 = 4 * (int)((kk % (2 * SubBlkLen32)) / SubBlkLen32);
+        // 32 weights per subblock. The 64-weight packs of the BlkLen >= 64 layout are consumed whole so that
+        // both nibbles of each loaded byte are used.
+        constexpr size_t KStep = IsBlkLen64Layout ? 2 * SubBlkLen32 : SubBlkLen32;
+        for (size_t kk = 0; kk < ck; kk += KStep) {
+            const int kklen = std::min((int)KStep, (int)(ck - kk));
+            // A is read straight from memory by the FMAs; a partial K step is staged through a zero-padded buffer.
+            const float* a_ptr = ARowPtr + k + kk;
+            alignas(32) float a_tail[KStep];
+            if (kklen < (int)KStep) {
+                std::fill_n(a_tail, KStep, 0.0f);
+                std::copy_n(a_ptr, kklen, a_tail);
+                a_ptr = a_tail;
             }
+
             UnrolledLoop<NCols>([&](size_t i) {
-                // Load B col vectors. get SubBlkLen32 4b quantized weights from each column
-                __m256i bv_32_epi8;
+                // Subtract zero-point (or 8 when there is none) from the integers
+                int32_t zp_value = 8;
+                if constexpr (HasZeroPoint) {
+                    zp_value = offset[i];
+                }
+                const __m256i zp = _mm256_set1_epi32(zp_value);
+                const __m256 scale_ps = _mm256_set1_ps(scale_v[i]);
+
+                // Zero-extend each packed byte straight into an int32 lane, so a nibble is isolated with a single
+                // and/shift instead of an int8 -> int16 -> int32 widening chain.
+                const std::byte* b_ptr = b_blk_data_col_ptr[i];
+                const __m256i x0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b_ptr)));
+                const __m256i x1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b_ptr + 8)));
                 if constexpr (IsBlkLen64Layout) {
-                    // dst: | v0  v32 | v1  v33 | ... | v30 v62 | v31 v63 |
-                    // load 64 weights at once, parse to get v0 - v31 if subblk % 2 == 0, otherwise get v32 - v63
-                    // increment b_data_ptr by 2 * SubBlkStep16 if kk % (2 * SubBlkLen32) == 1
-                    // so that all v0-63 of the pack are processed.
-                    const __m256i bvi4 = _mm256_loadu_si256((__m256i const*)(b_blk_data_col_ptr[i]));
-                    bv_32_epi8 = _mm256_and_si256(_mm256_srli_epi16(bvi4, count_half_4), lowMask);
-                    b_blk_data_col_ptr[i] += count_half_4 / 2 * SubBlkStep16;
+                    // | v0  v32 | v1  v33 | ... | v30 v62 | v31 v63 |
+                    const __m256i x2 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b_ptr + 16)));
+                    const __m256i x3 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b_ptr + 24)));
+                    b_blk_data_col_ptr[i] += 2 * SubBlkStep16;
+
+                    AccumulateQ4x32_CompFp32_avx2(
+                        acc[i], _mm256_and_si256(x0, lowMask32), _mm256_and_si256(x1, lowMask32),
+                        _mm256_and_si256(x2, lowMask32), _mm256_and_si256(x3, lowMask32), zp, scale_ps, a_ptr
+                    );
+                    if (kklen > (int)SubBlkLen32) {
+                        AccumulateQ4x32_CompFp32_avx2(
+                            acc[i], _mm256_srli_epi32(x0, 4), _mm256_srli_epi32(x1, 4),
+                            _mm256_srli_epi32(x2, 4), _mm256_srli_epi32(x3, 4), zp, scale_ps,
+                            a_ptr + SubBlkLen32
+                        );
+                    }
                 } else {
                     // SubBlkLen = 32: | v0  v16 | v1  v17 | ... | v14 v30 | v15 v31 |
-                    __m128i bvi4 = _mm_loadu_si128((const __m128i*)(b_blk_data_col_ptr[i]));
                     b_blk_data_col_ptr[i] += SubBlkStep16;
 
-                    bv_32_epi8 = _mm256_set_m128i(_mm_srli_epi16(bvi4, 4), bvi4);
-                    bv_32_epi8 = _mm256_and_si256(lowMask, bv_32_epi8);
+                    AccumulateQ4x32_CompFp32_avx2(
+                        acc[i], _mm256_and_si256(x0, lowMask32), _mm256_and_si256(x1, lowMask32),
+                        _mm256_srli_epi32(x0, 4), _mm256_srli_epi32(x1, 4), zp, scale_ps, a_ptr
+                    );
                 }
-
-                // Subtract zero-point from the integers
-                if constexpr (HasZeroPoint) {
-                    // Subtract zero-point from the integers
-                    __m256i zp = _mm256_set1_epi8(offset[i]);
-                    bv_32_epi8 = _mm256_sub_epi8(bv_32_epi8, zp);
-                } else {
-                    // Subtract 8 from the integers
-                    const __m256i eight = _mm256_set1_epi8(8);
-                    bv_32_epi8 = _mm256_sub_epi8(bv_32_epi8, eight);
-                }
-
-                // Convert to 16 float32
-                const __m256i bv0_16_epi16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(bv_32_epi8, 0));
-                const __m256i bv1_16_epi16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(bv_32_epi8, 1));
-
-                __m256 bv0_8_ps =
-                    _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(bv0_16_epi16, 0)));
-                __m256 bv1_8_ps =
-                    _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(bv0_16_epi16, 1)));
-                __m256 bv2_8_ps =
-                    _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(bv1_16_epi16, 0)));
-                __m256 bv3_8_ps =
-                    _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(bv1_16_epi16, 1)));
-
-                // multiply by scale
-                __m256 scale_ps = _mm256_set1_ps(scale_v[i]);
-                bv0_8_ps = _mm256_mul_ps(bv0_8_ps, scale_ps);
-                bv1_8_ps = _mm256_mul_ps(bv1_8_ps, scale_ps);
-                bv2_8_ps = _mm256_mul_ps(bv2_8_ps, scale_ps);
-                bv3_8_ps = _mm256_mul_ps(bv3_8_ps, scale_ps);
-
-                // c[m,n] += a[m,k] * b[k,n]
-                acc[i] = _mm256_fmadd_ps(bv0_8_ps, av0_8_ps, acc[i]);
-                acc[i] = _mm256_fmadd_ps(bv1_8_ps, av1_8_ps, acc[i]);
-                acc[i] = _mm256_fmadd_ps(bv2_8_ps, av2_8_ps, acc[i]);
-                acc[i] = _mm256_fmadd_ps(bv3_8_ps, av3_8_ps, acc[i]);
             });
         }  // kk
 
