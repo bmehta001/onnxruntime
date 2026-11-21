@@ -1,8 +1,13 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <algorithm>
+#include <cmath>
+#include <complex>
 #include <functional>
+#include <numbers>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -952,6 +957,241 @@ TEST(SignalOpsTest, DFT17_2D_real) {
 
 TEST(SignalOpsTest, DFT20_2D_real) {
   TestDFT2DReal(kOpsetVersion20);
+}
+
+// Reference DFT computed directly in double precision with exactly reduced angles. `x` holds n samples.
+static vector<std::complex<double>> ReferenceDFT(const vector<std::complex<double>>& x, size_t output_size,
+                                                 bool inverse) {
+  const size_t n = x.size();
+  const double sign = inverse ? 1.0 : -1.0;
+  vector<std::complex<double>> y(output_size);
+  for (size_t k = 0; k < output_size; ++k) {
+    std::complex<double> sum = 0;
+    for (size_t j = 0; j < n; ++j) {
+      const double angle = sign * 2.0 * std::numbers::pi * static_cast<double>((j * k) % n) / static_cast<double>(n);
+      sum += x[j] * std::polar(1.0, angle);
+    }
+    y[k] = inverse ? sum / static_cast<double>(n) : sum;
+  }
+  return y;
+}
+
+struct DFTReferenceCase {
+  int64_t input_length;
+  int64_t dft_length;
+  bool complex_input;
+  bool onesided;
+  bool inverse;
+  bool signal_axis_last;
+  int64_t batch = 3;
+};
+
+// Compares the CPU DFT against ReferenceDFT for a [batch, 2, length, c] (signal_axis_last) or [batch, length, 2, c]
+// input, covering zero padding/truncation, real/complex input, one-sided output, inverse and IRFFT.
+template <typename T>
+static void TestDFTAgainstReference(int since_version, const DFTReferenceCase& c) {
+  constexpr int64_t other = 2;
+  const int64_t n = c.dft_length;
+  const bool irfft = c.inverse && c.onesided;
+  const int64_t in_c = c.complex_input ? 2 : 1;
+  const int64_t out_len = (c.onesided && !c.inverse) ? n / 2 + 1 : n;
+  const int64_t out_c = irfft ? 1 : 2;
+  const int64_t axis = c.signal_axis_last ? 2 : 1;
+  auto make_shape = [&](int64_t len, int64_t comps) {
+    return c.signal_axis_last ? vector<int64_t>{c.batch, other, len, comps} : vector<int64_t>{c.batch, len, other, comps};
+  };
+  auto index = [&](int64_t b, int64_t o, int64_t j, int64_t len, int64_t comps) {
+    return static_cast<size_t>(c.signal_axis_last ? ((b * other + o) * len + j) * comps
+                                                  : ((b * len + j) * other + o) * comps);
+  };
+
+  const vector<int64_t> input_shape = make_shape(c.input_length, in_c);
+  const vector<int64_t> output_shape = make_shape(out_len, out_c);
+  RandomValueGenerator random(GetTestRandomSeed());
+  const vector<float> raw = random.Uniform<float>(input_shape, -1.f, 1.f);
+  const vector<T> input(raw.begin(), raw.end());
+  vector<T> expected(static_cast<size_t>(c.batch * other * out_len * out_c));
+
+  const int64_t samples = std::min(c.input_length, n);
+  double max_abs = 1.0;
+  for (int64_t b = 0; b < c.batch; ++b) {
+    for (int64_t o = 0; o < other; ++o) {
+      auto load = [&](int64_t j) {
+        const size_t i = index(b, o, j, c.input_length, in_c);
+        return std::complex<double>(input[i], c.complex_input ? static_cast<double>(input[i + 1]) : 0.0);
+      };
+      vector<std::complex<double>> x(static_cast<size_t>(n));
+      for (int64_t j = 0; j < samples; ++j) {
+        x[j] = load(j);
+      }
+      if (irfft) {
+        const int64_t conjugate_end = (n % 2 == 0 && samples > 0) ? samples - 1 : samples;
+        for (int64_t k = 1; k < conjugate_end; ++k) {
+          x[n - k] = std::conj(load(k));
+        }
+      }
+      const auto y = ReferenceDFT(x, static_cast<size_t>(out_len), c.inverse);
+      for (int64_t k = 0; k < out_len; ++k) {
+        const size_t i = index(b, o, k, out_len, out_c);
+        expected[i] = static_cast<T>(y[k].real());
+        if (!irfft) {
+          expected[i + 1] = static_cast<T>(y[k].imag());
+        }
+        max_abs = std::max(max_abs, std::abs(y[k]));
+      }
+    }
+  }
+
+  OpTester test("DFT", since_version);
+  test.AddInput<T>("input", input_shape, input);
+  test.AddInput<int64_t>("dft_length", {}, {n});
+  if (since_version >= kOpsetVersion20) {
+    test.AddInput<int64_t>("axis", {}, {axis});
+  } else {
+    test.AddAttribute<int64_t>("axis", axis);
+  }
+  test.AddAttribute<int64_t>("onesided", c.onesided ? 1 : 0);
+  test.AddAttribute<int64_t>("inverse", c.inverse ? 1 : 0);
+  test.AddOutput<T>("output", output_shape, expected);
+  const double relative_tolerance = std::is_same_v<T, float> ? 1e-5 : 1e-12;
+  test.SetOutputAbsErr("output", static_cast<float>(relative_tolerance * max_abs));
+  test.ConfigEp(DefaultCpuExecutionProvider());
+  SCOPED_TRACE(::testing::Message() << "input_length=" << c.input_length << " dft_length=" << n
+                                    << " complex=" << c.complex_input << " onesided=" << c.onesided
+                                    << " inverse=" << c.inverse << " axis_last=" << c.signal_axis_last);
+  test.RunWithConfig();
+}
+
+template <typename T>
+static void TestDFTLengthsAgainstReference(int since_version, const vector<int64_t>& lengths) {
+  for (int64_t n : lengths) {
+    for (bool axis_last : {true, false}) {
+      TestDFTAgainstReference<T>(since_version, {n, n, false, true, false, axis_last});        // real -> one-sided
+      TestDFTAgainstReference<T>(since_version, {n, n, false, false, false, axis_last});       // real -> full
+      TestDFTAgainstReference<T>(since_version, {n, n, true, false, false, axis_last});        // complex forward
+      TestDFTAgainstReference<T>(since_version, {n, n, true, true, false, axis_last});         // complex -> one-sided
+      TestDFTAgainstReference<T>(since_version, {n, n, true, false, true, axis_last});         // complex inverse
+      TestDFTAgainstReference<T>(since_version, {n, n, false, false, true, axis_last});        // real inverse
+      TestDFTAgainstReference<T>(since_version, {n / 2 + 1, n, true, true, true, axis_last});  // IRFFT
+    }
+  }
+}
+
+// Lengths whose factors are 2, 3, 4, 5 and larger odd primes handled by the mixed-radix passes.
+TEST(SignalOpsTest, DFT20_Float_mixed_radix_lengths) {
+  TestDFTLengthsAgainstReference<float>(kOpsetVersion20, {1, 2, 3, 5, 6, 12, 15, 30, 45, 49, 60, 77, 400, 480});
+}
+
+TEST(SignalOpsTest, DFT20_Double_mixed_radix_lengths) {
+  TestDFTLengthsAgainstReference<double>(kOpsetVersion20, {6, 15, 49, 77, 400, 480});
+}
+
+// Lengths with a large prime factor use Bluestein's algorithm.
+TEST(SignalOpsTest, DFT20_Float_bluestein_lengths) {
+  TestDFTLengthsAgainstReference<float>(kOpsetVersion20, {67, 97, 134, 401, 997});
+}
+
+TEST(SignalOpsTest, DFT20_Double_bluestein_lengths) {
+  TestDFTLengthsAgainstReference<double>(kOpsetVersion20, {97, 401, 997});
+}
+
+TEST(SignalOpsTest, DFT17_Float_mixed_radix_and_bluestein_lengths) {
+  TestDFTLengthsAgainstReference<float>(kMinOpsetVersion, {12, 400, 401});
+}
+
+TEST(SignalOpsTest, DFT20_Float_power_of_two_lengths) {
+  TestDFTLengthsAgainstReference<float>(kOpsetVersion20, {8, 64, 512, 1024});
+}
+
+TEST(SignalOpsTest, DFT20_Float_padding_and_truncation) {
+  for (bool axis_last : {true, false}) {
+    TestDFTAgainstReference<float>(kOpsetVersion20, {50, 64, false, true, false, axis_last});
+    TestDFTAgainstReference<float>(kOpsetVersion20, {120, 100, false, true, false, axis_last});
+    TestDFTAgainstReference<float>(kOpsetVersion20, {37, 45, true, false, false, axis_last});
+    TestDFTAgainstReference<float>(kOpsetVersion20, {130, 97, true, false, true, axis_last});
+    // IRFFT with fewer and more bins than n / 2 + 1, for even and odd n.
+    TestDFTAgainstReference<float>(kOpsetVersion20, {30, 100, true, true, true, axis_last});
+    TestDFTAgainstReference<float>(kOpsetVersion20, {80, 100, true, true, true, axis_last});
+    TestDFTAgainstReference<float>(kOpsetVersion20, {50, 99, true, true, true, axis_last});
+    TestDFTAgainstReference<float>(kOpsetVersion20, {120, 99, true, true, true, axis_last});
+  }
+}
+
+// Enough transforms that the work is split across the intra-op thread pool.
+TEST(SignalOpsTest, DFT20_Float_large_batch) {
+  TestDFTAgainstReference<float>(kOpsetVersion20, {1000, 1000, false, true, false, true, 64});
+  TestDFTAgainstReference<float>(kOpsetVersion20, {512, 512, true, false, false, false, 64});
+  TestDFTAgainstReference<float>(kOpsetVersion20, {201, 400, true, true, true, true, 64});
+}
+
+template <typename T>
+static void TestSTFTAgainstReference(int64_t batch, int64_t signal_size, int64_t frame_length, int64_t frame_step,
+                                     bool complex_input, bool onesided) {
+  const int64_t comps = complex_input ? 2 : 1;
+  const vector<int64_t> signal_shape{batch, signal_size, comps};
+  RandomValueGenerator random(GetTestRandomSeed());
+  const vector<float> raw = random.Uniform<float>(signal_shape, -1.f, 1.f);
+  const vector<T> signal(raw.begin(), raw.end());
+  vector<T> window(static_cast<size_t>(frame_length));
+  for (int64_t i = 0; i < frame_length; ++i) {
+    window[i] = static_cast<T>(0.5 - 0.5 * std::cos(2.0 * std::numbers::pi * static_cast<double>(i) / frame_length));
+  }
+
+  const int64_t frames = (signal_size - frame_length) / frame_step + 1;
+  const int64_t bins = onesided ? frame_length / 2 + 1 : frame_length;
+  vector<T> expected(static_cast<size_t>(batch * frames * bins * 2));
+  double max_abs = 1.0;
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t f = 0; f < frames; ++f) {
+      vector<std::complex<double>> x(static_cast<size_t>(frame_length));
+      for (int64_t j = 0; j < frame_length; ++j) {
+        const size_t i = static_cast<size_t>((b * signal_size + f * frame_step + j) * comps);
+        x[j] = std::complex<double>(signal[i], complex_input ? static_cast<double>(signal[i + 1]) : 0.0) *
+               static_cast<double>(window[j]);
+      }
+      const auto y = ReferenceDFT(x, static_cast<size_t>(bins), false);
+      for (int64_t k = 0; k < bins; ++k) {
+        const size_t i = static_cast<size_t>(((b * frames + f) * bins + k) * 2);
+        expected[i] = static_cast<T>(y[k].real());
+        expected[i + 1] = static_cast<T>(y[k].imag());
+        max_abs = std::max(max_abs, std::abs(y[k]));
+      }
+    }
+  }
+
+  OpTester test("STFT", kMinOpsetVersion);
+  test.AddAttribute<int64_t>("onesided", onesided ? 1 : 0);
+  test.AddInput<T>("signal", signal_shape, signal);
+  test.AddInput<int64_t>("frame_step", {}, {frame_step});
+  test.AddInput<T>("window", {frame_length}, window);
+  test.AddInput<int64_t>("frame_length", {}, {frame_length});
+  test.AddOutput<T>("output", {batch, frames, bins, 2}, expected);
+  const double relative_tolerance = std::is_same_v<T, float> ? 1e-5 : 1e-12;
+  test.SetOutputAbsErr("output", static_cast<float>(relative_tolerance * max_abs));
+  test.ConfigEp(DefaultCpuExecutionProvider());
+  test.RunWithConfig();
+}
+
+// Whisper-style framing (n_fft = 400, hop = 160, Hann window) with many frames per batch.
+TEST(SignalOpsTest, STFTFloat_whisper_like_frames) {
+  TestSTFTAgainstReference<float>(2, 8000, 400, 160, false, true);
+}
+
+TEST(SignalOpsTest, STFTDouble_mixed_radix_and_bluestein_frames) {
+  TestSTFTAgainstReference<double>(2, 1000, 96, 40, false, true);
+  TestSTFTAgainstReference<double>(2, 1000, 101, 40, true, false);
+}
+
+TEST(SignalOpsTest, STFT_requires_frame_length_or_window) {
+  OpTester test("STFT", kMinOpsetVersion);
+  test.AddInput<float>("signal", {1, 64, 1}, vector<float>(64, 1.f));
+  test.AddInput<int64_t>("frame_step", {}, {8});
+  test.AddOptionalInputEdge<float>();
+  test.AddOptionalInputEdge<int64_t>();
+  test.AddOutput<float>("output", {1, 1, 1, 2}, {0.f, 0.f});
+  test.ConfigEp(DefaultCpuExecutionProvider());
+  test.Config(OpTester::ExpectResult::kExpectFailure, "STFT requires a window or frame_length");
+  test.RunWithConfig();
 }
 
 }  // namespace test
