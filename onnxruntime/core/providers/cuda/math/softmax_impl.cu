@@ -210,11 +210,11 @@ __global__ void softmax_strided_forward(output_t* dst, const input_t* src, int64
 
     if (active) {
       if constexpr (is_log_softmax) {
-        const acc_t shift = m + std::log(s);
+        const acc_t log_sum = std::log(s);
 #pragma unroll 4
         for (int64_t d = threadIdx.y; d < axis_dim; d += blockDim.y) {
           const int64_t idx = base + d * inner;
-          dst[idx] = static_cast<output_t>(static_cast<acc_t>(src[idx]) - shift);
+          dst[idx] = static_cast<output_t>((static_cast<acc_t>(src[idx]) - m) - log_sum);
         }
       } else {
         const acc_t inv_s = acc_t(1) / s;

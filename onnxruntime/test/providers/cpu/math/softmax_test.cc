@@ -468,6 +468,20 @@ TEST(SoftmaxOperator, NonInnermostAxis_opset13) {
 }
 
 #if defined(USE_CUDA)
+TEST(SoftmaxOperator, LogSoftmaxNonInnermostLargeOffset_opset13) {
+  if (!HasCudaEnvironment(530)) {
+    GTEST_SKIP() << "CUDA not supported";
+  }
+
+  OpTester test("LogSoftmax", 13);
+  test.AddAttribute("axis", int64_t{0});
+  test.AddInput<float>("X", {2, 2}, {1.0e20f, -1.0e20f, 1.0e20f, -1.0e20f});
+  test.AddOutput<float>("Y", {2, 2}, {-0.69314718f, -0.69314718f, -0.69314718f, -0.69314718f});
+  std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+  execution_providers.push_back(DefaultCudaExecutionProvider());
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+}
+
 TEST(SoftmaxOperator, NonInnermostAxis_fp16_opset13) {
   if (!HasCudaEnvironment(530)) {
     GTEST_SKIP() << "CUDA FP16 not supported";
