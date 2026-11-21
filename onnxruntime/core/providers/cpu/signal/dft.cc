@@ -45,6 +45,8 @@ namespace {
 
 using signal::fft::Complex;
 using signal::fft::ComplexFftPlan;
+using signal::fft::LanePtr;
+using signal::fft::LaneTraits;
 using signal::fft::PlanCache;
 using signal::fft::RealFftPlan;
 
@@ -99,41 +101,87 @@ DftSetup<T> MakeDftSetup(PlanCache& cache, DftMode mode, size_t n, size_t input_
   return setup;
 }
 
-// Transforms one signal. `x` is read with a stride of `x_stride` elements of U. Output element k is written to
-// y[k * y_step] (and y[k * y_step + 1] for the imaginary part of complex outputs).
-template <typename T, typename U>
-void RunDft(const DftSetup<T>& s, const U* x, size_t x_stride, const T* window, T* y, size_t y_step,
-            Complex<T>* buffer, Complex<T>* scratch) {
+// Lane type used to transform several signals of type T at once; T itself when no SIMD type is available.
+template <typename T>
+struct VectorLane {
+  using type = T;
+};
+
+#if defined(ORT_FFT_FLOAT32X4)
+template <>
+struct VectorLane<float> {
+  using type = signal::fft::Float32x4;
+};
+#endif
+
+// Real and imaginary parts of lane l (signal l) of element k of a lane buffer.
+template <typename V>
+inline auto& LaneRe(Complex<V>* b, size_t k, size_t l) { return LanePtr(b + k)[l]; }
+
+template <typename V>
+inline auto& LaneIm(Complex<V>* b, size_t k, size_t l) { return LanePtr(b + k)[LaneTraits<V>::kLanes + l]; }
+
+// Sample j of lane l of a real signal packed two samples per complex element.
+template <typename V>
+inline auto& PackedSample(Complex<V>* b, size_t j, size_t l) {
+  return LanePtr(b + j / 2)[(j & 1) * LaneTraits<V>::kLanes + l];
+}
+
+// Transforms LaneTraits<V>::kLanes signals, one per lane of V. Signal l is read from xs[l] with a stride of
+// `x_stride` elements of U. Its output element k is written to ys[l][k * y_step] (and ys[l][k * y_step + 1] for the
+// imaginary part of complex outputs). Only the first `active` lanes are stored; the inputs of the other lanes must
+// still be readable. Lanes are independent, so a signal's result does not depend on the other lanes.
+template <typename T, typename U, typename V>
+void RunDft(const DftSetup<T>& s, const U* const* xs, size_t x_stride, const T* window, T* const* ys, size_t y_step,
+            Complex<V>* buffer, Complex<V>* scratch, size_t active) {
+  constexpr size_t kLanes = LaneTraits<V>::kLanes;
   const size_t n = s.n;
   const size_t samples = s.samples;
+
+  auto load = [&](size_t end) {
+    for (size_t j = 0; j < samples; ++j) {
+      for (size_t l = 0; l < kLanes; ++l) {
+        const U* x = xs[l];
+        if constexpr (std::is_same_v<U, T>) {
+          LaneRe(buffer, j, l) = window ? x[j * x_stride] * window[j] : x[j * x_stride];
+          LaneIm(buffer, j, l) = T{0};
+        } else {
+          Complex<T> v = LoadComplex(x[j * x_stride]);
+          if (window) {
+            v = signal::fft::Scale(v, window[j]);
+          }
+          LaneRe(buffer, j, l) = v.re;
+          LaneIm(buffer, j, l) = v.im;
+        }
+      }
+    }
+    std::fill(buffer + samples, buffer + end, Complex<V>{});
+  };
 
   if (s.mode == DftMode::kInverseOnesided) {
     const T inv_n = static_cast<T>(1.0 / static_cast<double>(n));
     if (s.real_plan) {
-      for (size_t k = 0; k < samples; ++k) {
-        buffer[k] = LoadComplex(x[k * x_stride]);
-      }
-      std::fill(buffer + samples, buffer + n / 2 + 1, Complex<T>{0, 0});
+      load(n / 2 + 1);
       s.real_plan->Backward(buffer, scratch);
-      const T* r = reinterpret_cast<const T*>(buffer);
       for (size_t j = 0; j < n; ++j) {
-        y[j * y_step] = r[j] * inv_n;
+        for (size_t l = 0; l < active; ++l) {
+          ys[l][j * y_step] = PackedSample(buffer, j, l) * inv_n;
+        }
       }
       return;
     }
     // Odd n: rebuild the full Hermitian spectrum. Bin k < (n+1)/2 mirrors to n-k; the imaginary part of DC
     // only contributes to the discarded imaginary output.
-    for (size_t k = 0; k < samples; ++k) {
-      buffer[k] = LoadComplex(x[k * x_stride]);
-    }
-    std::fill(buffer + samples, buffer + n, Complex<T>{0, 0});
+    load(n);
     const size_t conjugate_end = std::min(samples, (n + 1) / 2);
     for (size_t k = 1; k < conjugate_end; ++k) {
       buffer[n - k] = signal::fft::Conj(buffer[k]);
     }
     s.complex_plan->Backward(buffer, scratch);
     for (size_t j = 0; j < n; ++j) {
-      y[j * y_step] = buffer[j].re * inv_n;
+      for (size_t l = 0; l < active; ++l) {
+        ys[l][j * y_step] = LaneRe(buffer, j, l) * inv_n;
+      }
     }
     return;
   }
@@ -141,69 +189,99 @@ void RunDft(const DftSetup<T>& s, const U* x, size_t x_stride, const T* window, 
   if constexpr (std::is_same_v<U, T>) {
     if (s.real_plan) {
       if (s.real_plan->IsPacked()) {
-        T* r = reinterpret_cast<T*>(buffer);
         for (size_t j = 0; j < samples; ++j) {
-          r[j] = window ? x[j * x_stride] * window[j] : x[j * x_stride];
+          for (size_t l = 0; l < kLanes; ++l) {
+            PackedSample(buffer, j, l) = window ? xs[l][j * x_stride] * window[j] : xs[l][j * x_stride];
+          }
         }
-        std::fill(r + samples, r + n, T{0});
+        for (size_t j = samples; j < n; ++j) {
+          for (size_t l = 0; l < kLanes; ++l) {
+            PackedSample(buffer, j, l) = T{0};
+          }
+        }
       } else {
-        for (size_t j = 0; j < samples; ++j) {
-          buffer[j] = {window ? x[j * x_stride] * window[j] : x[j * x_stride], 0};
-        }
-        std::fill(buffer + samples, buffer + n, Complex<T>{0, 0});
+        load(n);
       }
       s.real_plan->Forward(buffer, scratch);
       const size_t half = n / 2;
-      for (size_t k = 0; k < s.output_size; ++k) {
-        // Bins above n/2 of a real signal's spectrum are conjugates of the lower bins.
-        const Complex<T> v = k <= half ? buffer[k] : signal::fft::Conj(buffer[n - k]);
-        y[k * y_step] = v.re;
-        y[k * y_step + 1] = v.im;
+      // Bins above n/2 of a real signal's spectrum are conjugates of the lower bins.
+      const size_t direct_end = std::min(s.output_size, half + 1);
+      for (size_t k = 0; k < direct_end; ++k) {
+        for (size_t l = 0; l < active; ++l) {
+          ys[l][k * y_step] = LaneRe(buffer, k, l);
+          ys[l][k * y_step + 1] = LaneIm(buffer, k, l);
+        }
+      }
+      for (size_t k = direct_end; k < s.output_size; ++k) {
+        for (size_t l = 0; l < active; ++l) {
+          ys[l][k * y_step] = LaneRe(buffer, n - k, l);
+          ys[l][k * y_step + 1] = -LaneIm(buffer, n - k, l);
+        }
       }
       return;
     }
   }
 
-  for (size_t j = 0; j < samples; ++j) {
-    const Complex<T> v = LoadComplex(x[j * x_stride]);
-    buffer[j] = window ? signal::fft::Scale(v, window[j]) : v;
-  }
-  std::fill(buffer + samples, buffer + n, Complex<T>{0, 0});
-  if (s.mode == DftMode::kForward) {
+  load(n);
+  const bool forward = s.mode == DftMode::kForward;
+  if (forward) {
     s.complex_plan->Forward(buffer, scratch);
-    for (size_t k = 0; k < s.output_size; ++k) {
-      y[k * y_step] = buffer[k].re;
-      y[k * y_step + 1] = buffer[k].im;
-    }
   } else {
     s.complex_plan->Backward(buffer, scratch);
-    const T inv_n = static_cast<T>(1.0 / static_cast<double>(n));
+  }
+  if (forward) {
     for (size_t k = 0; k < s.output_size; ++k) {
-      y[k * y_step] = buffer[k].re * inv_n;
-      y[k * y_step + 1] = buffer[k].im * inv_n;
+      for (size_t l = 0; l < active; ++l) {
+        ys[l][k * y_step] = LaneRe(buffer, k, l);
+        ys[l][k * y_step + 1] = LaneIm(buffer, k, l);
+      }
+    }
+    return;
+  }
+  const T inv_n = static_cast<T>(1.0 / static_cast<double>(n));
+  for (size_t k = 0; k < s.output_size; ++k) {
+    for (size_t l = 0; l < active; ++l) {
+      ys[l][k * y_step] = LaneRe(buffer, k, l) * inv_n;
+      ys[l][k * y_step + 1] = LaneIm(buffer, k, l) * inv_n;
     }
   }
 }
 
 // Runs `count` independent transforms on the operator thread pool. get_signal(i) returns the input and output base
-// pointers of signal i. Each worker allocates its buffers once per range of signals.
+// pointers of signal i. Signals are transformed in groups of kLanes using the SIMD lane type. A partial last group
+// fills its unused lanes with a copy of its first signal and discards their results, so every signal takes the same
+// code path regardless of its position, the batch size or the thread count. Each worker allocates its buffers once.
 template <typename T, typename U, typename GetSignal>
 void RunDfts(concurrency::ThreadPool* thread_pool, const DftSetup<T>& setup, size_t count, size_t x_stride,
              const T* window, size_t y_step, const GetSignal& get_signal) {
+  using Vec = typename VectorLane<T>::type;
+  constexpr size_t kLanes = LaneTraits<Vec>::kLanes;
+  const size_t groups = (count + kLanes - 1) / kLanes;
+  const size_t memory_size = setup.buffer_size + setup.scratch_size;
+
+  // A group costs about as much compute as one scalar transform but moves kLanes signals.
   const double work = static_cast<double>(std::max(setup.n, setup.scratch_size));
-  const TensorOpCost cost{static_cast<double>(setup.samples * sizeof(U)),
-                          static_cast<double>(setup.output_size * 2 * sizeof(T)),
+  const TensorOpCost cost{static_cast<double>(kLanes * setup.samples * sizeof(U)),
+                          static_cast<double>(kLanes * setup.output_size * 2 * sizeof(T)),
                           5.0 * work * std::max(1.0, std::log2(work))};
   concurrency::ThreadPool::TryParallelFor(
-      thread_pool, static_cast<std::ptrdiff_t>(count), cost, [&](std::ptrdiff_t first, std::ptrdiff_t last) {
-        auto memory = std::make_unique<Complex<T>[]>(setup.buffer_size + setup.scratch_size);
-        Complex<T>* buffer = memory.get();
-        Complex<T>* scratch = buffer + setup.buffer_size;
-        for (std::ptrdiff_t i = first; i < last; ++i) {
-          const U* x;
-          T* y;
-          get_signal(static_cast<size_t>(i), x, y);
-          RunDft<T, U>(setup, x, x_stride, window, y, y_step, buffer, scratch);
+      thread_pool, static_cast<std::ptrdiff_t>(groups), cost, [&](std::ptrdiff_t first, std::ptrdiff_t last) {
+        auto memory = std::make_unique<Complex<Vec>[]>(memory_size);
+        const U* xs[kLanes];
+        T* ys[kLanes];
+        for (std::ptrdiff_t g = first; g < last; ++g) {
+          const size_t begin = static_cast<size_t>(g) * kLanes;
+          const size_t active = std::min(kLanes, count - begin);
+          for (size_t l = 0; l < kLanes; ++l) {
+            if (l < active) {
+              get_signal(begin + l, xs[l], ys[l]);
+            } else {
+              xs[l] = xs[0];
+              ys[l] = nullptr;
+            }
+          }
+          RunDft<T, U, Vec>(setup, xs, x_stride, window, ys, y_step, memory.get(), memory.get() + setup.buffer_size,
+                            active);
         }
       });
 }

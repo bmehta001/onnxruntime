@@ -1114,6 +1114,93 @@ TEST(SignalOpsTest, DFT20_Float_large_batch) {
   TestDFTAgainstReference<float>(kOpsetVersion20, {201, 400, true, true, true, true, 64});
 }
 
+// Runs DFT-20 along axis 1 of a [batch, input_length, components] input, checks the output against `expected` within
+// `abs_err` (0 means bitwise equality) and returns it.
+static vector<float> RunDFTAlongAxis1(const vector<float>& input, int64_t batch, int64_t input_length, int64_t n,
+                                      bool complex_input, bool onesided, bool inverse, const vector<float>& expected,
+                                      float abs_err) {
+  const bool irfft = onesided && inverse;
+  const int64_t out_len = (onesided && !inverse) ? n / 2 + 1 : n;
+  OpTester test("DFT", kOpsetVersion20);
+  test.AddInput<float>("input", {batch, input_length, complex_input ? 2 : 1}, input);
+  test.AddInput<int64_t>("dft_length", {}, {n});
+  test.AddInput<int64_t>("axis", {}, {1});
+  test.AddAttribute<int64_t>("onesided", onesided ? 1 : 0);
+  test.AddAttribute<int64_t>("inverse", inverse ? 1 : 0);
+  test.AddOutput<float>("output", {batch, out_len, irfft ? 1 : 2}, expected);
+  test.SetOutputAbsErr("output", abs_err);
+  test.SetOutputRelErr("output", 0.0f);
+  test.ConfigEp(DefaultCpuExecutionProvider());
+  test.RunWithConfig();
+  const auto fetches = test.GetFetches();
+  const Tensor& output = fetches.at(0).Get<Tensor>();
+  const float* data = output.Data<float>();
+  return vector<float>(data, data + output.Shape().Size());
+}
+
+// Signals are transformed in groups of SIMD lanes, with unused lanes of a partial group discarded. A signal must
+// produce bitwise identical results whatever the batch size, which also keeps results independent of the thread count.
+TEST(SignalOpsTest, DFT20_Float_batched_signals_match_single_signal) {
+  constexpr int64_t kBatch = 7;
+  struct Mode {
+    bool complex_input;
+    bool onesided;
+    bool inverse;
+  };
+  constexpr Mode kModes[] = {{false, true, false}, {false, false, false}, {true, false, false}, {true, false, true}, {false, false, true}, {true, true, true}};
+  for (int64_t n : {7, 97, 400, 401}) {
+    for (const Mode& m : kModes) {
+      const bool irfft = m.onesided && m.inverse;
+      const int64_t in_len = irfft ? n / 2 + 1 : n;
+      const int64_t in_c = m.complex_input ? 2 : 1;
+      const int64_t out_len = (m.onesided && !m.inverse) ? n / 2 + 1 : n;
+      const int64_t out_c = irfft ? 1 : 2;
+      RandomValueGenerator random(GetTestRandomSeed());
+      const vector<int64_t> input_shape{kBatch, in_len, in_c};
+      const vector<float> input = random.Uniform<float>(input_shape, -1.f, 1.f);
+
+      vector<float> expected(static_cast<size_t>(kBatch * out_len * out_c));
+      double max_abs = 1.0;
+      for (int64_t b = 0; b < kBatch; ++b) {
+        auto load = [&](int64_t j) {
+          const size_t i = static_cast<size_t>((b * in_len + j) * in_c);
+          return std::complex<double>(input[i], m.complex_input ? static_cast<double>(input[i + 1]) : 0.0);
+        };
+        vector<std::complex<double>> x(static_cast<size_t>(n));
+        for (int64_t j = 0; j < in_len; ++j) {
+          x[j] = load(j);
+        }
+        if (irfft) {
+          for (int64_t k = 1; k < (n + 1) / 2; ++k) {
+            x[n - k] = std::conj(load(k));
+          }
+        }
+        const auto y = ReferenceDFT(x, static_cast<size_t>(out_len), m.inverse);
+        for (int64_t k = 0; k < out_len; ++k) {
+          const size_t i = static_cast<size_t>((b * out_len + k) * out_c);
+          expected[i] = static_cast<float>(y[k].real());
+          if (!irfft) {
+            expected[i + 1] = static_cast<float>(y[k].imag());
+          }
+          max_abs = std::max(max_abs, std::abs(y[k]));
+        }
+      }
+
+      SCOPED_TRACE(::testing::Message() << "n=" << n << " complex=" << m.complex_input << " onesided=" << m.onesided
+                                        << " inverse=" << m.inverse);
+      const vector<float> batched = RunDFTAlongAxis1(input, kBatch, in_len, n, m.complex_input, m.onesided, m.inverse,
+                                                     expected, static_cast<float>(1e-5 * max_abs));
+      const size_t in_size = static_cast<size_t>(in_len * in_c);
+      const size_t out_size = static_cast<size_t>(out_len * out_c);
+      for (int64_t b = 0; b < kBatch; ++b) {
+        const vector<float> single_input(input.begin() + b * in_size, input.begin() + (b + 1) * in_size);
+        const vector<float> single_expected(batched.begin() + b * out_size, batched.begin() + (b + 1) * out_size);
+        RunDFTAlongAxis1(single_input, 1, in_len, n, m.complex_input, m.onesided, m.inverse, single_expected, 0.0f);
+      }
+    }
+  }
+}
+
 template <typename T>
 static void TestSTFTAgainstReference(int64_t batch, int64_t signal_size, int64_t frame_length, int64_t frame_step,
                                      bool complex_input, bool onesided) {
@@ -1170,6 +1257,13 @@ TEST(SignalOpsTest, STFTFloat_whisper_like_frames) {
 TEST(SignalOpsTest, STFTDouble_mixed_radix_and_bluestein_frames) {
   TestSTFTAgainstReference<double>(2, 1000, 96, 40, false, true);
   TestSTFTAgainstReference<double>(2, 1000, 101, 40, true, false);
+}
+
+// 23 frames per batch so the frames do not divide evenly into groups of SIMD lanes.
+TEST(SignalOpsTest, STFTFloat_mixed_radix_and_bluestein_frames) {
+  TestSTFTAgainstReference<float>(1, 1000, 96, 40, false, true);
+  TestSTFTAgainstReference<float>(3, 1000, 101, 40, true, false);
+  TestSTFTAgainstReference<float>(1, 1000, 99, 40, false, true);
 }
 
 TEST(SignalOpsTest, STFT_requires_frame_length_or_window) {

@@ -23,6 +23,15 @@
 #include <utility>
 #include <vector>
 
+#if defined(_M_ARM64) || defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#define ORT_FFT_FLOAT32X4_NEON 1
+#elif (defined(_M_X64) && !defined(_M_ARM64EC)) || defined(__x86_64__) || defined(__SSE2__) || \
+    (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <emmintrin.h>
+#define ORT_FFT_FLOAT32X4_SSE2 1
+#endif
+
 namespace onnxruntime {
 namespace signal {
 namespace fft {
@@ -42,16 +51,64 @@ inline Complex<T> operator+(Complex<T> a, Complex<T> b) { return {a.re + b.re, a
 template <typename T>
 inline Complex<T> operator-(Complex<T> a, Complex<T> b) { return {a.re - b.re, a.im - b.im}; }
 
-template <typename T>
-inline Complex<T> Scale(Complex<T> a, T s) { return {a.re * s, a.im * s}; }
+// Four float lanes processed with SSE2 or NEON. Operations map one-to-one to the scalar operators.
+#if defined(ORT_FFT_FLOAT32X4_NEON)
+#define ORT_FFT_FLOAT32X4 1
+struct Float32x4 {
+  float32x4_t v;
+};
+inline Float32x4 operator+(Float32x4 a, Float32x4 b) { return {vaddq_f32(a.v, b.v)}; }
+inline Float32x4 operator-(Float32x4 a, Float32x4 b) { return {vsubq_f32(a.v, b.v)}; }
+inline Float32x4 operator*(Float32x4 a, Float32x4 b) { return {vmulq_f32(a.v, b.v)}; }
+inline Float32x4 operator*(Float32x4 a, float b) { return {vmulq_n_f32(a.v, b)}; }
+inline Float32x4 operator-(Float32x4 a) { return {vnegq_f32(a.v)}; }
+#elif defined(ORT_FFT_FLOAT32X4_SSE2)
+#define ORT_FFT_FLOAT32X4 1
+struct Float32x4 {
+  __m128 v;
+};
+inline Float32x4 operator+(Float32x4 a, Float32x4 b) { return {_mm_add_ps(a.v, b.v)}; }
+inline Float32x4 operator-(Float32x4 a, Float32x4 b) { return {_mm_sub_ps(a.v, b.v)}; }
+inline Float32x4 operator*(Float32x4 a, Float32x4 b) { return {_mm_mul_ps(a.v, b.v)}; }
+inline Float32x4 operator*(Float32x4 a, float b) { return {_mm_mul_ps(a.v, _mm_set1_ps(b))}; }
+inline Float32x4 operator-(Float32x4 a) { return {_mm_xor_ps(a.v, _mm_set1_ps(-0.0f))}; }
+#endif
 
-template <typename T>
-inline Complex<T> Mul(Complex<T> a, Complex<T> b) {
+// Number of independent signals transformed together by a lane type, and the scalar type of each lane.
+template <typename V>
+struct LaneTraits {
+  static constexpr size_t kLanes = 1;
+  using Scalar = V;
+};
+
+#if defined(ORT_FFT_FLOAT32X4)
+template <>
+struct LaneTraits<Float32x4> {
+  static constexpr size_t kLanes = 4;
+  using Scalar = float;
+};
+#endif
+
+// A Complex<V> occupies 2 * kLanes scalars: the real parts of every lane followed by the imaginary parts.
+template <typename V>
+inline typename LaneTraits<V>::Scalar* LanePtr(Complex<V>* c) {
+  return reinterpret_cast<typename LaneTraits<V>::Scalar*>(c);
+}
+
+// The transforms below are written for a "lane" type V, which is either the scalar T or a SIMD vector holding the
+// same element of several independent signals (one signal per lane). Plan constants are always scalar T and are
+// broadcast across lanes, so every lane performs exactly the operations of the scalar code.
+
+template <typename V, typename S>
+inline Complex<V> Scale(Complex<V> a, S s) { return {a.re * s, a.im * s}; }
+
+template <typename V, typename W>
+inline Complex<V> Mul(Complex<V> a, Complex<W> b) {
   return {a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re};
 }
 
-template <typename T>
-inline Complex<T> MulConj(Complex<T> a, Complex<T> b) {
+template <typename V, typename W>
+inline Complex<V> MulConj(Complex<V> a, Complex<W> b) {
   return {a.re * b.re + a.im * b.im, a.im * b.re - a.re * b.im};
 }
 
@@ -59,8 +116,8 @@ template <typename T>
 inline Complex<T> Conj(Complex<T> a) { return {a.re, -a.im}; }
 
 // Twiddles are stored for the forward direction (exp(-i*theta)); the backward direction uses their conjugates.
-template <bool kForward, typename T>
-inline Complex<T> Twiddle(Complex<T> a, Complex<T> w) {
+template <bool kForward, typename V, typename T>
+inline Complex<V> Twiddle(Complex<V> a, Complex<T> w) {
   if constexpr (kForward) {
     return Mul(a, w);
   } else {
@@ -173,8 +230,11 @@ class ComplexFftPlan {
   }
 
   // Unnormalized in-place transforms of `data` (n elements).
-  void Forward(Complex<T>* data, Complex<T>* scratch) const { Execute<true>(data, scratch); }
-  void Backward(Complex<T>* data, Complex<T>* scratch) const { Execute<false>(data, scratch); }
+  // V is T or a lane type whose LaneTraits<V>::Scalar is T, transforming one signal per lane.
+  template <typename V = T>
+  void Forward(Complex<V>* data, Complex<V>* scratch) const { Execute<true>(data, scratch); }
+  template <typename V = T>
+  void Backward(Complex<V>* data, Complex<V>* scratch) const { Execute<false>(data, scratch); }
 
  private:
   struct Pass {
@@ -239,8 +299,8 @@ class ComplexFftPlan {
     }
   }
 
-  template <bool kForward>
-  void Execute(Complex<T>* data, Complex<T>* scratch) const {
+  template <bool kForward, typename V>
+  void Execute(Complex<V>* data, Complex<V>* scratch) const {
     if (n_ <= 1) {
       return;
     }
@@ -248,8 +308,8 @@ class ComplexFftPlan {
       ExecuteBluestein<kForward>(data, scratch);
       return;
     }
-    Complex<T>* in = data;
-    Complex<T>* out = scratch;
+    Complex<V>* in = data;
+    Complex<V>* out = scratch;
     for (const auto& pass : passes_) {
       const Complex<T>* tw = twiddles_.data() + pass.twiddle_offset;
       switch (pass.radix) {
@@ -277,24 +337,24 @@ class ComplexFftPlan {
     }
   }
 
-  template <bool kForward>
-  void ExecuteBluestein(Complex<T>* data, Complex<T>* scratch) const {
+  template <bool kForward, typename V>
+  void ExecuteBluestein(Complex<V>* data, Complex<V>* scratch) const {
     const size_t m = bluestein_m_;
-    Complex<T>* a = scratch;
-    Complex<T>* inner_scratch = scratch + m;
+    Complex<V>* a = scratch;
+    Complex<V>* inner_scratch = scratch + m;
     // The backward transform is conj(forward(conj(x))).
     for (size_t k = 0; k < n_; ++k) {
-      Complex<T> x = kForward ? data[k] : Conj(data[k]);
+      Complex<V> x = kForward ? data[k] : Conj(data[k]);
       a[k] = Mul(x, chirp_[k]);
     }
-    std::fill(a + n_, a + m, Complex<T>{0, 0});
+    std::fill(a + n_, a + m, Complex<V>{});
     inner_->Forward(a, inner_scratch);
     for (size_t k = 0; k < m; ++k) {
       a[k] = Mul(a[k], kernel_fft_[k]);
     }
     inner_->Backward(a, inner_scratch);
     for (size_t k = 0; k < n_; ++k) {
-      Complex<T> y = Mul(a[k], chirp_[k]);
+      Complex<V> y = Mul(a[k], chirp_[k]);
       data[k] = kForward ? y : Conj(y);
     }
   }
@@ -303,42 +363,42 @@ class ComplexFftPlan {
   // in[i + ido * (j + radix * k)] and output element (i, k, j) is written to out[i + ido * (k + l1 * j)], with the
   // output twiddle exp(-2*pi*i * j*l1*i / n) applied to every non-zero j and i.
 
-  template <bool kForward>
-  static void Pass2(size_t ido, size_t l1, const Complex<T>* in, Complex<T>* out, const Complex<T>* tw) {
+  template <bool kForward, typename V>
+  static void Pass2(size_t ido, size_t l1, const Complex<V>* in, Complex<V>* out, const Complex<T>* tw) {
     for (size_t k = 0; k < l1; ++k) {
-      const Complex<T>* src = in + ido * 2 * k;
-      Complex<T>* dst0 = out + ido * k;
-      Complex<T>* dst1 = out + ido * (k + l1);
+      const Complex<V>* src = in + ido * 2 * k;
+      Complex<V>* dst0 = out + ido * k;
+      Complex<V>* dst1 = out + ido * (k + l1);
       dst0[0] = src[0] + src[ido];
       dst1[0] = src[0] - src[ido];
       for (size_t i = 1; i < ido; ++i) {
-        const Complex<T> a = src[i];
-        const Complex<T> b = src[i + ido];
+        const Complex<V> a = src[i];
+        const Complex<V> b = src[i + ido];
         dst0[i] = a + b;
         dst1[i] = Twiddle<kForward>(a - b, tw[i - 1]);
       }
     }
   }
 
-  template <bool kForward>
-  static void Pass3(size_t ido, size_t l1, const Complex<T>* in, Complex<T>* out, const Complex<T>* tw) {
+  template <bool kForward, typename V>
+  static void Pass3(size_t ido, size_t l1, const Complex<V>* in, Complex<V>* out, const Complex<T>* tw) {
     constexpr T kHalf = static_cast<T>(0.5);
     constexpr T kSin60 = static_cast<T>(0.86602540378443864676372317075294);
     const Complex<T>* tw1 = tw;
     const Complex<T>* tw2 = tw + (ido - 1);
     for (size_t k = 0; k < l1; ++k) {
-      const Complex<T>* src = in + ido * 3 * k;
-      Complex<T>* dst0 = out + ido * k;
-      Complex<T>* dst1 = out + ido * (k + l1);
-      Complex<T>* dst2 = out + ido * (k + 2 * l1);
+      const Complex<V>* src = in + ido * 3 * k;
+      Complex<V>* dst0 = out + ido * k;
+      Complex<V>* dst1 = out + ido * (k + l1);
+      Complex<V>* dst2 = out + ido * (k + 2 * l1);
       for (size_t i = 0; i < ido; ++i) {
-        const Complex<T> x0 = src[i];
-        const Complex<T> x1 = src[i + ido];
-        const Complex<T> x2 = src[i + 2 * ido];
-        const Complex<T> t1 = x1 + x2;
-        const Complex<T> t2 = Scale(x1 - x2, kSin60);
-        const Complex<T> ca = x0 - Scale(t1, kHalf);
-        const Complex<T> cb = RotateQuarter<kForward>(t2);
+        const Complex<V> x0 = src[i];
+        const Complex<V> x1 = src[i + ido];
+        const Complex<V> x2 = src[i + 2 * ido];
+        const Complex<V> t1 = x1 + x2;
+        const Complex<V> t2 = Scale(x1 - x2, kSin60);
+        const Complex<V> ca = x0 - Scale(t1, kHalf);
+        const Complex<V> cb = RotateQuarter<kForward>(t2);
         dst0[i] = x0 + t1;
         if (i == 0) {
           dst1[i] = ca + cb;
@@ -351,36 +411,36 @@ class ComplexFftPlan {
     }
   }
 
-  template <bool kForward>
-  static void Pass4(size_t ido, size_t l1, const Complex<T>* in, Complex<T>* out, const Complex<T>* tw) {
+  template <bool kForward, typename V>
+  static void Pass4(size_t ido, size_t l1, const Complex<V>* in, Complex<V>* out, const Complex<T>* tw) {
     const Complex<T>* tw1 = tw;
     const Complex<T>* tw2 = tw + (ido - 1);
     const Complex<T>* tw3 = tw + 2 * (ido - 1);
     for (size_t k = 0; k < l1; ++k) {
-      const Complex<T>* src = in + ido * 4 * k;
-      Complex<T>* dst0 = out + ido * k;
-      Complex<T>* dst1 = out + ido * (k + l1);
-      Complex<T>* dst2 = out + ido * (k + 2 * l1);
-      Complex<T>* dst3 = out + ido * (k + 3 * l1);
+      const Complex<V>* src = in + ido * 4 * k;
+      Complex<V>* dst0 = out + ido * k;
+      Complex<V>* dst1 = out + ido * (k + l1);
+      Complex<V>* dst2 = out + ido * (k + 2 * l1);
+      Complex<V>* dst3 = out + ido * (k + 3 * l1);
       {
-        const Complex<T> t0 = src[0] + src[2 * ido];
-        const Complex<T> t1 = src[0] - src[2 * ido];
-        const Complex<T> t2 = src[ido] + src[3 * ido];
-        const Complex<T> t3 = RotateQuarter<kForward>(src[ido] - src[3 * ido]);
+        const Complex<V> t0 = src[0] + src[2 * ido];
+        const Complex<V> t1 = src[0] - src[2 * ido];
+        const Complex<V> t2 = src[ido] + src[3 * ido];
+        const Complex<V> t3 = RotateQuarter<kForward>(src[ido] - src[3 * ido]);
         dst0[0] = t0 + t2;
         dst1[0] = t1 + t3;
         dst2[0] = t0 - t2;
         dst3[0] = t1 - t3;
       }
       for (size_t i = 1; i < ido; ++i) {
-        const Complex<T> x0 = src[i];
-        const Complex<T> x1 = src[i + ido];
-        const Complex<T> x2 = src[i + 2 * ido];
-        const Complex<T> x3 = src[i + 3 * ido];
-        const Complex<T> t0 = x0 + x2;
-        const Complex<T> t1 = x0 - x2;
-        const Complex<T> t2 = x1 + x3;
-        const Complex<T> t3 = RotateQuarter<kForward>(x1 - x3);
+        const Complex<V> x0 = src[i];
+        const Complex<V> x1 = src[i + ido];
+        const Complex<V> x2 = src[i + 2 * ido];
+        const Complex<V> x3 = src[i + 3 * ido];
+        const Complex<V> t0 = x0 + x2;
+        const Complex<V> t1 = x0 - x2;
+        const Complex<V> t2 = x1 + x3;
+        const Complex<V> t3 = RotateQuarter<kForward>(x1 - x3);
         dst0[i] = t0 + t2;
         dst1[i] = Twiddle<kForward>(t1 + t3, tw1[i - 1]);
         dst2[i] = Twiddle<kForward>(t0 - t2, tw2[i - 1]);
@@ -389,32 +449,32 @@ class ComplexFftPlan {
     }
   }
 
-  template <bool kForward>
-  static void Pass5(size_t ido, size_t l1, const Complex<T>* in, Complex<T>* out, const Complex<T>* tw) {
+  template <bool kForward, typename V>
+  static void Pass5(size_t ido, size_t l1, const Complex<V>* in, Complex<V>* out, const Complex<T>* tw) {
     constexpr T kC1 = static_cast<T>(0.30901699437494742410229341718282);   // cos(2*pi/5)
     constexpr T kC2 = static_cast<T>(-0.80901699437494742410229341718282);  // cos(4*pi/5)
     constexpr T kS1 = static_cast<T>(0.95105651629515357211643933337938);   // sin(2*pi/5)
     constexpr T kS2 = static_cast<T>(0.58778525229247312916870595463907);   // sin(4*pi/5)
     for (size_t k = 0; k < l1; ++k) {
-      const Complex<T>* src = in + ido * 5 * k;
-      Complex<T>* dst[5];
+      const Complex<V>* src = in + ido * 5 * k;
+      Complex<V>* dst[5];
       for (size_t j = 0; j < 5; ++j) {
         dst[j] = out + ido * (k + j * l1);
       }
       for (size_t i = 0; i < ido; ++i) {
-        const Complex<T> x0 = src[i];
-        const Complex<T> x1 = src[i + ido];
-        const Complex<T> x2 = src[i + 2 * ido];
-        const Complex<T> x3 = src[i + 3 * ido];
-        const Complex<T> x4 = src[i + 4 * ido];
-        const Complex<T> t1 = x1 + x4;
-        const Complex<T> t4 = x1 - x4;
-        const Complex<T> t2 = x2 + x3;
-        const Complex<T> t3 = x2 - x3;
-        const Complex<T> a1 = x0 + Scale(t1, kC1) + Scale(t2, kC2);
-        const Complex<T> a2 = x0 + Scale(t1, kC2) + Scale(t2, kC1);
-        const Complex<T> b1 = RotateQuarter<kForward>(Scale(t4, kS1) + Scale(t3, kS2));
-        const Complex<T> b2 = RotateQuarter<kForward>(Scale(t4, kS2) - Scale(t3, kS1));
+        const Complex<V> x0 = src[i];
+        const Complex<V> x1 = src[i + ido];
+        const Complex<V> x2 = src[i + 2 * ido];
+        const Complex<V> x3 = src[i + 3 * ido];
+        const Complex<V> x4 = src[i + 4 * ido];
+        const Complex<V> t1 = x1 + x4;
+        const Complex<V> t4 = x1 - x4;
+        const Complex<V> t2 = x2 + x3;
+        const Complex<V> t3 = x2 - x3;
+        const Complex<V> a1 = x0 + Scale(t1, kC1) + Scale(t2, kC2);
+        const Complex<V> a2 = x0 + Scale(t1, kC2) + Scale(t2, kC1);
+        const Complex<V> b1 = RotateQuarter<kForward>(Scale(t4, kS1) + Scale(t3, kS2));
+        const Complex<V> b2 = RotateQuarter<kForward>(Scale(t4, kS2) - Scale(t3, kS1));
         dst[0][i] = x0 + t1 + t2;
         if (i == 0) {
           dst[1][i] = a1 + b1;
@@ -432,39 +492,39 @@ class ComplexFftPlan {
   }
 
   // Odd radix p > 5. `roots` holds exp(-2*pi*i*j/p) for j in [0, p).
-  template <bool kForward>
-  static void PassGeneric(size_t radix, size_t ido, size_t l1, const Complex<T>* in, Complex<T>* out,
+  template <bool kForward, typename V>
+  static void PassGeneric(size_t radix, size_t ido, size_t l1, const Complex<V>* in, Complex<V>* out,
                           const Complex<T>* tw, const Complex<T>* roots) {
     const size_t half = radix / 2;
     for (size_t k = 0; k < l1; ++k) {
-      const Complex<T>* src = in + ido * radix * k;
+      const Complex<V>* src = in + ido * radix * k;
       for (size_t i = 0; i < ido; ++i) {
-        const Complex<T> x0 = src[i];
-        Complex<T> dc = x0;
+        const Complex<V> x0 = src[i];
+        Complex<V> dc = x0;
         for (size_t j = 1; j <= half; ++j) {
           dc = dc + src[i + j * ido] + src[i + (radix - j) * ido];
         }
         out[i + ido * k] = dc;
         for (size_t m = 1; m <= half; ++m) {
           // y[m] = x0 + sum_j cos(2*pi*j*m/p) * (x[j] + x[p-j]) + rot(sum_j sin(2*pi*j*m/p) * (x[j] - x[p-j])).
-          Complex<T> sum_cos = x0;
-          Complex<T> sum_sin{0, 0};
+          Complex<V> sum_cos = x0;
+          Complex<V> sum_sin{};
           size_t jm = 0;
           for (size_t j = 1; j <= half; ++j) {
             jm += m;
             if (jm >= radix) {
               jm -= radix;
             }
-            const Complex<T> xp = src[i + j * ido];
-            const Complex<T> xm = src[i + (radix - j) * ido];
+            const Complex<V> xp = src[i + j * ido];
+            const Complex<V> xm = src[i + (radix - j) * ido];
             const Complex<T> w = roots[jm];
             sum_cos = sum_cos + Scale(xp + xm, w.re);
             // roots[] store -sin in the imaginary part.
             sum_sin = sum_sin + Scale(xp - xm, -w.im);
           }
-          const Complex<T> rot = RotateQuarter<kForward>(sum_sin);
-          Complex<T> y_m = sum_cos + rot;
-          Complex<T> y_pm = sum_cos - rot;
+          const Complex<V> rot = RotateQuarter<kForward>(sum_sin);
+          Complex<V> y_m = sum_cos + rot;
+          Complex<V> y_pm = sum_cos - rot;
           if (i != 0) {
             y_m = Twiddle<kForward>(y_m, tw[(m - 1) * (ido - 1) + i - 1]);
             y_pm = Twiddle<kForward>(y_pm, tw[(radix - m - 1) * (ido - 1) + i - 1]);
@@ -515,24 +575,25 @@ class RealFftPlan {
 
   // On entry `buffer` holds n real samples: packed as n consecutive T values when IsPacked(), otherwise as n complex
   // values with zero imaginary parts. On exit buffer[0..n/2] holds the non-negative frequency bins.
-  void Forward(Complex<T>* buffer, Complex<T>* scratch) const {
+  template <typename V = T>
+  void Forward(Complex<V>* buffer, Complex<V>* scratch) const {
     complex_plan_->Forward(buffer, scratch);
     if (!IsPacked()) {
       return;
     }
     const size_t h = half_;
-    const Complex<T> z0 = buffer[0];
-    buffer[0] = {z0.re + z0.im, 0};
-    buffer[h] = {z0.re - z0.im, 0};
+    const Complex<V> z0 = buffer[0];
+    buffer[0] = {z0.re + z0.im, V{}};
+    buffer[h] = {z0.re - z0.im, V{}};
     constexpr T kHalf = static_cast<T>(0.5);
     for (size_t k = 1, j = h - 1; k <= j; ++k, --j) {
-      const Complex<T> zk = buffer[k];
-      const Complex<T> zj = buffer[j];
+      const Complex<V> zk = buffer[k];
+      const Complex<V> zj = buffer[j];
       // X[k] = E + w^k * O, X[j] = conj(E) + w^j * conj(O) with E = (Z[k] + conj(Z[j])) / 2 and
       // O = (Z[k] - conj(Z[j])) / 2i, where j = h - k.
-      const Complex<T> e = Scale(zk + Conj(zj), kHalf);
-      const Complex<T> d = Scale(zk - Conj(zj), kHalf);
-      const Complex<T> o{d.im, -d.re};
+      const Complex<V> e = Scale(zk + Conj(zj), kHalf);
+      const Complex<V> d = Scale(zk - Conj(zj), kHalf);
+      const Complex<V> o{d.im, -d.re};
       buffer[k] = e + Mul(o, split_twiddles_[k]);
       if (j != k) {
         buffer[j] = Conj(e) + Mul(Conj(o), split_twiddles_[j]);
@@ -543,22 +604,23 @@ class RealFftPlan {
   // On entry buffer[0..n/2] holds non-negative frequency bins of a Hermitian spectrum (the imaginary parts of the DC
   // and, for even n, Nyquist bins are ignored). On exit `buffer` holds the n real samples scaled by n, packed as
   // described for Forward. Only valid when IsPacked().
-  void Backward(Complex<T>* buffer, Complex<T>* scratch) const {
+  template <typename V = T>
+  void Backward(Complex<V>* buffer, Complex<V>* scratch) const {
     const size_t h = half_;
-    const T x0 = buffer[0].re;
-    const T xh = buffer[h].re;
+    const V x0 = buffer[0].re;
+    const V xh = buffer[h].re;
     buffer[0] = {x0 + xh, x0 - xh};
     for (size_t k = 1, j = h - 1; k <= j; ++k, --j) {
-      const Complex<T> xk = buffer[k];
-      const Complex<T> xj = buffer[j];
+      const Complex<V> xk = buffer[k];
+      const Complex<V> xj = buffer[j];
       // Z[k] = (X[k] + conj(X[j])) + i * (X[k] - conj(X[j])) * conj(w^k), j = h - k.
-      const Complex<T> e = xk + Conj(xj);
-      const Complex<T> d = MulConj(xk - Conj(xj), split_twiddles_[k]);
-      buffer[k] = e + Complex<T>{-d.im, d.re};
+      const Complex<V> e = xk + Conj(xj);
+      const Complex<V> d = MulConj(xk - Conj(xj), split_twiddles_[k]);
+      buffer[k] = e + Complex<V>{-d.im, d.re};
       if (j != k) {
-        const Complex<T> e2 = xj + Conj(xk);
-        const Complex<T> d2 = MulConj(xj - Conj(xk), split_twiddles_[j]);
-        buffer[j] = e2 + Complex<T>{-d2.im, d2.re};
+        const Complex<V> e2 = xj + Conj(xk);
+        const Complex<V> d2 = MulConj(xj - Conj(xk), split_twiddles_[j]);
+        buffer[j] = e2 + Complex<V>{-d2.im, d2.re};
       }
     }
     complex_plan_->Backward(buffer, scratch);
