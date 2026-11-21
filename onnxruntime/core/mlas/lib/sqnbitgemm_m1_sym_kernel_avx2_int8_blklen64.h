@@ -77,6 +77,44 @@ accumulate_blklen64_r1c1blk1_zp_is_8_avx2(
     acc0 = _mm256_fmadd_ps(sum_ps, _mm256_mul_ps(scale_a_8_ps, scale_b_8_ps), acc0);
 }
 
+// Unsigned-weight variant of the two functions above: sum(a * (b - zp)) = sum(a * b) - zp * sum(a),
+// with zp_ps * sum_a_ps (8 * sum_a_ps when symmetric) precomputed or applied in float. All values are
+// integers below 2^24, so the result equals the signed formulation exactly.
+template <bool HasZeroPoint>
+static MLAS_FORCEINLINE void
+accumulate_blklen64_r1c1blk1_u_avx2(
+    const __m256i& av00_32_epi8,
+    const __m256i& av01_32_epi8,
+    const __m256& sum_a_ps,
+    const std::byte* QuantBDataPtr,
+    const float* scale_a,
+    const float* scale_b,
+    [[maybe_unused]] const __m256& zp_ps,
+    __m256& acc0,
+    const __m256i& low_mask,
+    const __m256i& one_16_epi16
+)
+{
+    const __m256i bv_packed = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(QuantBDataPtr));
+    const __m256i bv0_32_epi8 = _mm256_and_si256(bv_packed, low_mask);                          // 0, 1,...30, 31
+    const __m256i bv1_32_epi8 = _mm256_srli_epi16(_mm256_sub_epi8(bv_packed, bv0_32_epi8), 4);  // 32, 33,...62, 63
+
+    const __m256i dot0_16_epi16 = _mm256_maddubs_epi16(bv0_32_epi8, av00_32_epi8);
+    const __m256i dot1_16_epi16 = _mm256_maddubs_epi16(bv1_32_epi8, av01_32_epi8);
+    const __m256i sum_8_epi32 = _mm256_madd_epi16(one_16_epi16, _mm256_hadd_epi16(dot0_16_epi16, dot1_16_epi16));
+    __m256 sum_ps;
+    if constexpr (HasZeroPoint) {
+        sum_ps = _mm256_fnmadd_ps(zp_ps, sum_a_ps, _mm256_cvtepi32_ps(sum_8_epi32));
+    } else {
+        sum_ps = _mm256_sub_ps(_mm256_cvtepi32_ps(sum_8_epi32), sum_a_ps);
+    }
+
+    const __m256 scale_a_8_ps = _mm256_broadcast_ss(scale_a);
+    const __m256 scale_b_8_ps = _mm256_broadcast_ss(scale_b);
+
+    acc0 = _mm256_fmadd_ps(sum_ps, _mm256_mul_ps(scale_a_8_ps, scale_b_8_ps), acc0);
+}
+
 template <bool HasZeroPoint>
 MLAS_FORCEINLINE void
 Q4Int8GemmM1C4BlkLen64Avx2(
@@ -111,6 +149,8 @@ Q4Int8GemmM1C4BlkLen64Avx2(
     auto* SumPtr = C;
 
     const __m256i low_mask = _mm256_set1_epi8(0x0F);
+    const __m256i one_32_epi8 = _mm256_set1_epi8(1);
+    const __m256i one_16_epi16 = _mm256_set1_epi16(1);
     const size_t StrideQuantBData1 = 1 * SubblkDataSizeInBytes;
     const size_t StrideQuantBScale1 = 1;
     const size_t StrideQuantBZeroPoint = MlasQNBitZeroPointsForBlksSizeInBytes<BlkBitWidth4>(BlockCountK);
@@ -129,17 +169,18 @@ Q4Int8GemmM1C4BlkLen64Avx2(
             for (size_t kk = 0; kk < PerBlkSubblkCount; kk++) {
                 const __m256i av_00_epi8 = _mm256_loadu_si256((const __m256i*)QuantAPtr);
                 const __m256i av_01_epi8 = _mm256_loadu_si256((const __m256i*)(QuantAPtr + 32));
-                if constexpr (HasZeroPoint) {
-                    accumulate_blklen64_r1c1blk1_zp_avx2(av_00_epi8, av_01_epi8, QuantBDataPtr, QuantAScalePtr, QuantBScalePtr, QuantBZeroPointPtr, is_lower_half_byte_zp, acc[0], low_mask);
-                    accumulate_blklen64_r1c1blk1_zp_avx2(av_00_epi8, av_01_epi8, QuantBDataPtr + StrideQuantBData1, QuantAScalePtr, QuantBScalePtr + StrideQuantBScale1, QuantBZeroPointPtr + StrideQuantBZeroPoint, is_lower_half_byte_zp, acc[1], low_mask);
-                    accumulate_blklen64_r1c1blk1_zp_avx2(av_00_epi8, av_01_epi8, QuantBDataPtr + 2 * StrideQuantBData1, QuantAScalePtr, QuantBScalePtr + 2 * StrideQuantBScale1, QuantBZeroPointPtr + 2 * StrideQuantBZeroPoint, is_lower_half_byte_zp, acc[2], low_mask);
-                    accumulate_blklen64_r1c1blk1_zp_avx2(av_00_epi8, av_01_epi8, QuantBDataPtr + 3 * StrideQuantBData1, QuantAScalePtr, QuantBScalePtr + 3 * StrideQuantBScale1, QuantBZeroPointPtr + 3 * StrideQuantBZeroPoint, is_lower_half_byte_zp, acc[3], low_mask);
-                } else {
-                    const __m256i bzp8 = _mm256_set1_epi8(8);
-                    accumulate_blklen64_r1c1blk1_zp_is_8_avx2(av_00_epi8, av_01_epi8, QuantBDataPtr, QuantAScalePtr, QuantBScalePtr, acc[0], low_mask, bzp8);
-                    accumulate_blklen64_r1c1blk1_zp_is_8_avx2(av_00_epi8, av_01_epi8, QuantBDataPtr + StrideQuantBData1, QuantAScalePtr, QuantBScalePtr + StrideQuantBScale1, acc[1], low_mask, bzp8);
-                    accumulate_blklen64_r1c1blk1_zp_is_8_avx2(av_00_epi8, av_01_epi8, QuantBDataPtr + 2 * StrideQuantBData1, QuantAScalePtr, QuantBScalePtr + 2 * StrideQuantBScale1, acc[2], low_mask, bzp8);
-                    accumulate_blklen64_r1c1blk1_zp_is_8_avx2(av_00_epi8, av_01_epi8, QuantBDataPtr + 3 * StrideQuantBData1, QuantAScalePtr, QuantBScalePtr + 3 * StrideQuantBScale1, acc[3], low_mask, bzp8);
+                __m256i sum_a_16_epi16 = _mm256_hadd_epi16(_mm256_maddubs_epi16(one_32_epi8, av_00_epi8), _mm256_maddubs_epi16(one_32_epi8, av_01_epi8));
+                if constexpr (!HasZeroPoint) {
+                    sum_a_16_epi16 = _mm256_slli_epi16(sum_a_16_epi16, 3);
+                }
+                const __m256 sum_a_ps = _mm256_cvtepi32_ps(_mm256_madd_epi16(one_16_epi16, sum_a_16_epi16));
+                for (size_t c = 0; c < NCols4; ++c) {
+                    __m256 zp_ps = sum_a_ps;
+                    if constexpr (HasZeroPoint) {
+                        const uint8_t zp = std::to_integer<uint8_t>(QuantBZeroPointPtr[c * StrideQuantBZeroPoint]);
+                        zp_ps = _mm256_set1_ps(static_cast<float>(is_lower_half_byte_zp ? (zp & 0x0F) : (zp >> 4)));
+                    }
+                    accumulate_blklen64_r1c1blk1_u_avx2<HasZeroPoint>(av_00_epi8, av_01_epi8, sum_a_ps, QuantBDataPtr + c * StrideQuantBData1, QuantAScalePtr, QuantBScalePtr + c * StrideQuantBScale1, zp_ps, acc[c], low_mask, one_16_epi16);
                 }
 
                 // increment block pointers
