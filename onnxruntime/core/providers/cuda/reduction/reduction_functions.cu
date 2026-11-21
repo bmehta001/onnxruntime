@@ -514,6 +514,82 @@ INSTANTIATE_REDUCE_MATRIX_ROWS(double);
 INSTANTIATE_REDUCE_MATRIX_ROWS(BFloat16);
 #undef INSTANTIATE_REDUCE_MATRIX_ROWS
 
+namespace detail {
+// Reduces the middle dimension of a row-major [outer, reduce, inner] tensor.
+// threadIdx.x walks adjacent inner columns so every load of a warp is coalesced, threadIdx.y
+// strides over the reduced dimension, and the partial sums are combined in shared memory.
+template <typename TIn, typename TOut, typename TAcc>
+__global__ void reduce_strided_middle_axis_kernel(const TIn* input, TOut* output, int64_t outer, int64_t reduce,
+                                                  int64_t inner, bool compute_mean) {
+  extern __shared__ unsigned char shared_memory_bytes[];
+  TAcc* shared_memory = reinterpret_cast<TAcc*>(shared_memory_bytes);
+
+  const int64_t col = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const bool valid_col = col < inner;
+  const int tid_in_block = threadIdx.y * blockDim.x + threadIdx.x;
+
+  for (int64_t o = blockIdx.y; o < outer; o += gridDim.y) {
+    TAcc sum = TAcc(0.0f);
+    if (valid_col) {
+      const TIn* column = input + o * reduce * inner + col;
+#pragma unroll 4
+      for (int64_t r = threadIdx.y; r < reduce; r += blockDim.y) {
+        sum += TAcc(column[r * inner]);
+      }
+    }
+    shared_memory[tid_in_block] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.y / 2; stride > 0; stride /= 2) {
+      if (threadIdx.y < stride) {
+        shared_memory[tid_in_block] += shared_memory[tid_in_block + stride * blockDim.x];
+      }
+      __syncthreads();
+    }
+
+    if (threadIdx.y == 0 && valid_col) {
+      TAcc result = shared_memory[threadIdx.x];
+      if (compute_mean) {
+        result /= static_cast<TAcc>(reduce);
+      }
+      output[o * inner + col] = TOut(result);
+    }
+    // shared_memory is reused by the next outer iteration.
+    __syncthreads();
+  }
+}
+}  // namespace detail
+
+template <typename TIn, typename TOut>
+Status reduce_strided_middle_axis(cudaStream_t stream, const TIn* input, TOut* output,
+                                  int64_t outer, int64_t reduce, int64_t inner, bool compute_mean) {
+  ORT_RETURN_IF_NOT(outer > 0 && reduce > 0 && inner > 0, "reduce_strided_middle_axis requires positive dimensions.");
+  using TAcc = AccumulationType_t<TIn>;
+
+  constexpr int max_num_threads_in_block = 512;
+  constexpr int64_t max_grid_y = 65535;
+  const int block_x = least_pow2_bound(static_cast<int>(std::min<int64_t>(inner, GPU_WARP_SIZE_HOST)));
+  const int block_y = least_pow2_bound(
+      static_cast<int>(std::min<int64_t>(reduce, max_num_threads_in_block / block_x)));
+  const int64_t grid_x = (inner + block_x - 1) / block_x;
+  ORT_RETURN_IF_NOT(grid_x <= std::numeric_limits<int>::max(), "reduce_strided_middle_axis inner dimension too large.");
+  const dim3 grid(static_cast<unsigned int>(grid_x), static_cast<unsigned int>(std::min(outer, max_grid_y)), 1);
+  const dim3 block(block_x, block_y, 1);
+
+  detail::reduce_strided_middle_axis_kernel<TIn, TOut, TAcc><<<grid, block, block_x * block_y * sizeof(TAcc), stream>>>(
+      input, output, outer, reduce, inner, compute_mean);
+  return CUDA_CALL(cudaGetLastError());
+}
+
+#define INSTANTIATE_REDUCE_STRIDED_MIDDLE_AXIS(T)                                                  \
+  template Status reduce_strided_middle_axis<T, T>(cudaStream_t stream, const T* input, T* output, \
+                                                   int64_t outer, int64_t reduce, int64_t inner, bool compute_mean)
+INSTANTIATE_REDUCE_STRIDED_MIDDLE_AXIS(half);
+INSTANTIATE_REDUCE_STRIDED_MIDDLE_AXIS(float);
+INSTANTIATE_REDUCE_STRIDED_MIDDLE_AXIS(double);
+INSTANTIATE_REDUCE_STRIDED_MIDDLE_AXIS(BFloat16);
+#undef INSTANTIATE_REDUCE_STRIDED_MIDDLE_AXIS
+
 template <typename TIn, typename TOut>
 Status reduce_matrix_columns(cudaStream_t stream, const TIn* input, TOut* output, int m, int n, void* buffer, size_t buffer_size) {
   return detail::call_reduce_matrix_columns<TIn, TOut, Identity, Identity, false>(

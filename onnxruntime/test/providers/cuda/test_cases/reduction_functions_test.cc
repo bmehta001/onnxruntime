@@ -4,6 +4,7 @@
 #include "gtest/gtest.h"
 
 #include <algorithm>
+#include <array>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -255,6 +256,65 @@ TEST(ReductionFunctionsTest, ReduceColumnsToColumn) {
 
 TEST(ReductionFunctionsTest, ReduceColumnsToColumnRepeated) {
   TestReduceColumnsToColumnRepeated(17, 8192, 100, 2e-4f);
+}
+
+TEST(ReductionFunctionsTest, ReduceStridedMiddleAxis) {
+  // Covers inner sizes below/above the warp width, an odd reduce length, and outer > 1.
+  for (const auto& [outer, reduce, inner] : std::vector<std::array<int64_t, 3>>{
+           {2, 3, 5}, {8, 512, 128}, {3, 1001, 33}, {70000, 2, 2}}) {
+    SCOPED_TRACE(MakeString("outer: ", outer, ", reduce: ", reduce, ", inner: ", inner));
+    RandomValueGenerator random{};
+    const auto input = random.Uniform<float>(std::vector<int64_t>{outer, reduce, inner}, 1.0f, 10.0f);
+    std::vector<float> expected_sum(outer * inner, 0.0f);
+    for (int64_t o = 0; o < outer; ++o) {
+      for (int64_t r = 0; r < reduce; ++r) {
+        for (int64_t i = 0; i < inner; ++i) {
+          expected_sum[o * inner + i] += input[(o * reduce + r) * inner + i];
+        }
+      }
+    }
+    std::vector<float> expected_mean(expected_sum);
+    for (auto& v : expected_mean) v /= static_cast<float>(reduce);
+
+    auto d_input = AllocateDeviceMemory<float>(input.size());
+    auto d_output = AllocateDeviceMemory<float>(expected_sum.size());
+    cudaMemcpy(d_input.get(), input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice);
+
+    ASSERT_STATUS_OK(reduce_strided_middle_axis(0, d_input.get(), d_output.get(), outer, reduce, inner, false));
+    ASSERT_TRUE(CUDA_CALL(cudaDeviceSynchronize()).IsOK());
+    CheckDeviceValues(expected_sum.size(), d_output.get(), expected_sum.data(), 1e-4f);
+
+    ASSERT_STATUS_OK(reduce_strided_middle_axis(0, d_input.get(), d_output.get(), outer, reduce, inner, true));
+    ASSERT_TRUE(CUDA_CALL(cudaDeviceSynchronize()).IsOK());
+    CheckDeviceValues(expected_mean.size(), d_output.get(), expected_mean.data(), 1e-4f);
+  }
+}
+
+TEST(ReductionFunctionsTest, GetApplicableStridedMiddleAxisReduction) {
+  int64_t outer{}, reduce{}, inner{};
+  ASSERT_TRUE(get_applicable_strided_middle_axis_reduction(
+      CUDNN_REDUCE_TENSOR_ADD, std::vector<int64_t>{8, 512, 128}, std::vector<int64_t>{1}, outer, reduce, inner));
+  EXPECT_EQ(outer, 8);
+  EXPECT_EQ(reduce, 512);
+  EXPECT_EQ(inner, 128);
+
+  // Size-1 dims between reduced axes keep the reduced block contiguous.
+  ASSERT_TRUE(get_applicable_strided_middle_axis_reduction(
+      CUDNN_REDUCE_TENSOR_AVG, std::vector<int64_t>{2, 3, 1, 4, 5}, std::vector<int64_t>{1, -2},
+      outer, reduce, inner));
+  EXPECT_EQ(outer, 2);
+  EXPECT_EQ(reduce, 12);
+  EXPECT_EQ(inner, 5);
+
+  // Non-contiguous axes, leading/trailing axes and unsupported ops are rejected.
+  EXPECT_FALSE(get_applicable_strided_middle_axis_reduction(
+      CUDNN_REDUCE_TENSOR_ADD, std::vector<int64_t>{2, 3, 4, 5}, std::vector<int64_t>{1, 3}, outer, reduce, inner));
+  EXPECT_FALSE(get_applicable_strided_middle_axis_reduction(
+      CUDNN_REDUCE_TENSOR_ADD, std::vector<int64_t>{4, 5}, std::vector<int64_t>{0}, outer, reduce, inner));
+  EXPECT_FALSE(get_applicable_strided_middle_axis_reduction(
+      CUDNN_REDUCE_TENSOR_ADD, std::vector<int64_t>{4, 5}, std::vector<int64_t>{1}, outer, reduce, inner));
+  EXPECT_FALSE(get_applicable_strided_middle_axis_reduction(
+      CUDNN_REDUCE_TENSOR_MAX, std::vector<int64_t>{8, 512, 128}, std::vector<int64_t>{1}, outer, reduce, inner));
 }
 
 TEST(ReductionFunctionsTest, ReduceSumNdMiddleAndMultipleAxes) {

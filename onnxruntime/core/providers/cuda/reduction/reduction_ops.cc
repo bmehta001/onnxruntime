@@ -475,6 +475,17 @@ Status ReduceComputeCore(const AllocatorPtr& gpu_allocator, const CudaKernel* ke
 
       return Status::OK();
     }
+
+    int64_t outer{}, reduce{}, inner{};
+    if (!calculate_log && !calculate_sqt && !log_sum_exp &&
+        get_applicable_strided_middle_axis_reduction(cudnn_reduce_op, input_shape.GetDims(), axes,
+                                                     outer, reduce, inner)) {
+      const auto* input_data = reinterpret_cast<const CudaT*>(input.Data<T>());
+      auto* output_data = reinterpret_cast<CudaT*>(output.MutableData<T>());
+      ORT_RETURN_IF_ERROR(reduce_strided_middle_axis(stream, input_data, output_data, outer, reduce, inner,
+                                                     cudnn_reduce_op == CUDNN_REDUCE_TENSOR_AVG));
+      return Status::OK();
+    }
   }
 
   if constexpr (ReduceTensorIndices == CUDNN_REDUCE_TENSOR_FLATTENED_INDICES) {

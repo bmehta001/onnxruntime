@@ -107,6 +107,26 @@ template <typename TIn, typename TOut>
 Status reduce_matrix_columns(cudaStream_t stream, const TIn* input, TOut* output, int m, int n, void* buffer, size_t buffer_size);
 
 /**
+ * Determines whether a sum/mean reduction reduces one contiguous run of axes that is neither leading nor trailing,
+ * i.e. the input can be viewed as [outer, reduce, inner] with outer > 1 and inner > 1. Such layouts are not handled
+ * by the matrix reductions above.
+ * @return true if applicable, in which case outer, reduce and inner are set.
+ */
+bool get_applicable_strided_middle_axis_reduction(
+    const cudnnReduceTensorOp_t cudnn_reduce_op,
+    gsl::span<const int64_t> dims, gsl::span<const int64_t> axes,
+    int64_t& outer, int64_t& reduce, int64_t& inner);
+
+/**
+ * Reduces the middle dimension of a row-major [outer, reduce, inner] tensor to [outer, inner] with coalesced
+ * loads along the inner dimension.
+ * @param compute_mean Whether to divide the sum by reduce.
+ */
+template <typename TIn, typename TOut>
+Status reduce_strided_middle_axis(cudaStream_t stream, const TIn* input, TOut* output,
+                                  int64_t outer, int64_t reduce, int64_t inner, bool compute_mean);
+
+/**
  * Computes ReduceSum for an arbitrary set of axes. This is the general fallback
  * for axis layouts that cannot be flattened into one of the optimized matrix
  * reductions above.

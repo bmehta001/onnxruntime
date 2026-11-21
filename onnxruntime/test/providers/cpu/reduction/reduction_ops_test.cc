@@ -51,6 +51,99 @@ void TestReduceOp(const std::string& op,
 #endif
 }
 
+#if defined(USE_CUDA)
+TEST(ReductionOpTest, CudaMiddleAxisSumAndMean) {
+  enum class InputType {
+    Float,
+    Float16,
+    Double,
+    BFloat16
+  };
+  constexpr int64_t outer = 2, reduce = 67, inner = 35;
+  std::vector<float> input(outer * reduce * inner);
+  for (size_t i = 0; i < input.size(); ++i) {
+    input[i] = static_cast<float>(static_cast<int>((i * 17) % 31) - 15) / 8.0f;
+  }
+
+  for (bool is_mean : {false, true}) {
+    std::vector<float> expected(outer * inner);
+    std::vector<double> expected_double(outer * inner);
+    for (int64_t o = 0; o < outer; ++o) {
+      for (int64_t col = 0; col < inner; ++col) {
+        double sum = 0;
+        for (int64_t r = 0; r < reduce; ++r) {
+          sum += input[(o * reduce + r) * inner + col];
+        }
+        expected_double[o * inner + col] = is_mean ? sum / reduce : sum;
+        expected[o * inner + col] = static_cast<float>(expected_double[o * inner + col]);
+      }
+    }
+
+    for (int64_t axis : {int64_t{1}, int64_t{-2}}) {
+      for (InputType type : {InputType::Float, InputType::Float16, InputType::Double, InputType::BFloat16}) {
+        SCOPED_TRACE(MakeString("mean: ", is_mean, ", axis: ", axis, ", type: ", static_cast<int>(type)));
+        auto cuda_ep = DefaultCudaExecutionProvider();
+        if (!cuda_ep) {
+          GTEST_SKIP() << "CUDA execution provider is unavailable";
+        }
+        OpTester test(is_mean ? "ReduceMean" : "ReduceSum", type == InputType::BFloat16 ? 13 : 11);
+        if (type != InputType::BFloat16 || is_mean) {
+          test.AddAttribute("axes", std::vector<int64_t>{axis});
+        }
+        test.AddAttribute("keepdims", int64_t{0});
+        if (type == InputType::Float16) {
+          std::vector<MLFloat16> input_fp16(input.size()), expected_fp16(expected.size());
+          ConvertFloatToMLFloat16(input.data(), input_fp16.data(), input.size());
+          ConvertFloatToMLFloat16(expected.data(), expected_fp16.data(), expected.size());
+          test.AddInput<MLFloat16>("data", {outer, reduce, inner}, input_fp16);
+          test.AddOutput<MLFloat16>("reduced", {outer, inner}, expected_fp16);
+        } else if (type == InputType::Double) {
+          std::vector<double> input_double(input.begin(), input.end());
+          test.AddInput<double>("data", {outer, reduce, inner}, input_double);
+          test.AddOutput<double>("reduced", {outer, inner}, expected_double);
+        } else if (type == InputType::BFloat16) {
+          test.AddInput<BFloat16>("data", {outer, reduce, inner}, FloatsToBFloat16s(input));
+          if (!is_mean) {
+            test.AddInput<int64_t>("axes", {1}, {axis}, true);
+          }
+          test.AddOutput<BFloat16>("reduced", {outer, inner}, FloatsToBFloat16s(expected));
+        } else {
+          test.AddInput<float>("data", {outer, reduce, inner}, input);
+          test.AddOutput<float>("reduced", {outer, inner}, expected);
+        }
+        SessionOptions options;
+        ASSERT_STATUS_OK(options.config_options.AddConfigEntry("session.disable_cpu_ep_fallback", "1"));
+        test.Config(options).ConfigEp(std::move(cuda_ep)).RunWithConfig();
+      }
+    }
+  }
+}
+
+TEST(ReductionOpTest, CudaMiddleAxisMultiAxisAndLargeOuter) {
+  struct TestCase {
+    std::vector<int64_t> dims, axes, output_dims;
+    size_t input_size, output_size;
+    float expected;
+  };
+  for (const auto& tc : std::vector<TestCase>{
+           {{2, 3, 1, 4, 5}, {1, 3}, {2, 1, 5}, 120, 10, 12.0f},
+           {{70000, 2, 2}, {1}, {70000, 2}, 280000, 140000, 2.0f}}) {
+    auto cuda_ep = DefaultCudaExecutionProvider();
+    if (!cuda_ep) {
+      GTEST_SKIP() << "CUDA execution provider is unavailable";
+    }
+    OpTester test("ReduceSum", 11);
+    test.AddAttribute("axes", tc.axes);
+    test.AddAttribute("keepdims", int64_t{0});
+    test.AddInput<float>("data", tc.dims, std::vector<float>(tc.input_size, 1.0f));
+    test.AddOutput<float>("reduced", tc.output_dims, std::vector<float>(tc.output_size, tc.expected));
+    SessionOptions options;
+    ASSERT_STATUS_OK(options.config_options.AddConfigEntry("session.disable_cpu_ep_fallback", "1"));
+    test.Config(options).ConfigEp(std::move(cuda_ep)).RunWithConfig();
+  }
+}
+#endif
+
 // TODO:investigate why it is so slow. It need 12 seconds on an Azure Standard F48s_v2 (48 vcpus, 96 GiB memory)
 //  machine in RelWithDebInfo build mode, but only 2 seconds on my local dev machine(4 cores).
 #ifdef NDEBUG

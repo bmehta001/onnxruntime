@@ -7,9 +7,11 @@
 #include <algorithm>
 #include <cassert>
 #include <iterator>
+#include <set>
 #include <utility>
 
 #include "core/common/optional.h"
+#include "core/common/safeint.h"
 #include "core/framework/tensor_shape.h"
 
 namespace onnxruntime {
@@ -169,6 +171,53 @@ ApplicableMatrixReduction get_applicable_matrix_reduction(
   return axes_from_beginning
              ? ApplicableMatrixReduction::Rows
              : ApplicableMatrixReduction::Columns;
+}
+
+bool get_applicable_strided_middle_axis_reduction(
+    const cudnnReduceTensorOp_t cudnn_reduce_op,
+    gsl::span<const int64_t> dims, gsl::span<const int64_t> axes,
+    int64_t& outer_out, int64_t& reduce_out, int64_t& inner_out) {
+  if ((cudnn_reduce_op != CUDNN_REDUCE_TENSOR_ADD && cudnn_reduce_op != CUDNN_REDUCE_TENSOR_AVG) || axes.empty()) {
+    return false;
+  }
+
+  const auto rank = gsl::narrow<int64_t>(dims.size());
+  std::set<int64_t> axes_set;
+  for (const auto axis : axes) {
+    axes_set.insert(HandleNegativeAxis(axis, rank));
+  }
+  const int64_t min_axis = *axes_set.begin();
+  const int64_t max_axis = *axes_set.rbegin();
+  // Size-1 dims between reduced axes do not break contiguity of the reduced block.
+  for (int64_t i = min_axis; i <= max_axis; ++i) {
+    if (dims[i] != 1 && axes_set.find(i) == axes_set.end()) {
+      return false;
+    }
+  }
+
+  SafeInt<int64_t> outer = 1;
+  SafeInt<int64_t> reduce = 1;
+  SafeInt<int64_t> inner = 1;
+  for (int64_t i = 0; i < rank; ++i) {
+    if (dims[i] <= 0) {
+      return false;
+    }
+    if (i < min_axis) {
+      outer *= dims[i];
+    } else if (i <= max_axis) {
+      reduce *= dims[i];
+    } else {
+      inner *= dims[i];
+    }
+  }
+  if (outer <= 1 || inner <= 1) {
+    return false;
+  }
+
+  outer_out = outer;
+  reduce_out = reduce;
+  inner_out = inner;
+  return true;
 }
 
 }  // namespace cuda
