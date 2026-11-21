@@ -1,8 +1,7 @@
 
-# With NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING, the cudnn_frontend shim resolves CUDA runtime calls by
-# loading cudart itself, and on Windows it only accepts the CUDA 13 runtime (cudart64_13.dll). ORT links
-# cudart directly, so patch the shim to call the linked runtime and, for the remaining dlopen-based
-# lookups, to load the cudart DLL of the major ORT was built with.
+# With NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING, the cudnn_frontend shim loads cudart itself,
+# and on Windows it only accepts the CUDA 13 runtime. Patch it to load the CUDA runtime
+# major version ORT was built with.
 onnxruntime_fetchcontent_declare(
   cudnn_frontend
   URL ${DEP_URL_cudnn_frontend}

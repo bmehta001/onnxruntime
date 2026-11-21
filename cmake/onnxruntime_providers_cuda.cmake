@@ -59,6 +59,10 @@
     "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/*.h"
     "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/*.cc"
   )
+  if(MSVC)
+    set_property(SOURCE "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/bert/cudnn_fmha/cudnn_flash_attention.cc"
+      APPEND PROPERTY COMPILE_OPTIONS "/bigobj")
+  endif()
   if(NOT onnxruntime_ENABLE_MLAS_QMOE_OFFLOAD)
     list(APPEND onnxruntime_cuda_contrib_ops_cc_srcs
       "${ONNXRUNTIME_ROOT}/contrib_ops/cpu/moe/qmoe_shared_layout.cc")

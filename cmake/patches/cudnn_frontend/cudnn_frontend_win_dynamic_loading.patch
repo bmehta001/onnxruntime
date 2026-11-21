@@ -1,6 +1,34 @@
 --- a/include/cudnn_frontend_shim.h
 +++ b/include/cudnn_frontend_shim.h
-@@ -184,8 +184,9 @@ validate_cuda13_runtime(HMODULE handle, const char *library) {
+@@ -16,8 +16,8 @@
+ #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+ #ifdef _WIN32
+ #include <cuda_runtime_api.h>
+-#if CUDART_VERSION < 13000 || CUDART_VERSION >= 14000
+-#error "cuDNN Frontend dynamic loading on Windows requires CUDA 13 headers and a CUDA 13 runtime"
++#if CUDART_VERSION < 12000 || CUDART_VERSION >= 14000
++#error "cuDNN Frontend dynamic loading on Windows requires CUDA 12 or 13 headers and a matching runtime"
+ #endif
+ #define NOMINMAX
+ #include <windows.h>
+@@ -170,22 +170,22 @@ load_cuda_so() {
+ #ifdef _WIN32
+ inline HMODULE
+-validate_cuda13_runtime(HMODULE handle, const char *library) {
++validate_cuda_runtime(HMODULE handle, const char *library) {
+     // Own the reference before diagnostics can allocate or throw.
+     std::unique_ptr<std::remove_pointer_t<HMODULE>, decltype(&FreeLibrary)> owner(handle, &FreeLibrary);
+-    // CUDA 13 graph wrappers use CUDA 13 signatures. Symbol names alone do not
+-    // distinguish those signatures from the incompatible CUDA 12 entry points.
++    // CUDA graph signatures can differ across major versions even for the same symbol name.
+     dlerror();
+     auto symbol       = dlsym(handle, "cudaRuntimeGetVersion");
+     const char *error = reinterpret_cast<const char *>(dlerror());
+     if (!symbol || error) {
+-        const std::string message = "Cannot validate CUDA 13 runtime " + std::string(library) + ": " +
++        const std::string message = "Cannot validate CUDA runtime " + std::string(library) + ": " +
+                                     std::string(error ? error : "cudaRuntimeGetVersion unavailable");
+         throw std::runtime_error(message);
      }
      int version = 0;
      auto status = reinterpret_cast<decltype(&cudaRuntimeGetVersion)>(symbol)(&version);
@@ -12,7 +40,25 @@
                                   std::to_string(version) + " (cudaRuntimeGetVersion status " +
                                   std::to_string(static_cast<int>(status)) + ")");
      }
-@@ -223,12 +224,16 @@ load_cudart_so() {
+@@ -204,7 +204,7 @@ load_cudart_so() {
+     // search path. In such cases the automatic detection below warns about the ambiguity
+     // (see below) and falls back to the first match. Setting CUDNN_FRONTEND_CUDART_LIB_NAME
+     // to the desired library name (or path), e.g. "libcudart.so.13", bypasses the detection
+-    // and loads exactly that library. On Windows, overrides must also report CUDA 13.
++    // and loads exactly that library. On Windows, overrides must match the build's CUDA major.
+     const char *user_lib = get_environment("CUDNN_FRONTEND_CUDART_LIB_NAME");
+     if (user_lib) {
+         if (user_lib[0] != '\0') {
+@@ -215,7 +215,7 @@ load_cudart_so() {
+                     std::string(user_lib) + "): " + last_dl_error());
+             }
+ #ifdef _WIN32
+-            return validate_cuda13_runtime(handle, user_lib);
++            return validate_cuda_runtime(handle, user_lib);
+ #else
+             return handle;
+ #endif
+@@ -223,15 +223,19 @@ load_cudart_so() {
      }
  
  #ifdef _WIN32
@@ -30,16 +76,8 @@
 +        throw std::runtime_error("CUDA runtime unavailable: unable to load " + std::string(library) + ": " +
                                   std::string(error ? error : "Unknown error"));
      }
-     return validate_cuda13_runtime(handle, library);
-@@ -342,9 +347,9 @@ get_cuda_symbol(CudaLibrary library, const char *function_name) {
- #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
- 
- #define NV_FE_CALL_TO_CUDA(function_name, cuda_symbol, ...) \
--    return reinterpret_cast<decltype(function_name) *>(get_cuda_symbol(CudaLibrary::CUDART, #cuda_symbol))(__VA_ARGS__);
-+    return cuda_symbol(__VA_ARGS__);
- #define NV_FE_CALL_TO_CU(function_name, cuda_symbol, ...) \
--    return reinterpret_cast<decltype(function_name) *>(get_cuda_symbol(CudaLibrary::CUDA, #cuda_symbol))(__VA_ARGS__);
-+    return cuda_symbol(__VA_ARGS__);
- 
+-    return validate_cuda13_runtime(handle, library);
++    return validate_cuda_runtime(handle, library);
  #else
- 
+     // List of potential libcudart libraries (Adding major version to support python package)
+     constexpr const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
