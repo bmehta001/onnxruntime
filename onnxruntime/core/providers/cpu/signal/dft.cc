@@ -77,13 +77,15 @@ struct DftSetup {
 
 template <typename T, typename U>
 DftSetup<T> MakeDftSetup(PlanCache& cache, DftMode mode, size_t n, size_t input_length, size_t output_size) {
-  DftSetup<T> setup{mode, n, std::min(input_length, n), output_size, nullptr, nullptr, 0, 0};
+  // IRFFT follows numpy.fft.irfft: only the first n/2+1 bins are used and missing bins are treated as zero.
+  const size_t max_samples = mode == DftMode::kInverseOnesided ? n / 2 + 1 : n;
+  DftSetup<T> setup{mode, n, std::min(input_length, max_samples), output_size, nullptr, nullptr, 0, 0};
   constexpr bool kRealInput = std::is_same_v<U, T>;
   bool use_real = false;
   if (mode == DftMode::kForward) {
     use_real = kRealInput;
   } else if (mode == DftMode::kInverseOnesided) {
-    use_real = n % 2 == 0 && setup.samples == n / 2 + 1;
+    use_real = n % 2 == 0;
   }
   if (use_real) {
     setup.real_plan = cache.GetReal<T>(n);
@@ -111,6 +113,7 @@ void RunDft(const DftSetup<T>& s, const U* x, size_t x_stride, const T* window, 
       for (size_t k = 0; k < samples; ++k) {
         buffer[k] = LoadComplex(x[k * x_stride]);
       }
+      std::fill(buffer + samples, buffer + n / 2 + 1, Complex<T>{0, 0});
       s.real_plan->Backward(buffer, scratch);
       const T* r = reinterpret_cast<const T*>(buffer);
       for (size_t j = 0; j < n; ++j) {
@@ -118,14 +121,15 @@ void RunDft(const DftSetup<T>& s, const U* x, size_t x_stride, const T* window, 
       }
       return;
     }
-    // General case: rebuild the full Hermitian spectrum from the available bins.
+    // Odd n: rebuild the full Hermitian spectrum. Bin k < (n+1)/2 mirrors to n-k; the imaginary part of DC
+    // only contributes to the discarded imaginary output.
     for (size_t k = 0; k < samples; ++k) {
       buffer[k] = LoadComplex(x[k * x_stride]);
     }
     std::fill(buffer + samples, buffer + n, Complex<T>{0, 0});
-    const size_t conjugate_end = (n % 2 == 0 && samples > 0) ? samples - 1 : samples;
+    const size_t conjugate_end = std::min(samples, (n + 1) / 2);
     for (size_t k = 1; k < conjugate_end; ++k) {
-      buffer[n - k] = signal::fft::Conj(LoadComplex(x[k * x_stride]));
+      buffer[n - k] = signal::fft::Conj(buffer[k]);
     }
     s.complex_plan->Backward(buffer, scratch);
     for (size_t j = 0; j < n; ++j) {

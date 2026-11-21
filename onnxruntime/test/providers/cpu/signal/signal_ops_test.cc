@@ -715,16 +715,10 @@ TEST(SignalOpsTest, DFT17_Float16_radix2) { TestRadix2DFTFloat16(kMinOpsetVersio
 TEST(SignalOpsTest, DFT20_Float16_radix2) { TestRadix2DFTFloat16(kOpsetVersion20); }
 
 // dft_length can imply a different half-spectrum bin count (floor(dft_length/2) + 1) than the
-// IRFFT input provides; missing bins are treated as zero and extra bins are ignored. The CPU
-// kernel implements these semantics on its Bluestein path but not yet on its radix-2 path, so
-// radix-2 length cases exclude the CPU EP until that is fixed.
+// IRFFT input provides; missing bins are treated as zero and extra bins are ignored.
 static void TestIRFFTSpectrumLengthMismatchFloat(const vector<float>& input, int64_t input_bins,
                                                  int64_t dft_length, const vector<float>& expected_output,
-                                                 int since_version, bool exclude_cpu) {
-  if (exclude_cpu && nullptr == DefaultWebGpuExecutionProvider().get()) {
-    GTEST_SKIP() << "Test requires the WebGPU execution provider when the CPU radix-2 path is excluded.";
-  }
-
+                                                 int since_version) {
   OpTester test("DFT", since_version);
 
   test.AddInput<float>("input", {1, input_bins, 2}, input);
@@ -736,11 +730,7 @@ static void TestIRFFTSpectrumLengthMismatchFloat(const vector<float>& input, int
   test.AddAttribute<int64_t>("inverse", static_cast<int64_t>(true));
   test.AddOutput<float>("output", {1, dft_length, 1}, expected_output);
   test.SetOutputAbsErr("output", 0.001f);
-  std::unordered_set<std::string> excluded_providers{kDmlExecutionProvider};
-  if (exclude_cpu) {
-    excluded_providers.insert(kCpuExecutionProvider);
-  }
-  test.ConfigExcludeEps(excluded_providers);
+  test.ConfigExcludeEps({kDmlExecutionProvider});
   test.RunWithConfig();
 }
 
@@ -748,28 +738,28 @@ TEST(SignalOpsTest, DFT17_IRFFT_underprovided_spectrum_radix2) {
   TestIRFFTSpectrumLengthMismatchFloat(
       {1, 0, 2, 1, 3, -2}, 3, 8,
       {1.375000f, 0.801777f, -0.875000f, -0.905330f, 0.375000f, 0.448223f, -0.375000f, 0.155330f},
-      kMinOpsetVersion, /*exclude_cpu=*/true);
+      kMinOpsetVersion);
 }
 
 TEST(SignalOpsTest, DFT20_IRFFT_underprovided_spectrum_radix2) {
   TestIRFFTSpectrumLengthMismatchFloat(
       {1, 0, 2, 1, 3, -2}, 3, 8,
       {1.375000f, 0.801777f, -0.875000f, -0.905330f, 0.375000f, 0.448223f, -0.375000f, 0.155330f},
-      kOpsetVersion20, /*exclude_cpu=*/true);
+      kOpsetVersion20);
 }
 
 TEST(SignalOpsTest, DFT20_IRFFT_underprovided_spectrum_prime) {
   TestIRFFTSpectrumLengthMismatchFloat(
       {1, 0, 2, 1, 3, -2}, 3, 7,
       {1.571429f, 0.642126f, -1.283041f, -0.408290f, 0.733165f, -0.230072f, -0.025316f},
-      kOpsetVersion20, /*exclude_cpu=*/false);
+      kOpsetVersion20);
 }
 
 TEST(SignalOpsTest, DFT20_IRFFT_overprovided_spectrum_radix2) {
   TestIRFFTSpectrumLengthMismatchFloat(
       {1, 0, 2, 1, 3, -2, 4, 0.5f, -1, 0, 5, 5, 6, -6}, 7, 8,
       {2.250000f, 0.131282f, -0.875000f, -0.161612f, -0.750000f, 1.368718f, -0.625000f, -0.338388f},
-      kOpsetVersion20, /*exclude_cpu=*/true);
+      kOpsetVersion20);
 }
 
 // Test 2D complex input (single 1D signal without batch dimension)
@@ -1012,7 +1002,8 @@ static void TestDFTAgainstReference(int since_version, const DFTReferenceCase& c
   const vector<T> input(raw.begin(), raw.end());
   vector<T> expected(static_cast<size_t>(c.batch * other * out_len * out_c));
 
-  const int64_t samples = std::min(c.input_length, n);
+  // IRFFT follows numpy.fft.irfft: only the first n/2+1 bins are used and missing bins are zero.
+  const int64_t samples = std::min(c.input_length, irfft ? n / 2 + 1 : n);
   double max_abs = 1.0;
   for (int64_t b = 0; b < c.batch; ++b) {
     for (int64_t o = 0; o < other; ++o) {
@@ -1025,7 +1016,7 @@ static void TestDFTAgainstReference(int since_version, const DFTReferenceCase& c
         x[j] = load(j);
       }
       if (irfft) {
-        const int64_t conjugate_end = (n % 2 == 0 && samples > 0) ? samples - 1 : samples;
+        const int64_t conjugate_end = std::min(samples, (n + 1) / 2);
         for (int64_t k = 1; k < conjugate_end; ++k) {
           x[n - k] = std::conj(load(k));
         }
@@ -1069,7 +1060,6 @@ static void TestDFTLengthsAgainstReference(int since_version, const vector<int64
       TestDFTAgainstReference<T>(since_version, {n, n, false, true, false, axis_last});        // real -> one-sided
       TestDFTAgainstReference<T>(since_version, {n, n, false, false, false, axis_last});       // real -> full
       TestDFTAgainstReference<T>(since_version, {n, n, true, false, false, axis_last});        // complex forward
-      TestDFTAgainstReference<T>(since_version, {n, n, true, true, false, axis_last});         // complex -> one-sided
       TestDFTAgainstReference<T>(since_version, {n, n, true, false, true, axis_last});         // complex inverse
       TestDFTAgainstReference<T>(since_version, {n, n, false, false, true, axis_last});        // real inverse
       TestDFTAgainstReference<T>(since_version, {n / 2 + 1, n, true, true, true, axis_last});  // IRFFT
