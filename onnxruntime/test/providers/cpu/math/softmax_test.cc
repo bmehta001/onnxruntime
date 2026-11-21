@@ -508,6 +508,37 @@ TEST(SoftmaxOperator, NonInnermostAxis_fp16_opset13) {
     test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
   }
 }
+
+TEST(SoftmaxOperator, NonInnermostAxis_bfloat16_opset13) {
+  if (!HasCudaEnvironment(530)) {
+    GTEST_SKIP() << "CUDA not supported";
+  }
+  OpTester test("Softmax", 13);
+  test.AddAttribute("axis", int64_t{0});
+  test.AddInput<BFloat16>("X", {2, 2}, MakeBFloat16({0.0f, 1.0f, -1.0f, 0.0f}));
+  test.AddOutput<BFloat16>("Y", {2, 2}, MakeBFloat16({0.73105858f, 0.73105858f, 0.26894142f, 0.26894142f}));
+  std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+  execution_providers.push_back(DefaultCudaExecutionProvider());
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+}
+
+TEST(SoftmaxOperator, NonInnermostAxis_double_opset13) {
+  if (!HasCudaEnvironment(530)) {
+    GTEST_SKIP() << "CUDA not supported";
+  }
+  for (const char* op_type : {"Softmax", "LogSoftmax"}) {
+    SCOPED_TRACE(op_type);
+    const bool log_softmax = std::string_view(op_type) == "LogSoftmax";
+    OpTester test(op_type, 13);
+    test.AddAttribute("axis", int64_t{0});
+    test.AddInput<double>("X", {2, 2}, {1.0e100, -1.0e100, 1.0e100, -1.0e100});
+    const double expected = log_softmax ? -std::log(2.0) : 0.5;
+    test.AddOutput<double>("Y", {2, 2}, {expected, expected, expected, expected});
+    std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+    execution_providers.push_back(DefaultCudaExecutionProvider());
+    test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+  }
+}
 #endif  // USE_CUDA
 
 // Regression test for NNAPI handling of a Softmax with opset < 13 where the input has been converted to NHWC.
