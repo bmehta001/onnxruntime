@@ -113,10 +113,12 @@
     if (TRT_GREATER_OR_EQUAL_TRT_10_GA)
       set(ONNX_USE_LITE_PROTO ON)
     endif()
+    # The 11.5 archive omits nvonnxparser.def; ORT links the static parser.
     onnxruntime_fetchcontent_declare(
       onnx_tensorrt
       URL ${DEP_URL_onnx_tensorrt}
       URL_HASH SHA1=${DEP_SHA1_onnx_tensorrt}
+      PATCH_COMMAND ${Patch_EXECUTABLE} --binary --ignore-whitespace -p1 < ${PROJECT_SOURCE_DIR}/patches/onnx_tensorrt/onnx_tensorrt_optional_windows_exports.patch
       EXCLUDE_FROM_ALL
     )
     if (NOT CUDA_INCLUDE_DIR)

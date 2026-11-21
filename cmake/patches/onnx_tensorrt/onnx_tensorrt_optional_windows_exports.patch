@@ -1,0 +1,11 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -148,7 +148,7 @@
+ # Importer library
+ # --------------------------------
+ add_library(${nvonnxparser_lib_name} SHARED ${IMPORTER_SOURCES})
+-if(MSVC)
++if(MSVC AND EXISTS "${ONNX2TRT_ROOT}/nvonnxparser.def")
+     target_sources(${nvonnxparser_lib_name} PRIVATE ${ONNX2TRT_ROOT}/nvonnxparser.def)
+ endif()
+ target_include_directories(${nvonnxparser_lib_name} PUBLIC ${ONNX_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR} ${TENSORRT_PYTHON_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
