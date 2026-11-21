@@ -489,12 +489,14 @@ TEST(SoftmaxOperator, NonInnermostAxis_fp16_opset13) {
   const std::vector<int64_t> dims = {8, 64, 40};
   const int64_t axis = 1;
   const size_t size = 8 * 64 * 40;
-  const auto x = MakeSoftmaxTestInput(size);
+  auto x = MakeSoftmaxTestInput(size);
+  std::vector<MLFloat16> x_fp16(size);
+  ConvertFloatToMLFloat16(x.data(), x_fp16.data(), size);
+  ConvertMLFloat16ToFloat(x_fp16.data(), x.data(), size);
   for (const char* op_type : {"Softmax", "LogSoftmax"}) {
     SCOPED_TRACE(op_type);
     const auto y = ReferenceSoftmaxOverAxis(x, dims, axis, std::string_view(op_type) == "LogSoftmax");
-    std::vector<MLFloat16> x_fp16(size), y_fp16(size);
-    ConvertFloatToMLFloat16(x.data(), x_fp16.data(), size);
+    std::vector<MLFloat16> y_fp16(size);
     ConvertFloatToMLFloat16(y.data(), y_fp16.data(), size);
 
     OpTester test(op_type, 13);
