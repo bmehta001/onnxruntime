@@ -2554,15 +2554,25 @@ struct MlasFlashAttentionGQAArgs {
     bool attention_bias_broadcast_batch;
     bool attention_bias_broadcast_head;
 
-    // Flash decoding (sequence_length == 1): partition KV across threads.
-    // Set flash_decoding_partials != nullptr to enable; otherwise the standard
-    // per-(batch, head, q_block) partitioning is used.
+    // Flash decoding (sequence_length == 1): partition KV into kv_chunk_count chunks of
+    // kv_block_size tokens. Set flash_decoding_partials != nullptr (with room for
+    // batch * num_heads * kv_chunk_count * (2 + head_size) floats) to enable; otherwise
+    // decode processes all total_seqlen tokens as one chunk. Decode needs per-thread
+    // scratch for at least one chunk of floats and processes up to
+    // buffer_size_per_thread / (chunk tokens * sizeof(float)) query heads of a GQA group
+    // per K/V pass. The chunking does not depend on thread_count, so results do not either.
     float* flash_decoding_partials;
     int kv_chunk_count;
 
     // Valid rows per batch for this invocation; sequence_length remains the physical
     // Q-head/output/bias stride. Negative means all sequence_length rows are valid.
     int valid_query_length = -1;
+
+    // Attention sink: adds exp(sink) to each softmax denominator without contributing a
+    // value. head_sink holds one logit per query head [num_heads]. When head_sink is
+    // nullptr and use_smooth_softmax is set, every head uses a sink of 0.
+    const float* head_sink = nullptr;
+    bool use_smooth_softmax = false;
 };
 
 /**

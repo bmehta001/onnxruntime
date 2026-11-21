@@ -1073,6 +1073,7 @@ class GQAAttentionBase {
       const float* Q,                         // Q data [B, N, S, H] BNSH
       const float* K,                         // K data [B, N_kv, L, H] or nullptr for packed_qkv
       const float* V,                         // V data [B, N_kv, L, H] or nullptr for packed_qkv
+      const float* head_sink,                 // attention sink logit per head [N], or nullptr
       const Tensor* attention_bias,           // additive bias [B|1, N|1, S, T] or nullptr
       const int32_t* attention_bias_offsets,  // per-batch absolute KV origin, or nullptr
       const Tensor* past_key,                 // past K (float)
@@ -1278,32 +1279,29 @@ class GQAAttentionBase {
     int thread_count = concurrency::ThreadPool::DegreeOfParallelism(tp);
     thread_count = std::max(thread_count, 1);
 
-    // Flash decoding: for decode (sequence_length==1), partition KV across threads
-    // to improve parallelism when batch*heads < thread_count. This KV-split is only
-    // wired into the unified kernel (common_past_seqlen >= 0); the ragged/per-batch
-    // fallback runs the single-pass decode kernel instead, which needs a larger
-    // per-thread scratch (scores[total_seqlen] + temp_output[head_size]). Gating on
-    // common_past_seqlen >= 0 keeps the per-thread buffer sizing below consistent
-    // with the kernel that actually runs.
-    const int kv_chunk_count = (max_total_seqlen + kv_block_size - 1) / kv_block_size;
+    // Decode (sequence_length == 1) splits the KV sequence into chunks whose length depends
+    // only on the total sequence length (flash decoding), giving the thread pool
+    // batch * kv_num_heads * chunks tasks with results independent of the thread count. Each
+    // task computes every query head of a GQA group, so per-thread scratch holds the scores
+    // of up to kDecodeHeadTile heads for one chunk. The per-batch (ragged) path runs each
+    // batch item as a single chunk.
+    constexpr int kDecodeHeadTile = 16;
+    const int decode_head_tile = std::min(num_heads_ / kv_num_heads_, kDecodeHeadTile);
+    const int decode_chunk_size = group_query_attention_helper::GetDecodeKvChunkSize(max_total_seqlen);
+    const int kv_chunk_count = (max_total_seqlen + decode_chunk_size - 1) / decode_chunk_size;
     const bool use_flash_decoding = (sequence_length == 1 &&
                                      common_past_seqlen >= 0 &&
-                                     batch_size * num_heads_ < thread_count &&
                                      kv_chunk_count > 1);
 
     size_t buffer_size_per_thread;
     size_t partials_buffer_bytes = 0;
     if (use_flash_decoding) {
-      // Flash decoding: per-thread scratch only needs scores[kv_block_size]
-      buffer_size_per_thread = SafeInt<size_t>(kv_block_size) * sizeof(float);
+      buffer_size_per_thread = SafeInt<size_t>(decode_head_tile) * decode_chunk_size * sizeof(float);
       // Partials: [batch * num_heads * kv_chunk_count * (2 + head_size)] floats
       partials_buffer_bytes = SafeInt<size_t>(batch_size) * num_heads_ *
                               kv_chunk_count * (2 + head_size) * sizeof(float);
     } else if (sequence_length == 1) {
-      // Decode (GEMV kernel, no Q/KV tiling): per-thread scratch holds the full
-      // score row scores[total_seqlen] plus a temp output accumulator[head_size].
-      buffer_size_per_thread =
-          (SafeInt<size_t>(max_total_seqlen) + head_size) * sizeof(float);
+      buffer_size_per_thread = SafeInt<size_t>(decode_head_tile) * max_total_seqlen * sizeof(float);
     } else {
       buffer_size_per_thread =
           (SafeInt<size_t>(q_block_size) * 2 +              // l + m
@@ -1338,7 +1336,7 @@ class GQAAttentionBase {
       args.local_window_size = local_window_size_;
       args.seqlen_present_kv = seqlen_present_kv_cache;
       args.q_block_size = q_block_size;
-      args.kv_block_size = kv_block_size;
+      args.kv_block_size = use_flash_decoding ? decode_chunk_size : kv_block_size;
       args.scale = scale;
       args.thread_count = thread_count;
       args.buffer = reinterpret_cast<float*>(flash_buffer_alloc);
@@ -1357,7 +1355,9 @@ class GQAAttentionBase {
       args.attention_bias_broadcast_batch = attention_bias_broadcast_batch;
       args.attention_bias_broadcast_head = attention_bias_broadcast_head;
       args.flash_decoding_partials = partials_ptr;
-      args.kv_chunk_count = kv_chunk_count;
+      args.kv_chunk_count = use_flash_decoding ? kv_chunk_count : 0;
+      args.head_sink = head_sink;
+      args.use_smooth_softmax = use_smooth_softmax_;
 
       MlasFlashAttentionGQA(&args, tp);
     } else {
@@ -1418,6 +1418,8 @@ class GQAAttentionBase {
         args.attention_bias_broadcast_head = attention_bias_broadcast_head;
         args.flash_decoding_partials = nullptr;  // per-batch doesn't use flash decoding
         args.kv_chunk_count = 0;
+        args.head_sink = head_sink;
+        args.use_smooth_softmax = use_smooth_softmax_;
 
         MlasFlashAttentionGQA(&args, tp);
       }

@@ -17,18 +17,21 @@ Abstract:
     an FP32 present K/V cache laid out as BNSH
     ([batch, kv_num_heads, seqlen_present, head_size]) and to support GQA head
     grouping (num_heads % kv_num_heads == 0), causal masking, local window
-    attention, additive attention bias, and an optional flash-decoding split
-    over the KV sequence dimension for single-token decode.
+    attention, additive attention bias, an attention sink (head_sink or smooth
+    softmax), and an optional flash-decoding split over the KV sequence
+    dimension for single-token decode.
 
     For multi-token prefill (sequence_length > 1) QK^T and S*V use the
     single-threaded SGEMM primitive MlasSgemmOperation. For single-token decode
-    (sequence_length == 1, including the flash-decoding KV split) the M == 1
-    GEMVs use the local MlasGQADecodeQK / MlasGQADecodeSV helpers to avoid SGEMM
-    packing overhead. The outer parallelism is provided by MlasExecuteThreaded.
+    (sequence_length == 1) the M == 1 GEMVs use grouped GEMV kernels that apply
+    each K/V row to every query head of its GQA group, avoiding both SGEMM
+    packing overhead and re-reading the shared K/V head once per query head.
+    The outer parallelism is provided by MlasExecuteThreaded.
 
 --*/
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -36,68 +39,105 @@ Abstract:
 #include "mlasi.h"
 
 //
-// Decode (sequence_length == 1) GEMV helpers.
+// Decode (sequence_length == 1) grouped GEMV helpers.
 //
 // With a single query token the QK^T and S*V products degenerate into
-// matrix-vector products. Computing them directly streams the K and V cache
-// exactly once and avoids the SGEMM B-packing overhead that otherwise dominates
-// the tiny M = 1 GEMMs. These helpers live in the baseline-ISA MLAS translation
-// unit, so the inner loops are written with independent accumulator lanes and a
-// map-style update so the compiler can vectorize them without -ffast-math
-// (which would be required to reassociate a plain scalar float reduction).
+// matrix-vector products. All query heads of a GQA group read the same K/V
+// head, so the helpers apply each K/V row to the whole group while it is
+// cached instead of streaming the K/V head once per query head. These portable
+// versions live in the baseline-ISA translation unit; the inner loops use
+// independent accumulator lanes and map-style updates so the compiler can
+// vectorize them without -ffast-math. Platforms may provide faster kernels via
+// GQADecodeQKKernel / GQADecodeSVKernel.
 //
 
-// QK^T GEMV: scores[t] = scale * dot(q[0..H), K[t*H .. t*H+H))  for t in [0, n_kv).
 static void
-MlasGQADecodeQK(
-    const float* q,
-    const float* k_cache,
-    std::ptrdiff_t n_kv,
-    std::ptrdiff_t head_size,
-    float scale,
-    float* scores
+MLASCALL
+MlasGQADecodeQKKernel(
+    const float* Query,
+    size_t GroupSize,
+    const float* Key,
+    size_t RowCount,
+    size_t HeadSize,
+    float Scale,
+    float* Scores,
+    size_t ScoresStride
 )
 {
-    constexpr std::ptrdiff_t kLanes = 8;
-    for (std::ptrdiff_t t = 0; t < n_kv; ++t) {
-        const float* krow = k_cache + t * head_size;
-        float acc[kLanes] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        std::ptrdiff_t h = 0;
-        for (; h + kLanes <= head_size; h += kLanes) {
-            for (std::ptrdiff_t j = 0; j < kLanes; ++j) {
-                acc[j] += q[h + j] * krow[h + j];
+    constexpr size_t kLanes = 8;
+    for (size_t t = 0; t < RowCount; ++t) {
+        const float* krow = Key + t * HeadSize;
+        for (size_t g = 0; g < GroupSize; ++g) {
+            const float* q = Query + g * HeadSize;
+            float acc[kLanes] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            size_t h = 0;
+            for (; h + kLanes <= HeadSize; h += kLanes) {
+                for (size_t j = 0; j < kLanes; ++j) {
+                    acc[j] += q[h + j] * krow[h + j];
+                }
             }
+            float sum = ((acc[0] + acc[1]) + (acc[2] + acc[3])) +
+                        ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+            for (; h < HeadSize; ++h) {
+                sum += q[h] * krow[h];
+            }
+            Scores[g * ScoresStride + t] = sum * Scale;
         }
-        float sum = ((acc[0] + acc[1]) + (acc[2] + acc[3])) +
-                    ((acc[4] + acc[5]) + (acc[6] + acc[7]));
-        for (; h < head_size; ++h) {
-            sum += q[h] * krow[h];
-        }
-        scores[t] = sum * scale;
     }
 }
 
-// S*V GEMV (accumulate): out[h] = sum_t probs[t] * V[t*H + h]  for h in [0, head_size).
-// `out` is overwritten (initialized to zero) before accumulation.
 static void
-MlasGQADecodeSV(
-    const float* probs,
-    const float* v_cache,
-    std::ptrdiff_t n_kv,
-    std::ptrdiff_t head_size,
-    float* out
+MLASCALL
+MlasGQADecodeSVKernel(
+    const float* Probs,
+    size_t ProbsStride,
+    size_t GroupSize,
+    const float* Value,
+    size_t RowCount,
+    size_t HeadSize,
+    float* Output,
+    size_t OutputStride
 )
 {
-    for (std::ptrdiff_t h = 0; h < head_size; ++h) {
-        out[h] = 0.0f;
+    for (size_t g = 0; g < GroupSize; ++g) {
+        std::fill_n(Output + g * OutputStride, HeadSize, 0.0f);
     }
-    for (std::ptrdiff_t t = 0; t < n_kv; ++t) {
-        const float p = probs[t];
-        const float* vrow = v_cache + t * head_size;
-        for (std::ptrdiff_t h = 0; h < head_size; ++h) {
-            out[h] += p * vrow[h];
+    for (size_t t = 0; t < RowCount; ++t) {
+        const float* vrow = Value + t * HeadSize;
+        for (size_t g = 0; g < GroupSize; ++g) {
+            const float p = Probs[g * ProbsStride + t];
+            float* out = Output + g * OutputStride;
+            for (size_t h = 0; h < HeadSize; ++h) {
+                out[h] += p * vrow[h];
+            }
         }
     }
+}
+
+constexpr size_t MlasGQADecodeMaxHeadTile = 16;
+
+static float
+MlasGQAHeadSink(const MlasFlashAttentionGQAArgs* args, ptrdiff_t head_idx)
+{
+    return args->head_sink != nullptr ? args->head_sink[head_idx] : 0.0f;
+}
+
+// Folds the sink logit into the softmax statistics: the sink adds exp(sink - m) to the
+// denominator and contributes no value. Returns the factor that maps the unnormalized
+// output (accumulated relative to `m`) to the final output.
+static float
+MlasGQAFinalScale(float m, float l, bool has_sink, float sink)
+{
+    if (has_sink) {
+        if (!(m > std::numeric_limits<float>::lowest())) {
+            return 0.0f;
+        }
+        const float m_final = std::max(m, sink);
+        const float rescale = std::exp(m - m_final);
+        const float denominator = l * rescale + std::exp(sink - m_final);
+        return rescale / denominator;
+    }
+    return l > 0.0f ? 1.0f / l : 0.0f;
 }
 
 void
@@ -353,8 +393,10 @@ MlasFlashAttentionGQAThreaded(
             static_cast<size_t>(head_idx) * static_cast<size_t>(head_size);
         const ptrdiff_t output_row_stride = num_heads * head_size;
 
+        const bool has_sink = args->head_sink != nullptr || args->use_smooth_softmax;
+        const float sink = has_sink ? MlasGQAHeadSink(args, head_idx) : 0.0f;
         for (ptrdiff_t irow = 0; irow < static_cast<ptrdiff_t>(row_size_q); ++irow) {
-            float inv_l = (l[irow] > 0.0f) ? (1.0f / l[irow]) : 0.0f;
+            const float inv_l = MlasGQAFinalScale(m[irow], l[irow], has_sink, sink);
             float* src = temp_output + irow * head_size;
             for (ptrdiff_t icol = 0; icol < head_size; ++icol) {
                 output_row[icol] = src[icol] * inv_l;
@@ -363,193 +405,192 @@ MlasFlashAttentionGQAThreaded(
         }
     }
 }
+//
+// Single-token decode (sequence_length == 1).
+//
+// Tasks are (batch, kv_head, kv_chunk) with the chunk varying fastest. Each task
+// computes all query heads of the GQA group against one chunk of the shared K/V
+// head, so K/V rows are streamed once per group rather than once per query head.
+// The chunking depends only on the arguments (never on the thread count), and
+// partial results are combined in fixed chunk order, so results are identical
+// for any thread count. Tasks are claimed dynamically to tolerate uneven worker
+// availability; results do not depend on which worker runs a task.
+//
+// With kv_chunk_count > 1 each task writes (m, l, unnormalized output) for every
+// head into flash_decoding_partials and MlasFlashDecodingGQAReduceThreaded combines
+// them. With a single chunk the normalized output is written directly.
+//
+struct MlasGQADecodeContext {
+    const MlasFlashAttentionGQAArgs* args;
+    MLAS_GQA_DECODE_QK_KERNEL* qk_kernel;
+    MLAS_GQA_DECODE_SV_KERNEL* sv_kernel;
+    ptrdiff_t chunk_count;
+    ptrdiff_t chunk_size;
+    ptrdiff_t task_count;
+    size_t head_tile;  // query heads processed per QK/SV call, bounded by the scratch size
+    std::atomic<ptrdiff_t> next_task;
+};
 
-//
-// Flash Decoding: Phase 1 - parallel partial attention over (batch, head, kv_chunk).
-// Each task computes attention for one KV chunk and stores (m, l, partial_output)
-// into the partials buffer.
-//
-void
-MlasFlashDecodingGQAThreaded(
+static void
+MlasGQADecodeThreaded(
     void* argptr,
     std::ptrdiff_t thread_id
 )
 {
-    const MlasFlashAttentionGQAArgs* args =
-        reinterpret_cast<MlasFlashAttentionGQAArgs*>(argptr);
+    auto* ctx = reinterpret_cast<MlasGQADecodeContext*>(argptr);
+    const MlasFlashAttentionGQAArgs* args = ctx->args;
 
-    const ptrdiff_t kv_block_size = static_cast<ptrdiff_t>(args->kv_block_size);
-    const ptrdiff_t batch_size = static_cast<ptrdiff_t>(args->batch_size);
     const ptrdiff_t num_heads = static_cast<ptrdiff_t>(args->num_heads);
     const ptrdiff_t kv_num_heads = static_cast<ptrdiff_t>(args->kv_num_heads);
     const ptrdiff_t total_seqlen = static_cast<ptrdiff_t>(args->total_seqlen);
     const ptrdiff_t head_size = static_cast<ptrdiff_t>(args->head_size);
-    const ptrdiff_t past_seqlen = static_cast<ptrdiff_t>(args->past_seqlen);
     const ptrdiff_t local_window_size = static_cast<ptrdiff_t>(args->local_window_size);
-    const float scale = args->scale;
-
-    float* buffer = args->buffer;
-    const ptrdiff_t buffer_size_per_thread = static_cast<ptrdiff_t>(args->buffer_size_per_thread);
-    const ptrdiff_t thread_count = static_cast<ptrdiff_t>(args->thread_count);
-
-    const size_t kv_num_heads_factor = static_cast<size_t>(num_heads / kv_num_heads);
+    const ptrdiff_t group_size = num_heads / kv_num_heads;
     const size_t kv_head_stride =
         static_cast<size_t>(args->seqlen_present_kv) * static_cast<size_t>(head_size);
-
-    const ptrdiff_t kv_chunk_count = static_cast<ptrdiff_t>(args->kv_chunk_count);
-    // Partials layout per entry: [m, l, output[head_size]]
+    const ptrdiff_t chunk_count = ctx->chunk_count;
+    const ptrdiff_t chunk_size = ctx->chunk_size;
+    const bool use_partials = chunk_count > 1;
     const ptrdiff_t partial_stride = 2 + head_size;
+    const bool has_sink = args->head_sink != nullptr || args->use_smooth_softmax;
+
+    // The new token attends to positions [window_start, causal_limit).
+    const ptrdiff_t causal_limit = std::min(total_seqlen, static_cast<ptrdiff_t>(args->past_seqlen) + 1);
+    const ptrdiff_t window_start =
+        (local_window_size >= 0 && causal_limit > local_window_size) ? causal_limit - local_window_size : 0;
 
 #if defined(MLAS_TARGET_AMD64) || defined(MLAS_TARGET_LARCH64)
     auto&& mlas_platform = GetMlasPlatform();
 #endif
 
-    // Total tasks: (batch, head, kv_chunk)
-    const ptrdiff_t total_task_count = batch_size * num_heads * kv_chunk_count;
+    float* scores = reinterpret_cast<float*>(
+        reinterpret_cast<char*>(args->buffer) + thread_id * args->buffer_size_per_thread);
 
-    ptrdiff_t task_start = 0;
-    ptrdiff_t task_end = 0;
-    ptrdiff_t quotient = total_task_count / thread_count;
-    ptrdiff_t remainder = total_task_count % thread_count;
-    if (thread_id < remainder) {
-        task_start = (quotient + 1) * thread_id;
-        task_end = task_start + quotient + 1;
-    } else {
-        task_start = quotient * thread_id + remainder;
-        task_end = task_start + quotient;
-    }
-
-    for (ptrdiff_t task_index = task_start; task_index < task_end; ++task_index) {
-        // Vary heads fastest so nearby tasks can reuse the same KV chunk across grouped query heads.
-        // Partial-result indexing below remains independent of this scheduling order.
-        ptrdiff_t tmp = task_index;
-        ptrdiff_t head_idx = tmp % num_heads;
-        tmp /= num_heads;
-        ptrdiff_t kv_chunk_idx = tmp % kv_chunk_count;
-        ptrdiff_t batch_idx = tmp / kv_chunk_count;
-
-        // Per-thread scratch buffer: just scores[kv_block_size]
-        char* buffer_ptr = reinterpret_cast<char*>(buffer) + thread_id * buffer_size_per_thread;
-        float* scores = reinterpret_cast<float*>(buffer_ptr);
-
-        // KV block range for this chunk
-        const ptrdiff_t ir = kv_chunk_idx * kv_block_size;
-        const size_t row_size_kv = static_cast<size_t>(std::min(kv_block_size, total_seqlen - ir));
-
-        // Determine KV head index for GQA head sharing
-        const size_t kv_head_idx = static_cast<size_t>(head_idx) / kv_num_heads_factor;
-
-        // K/V cache pointers
-        const size_t kv_batch_head_offset =
-            (static_cast<size_t>(batch_idx) * static_cast<size_t>(kv_num_heads) + kv_head_idx) *
-            kv_head_stride;
-        const float* k_cache_head = args->k_cache + kv_batch_head_offset;
-        const float* v_cache_head = args->v_cache + kv_batch_head_offset;
-
-        // Q pointer: layout [batch, num_heads, 1, head_size] (sequence_length=1).
-        // The batch stride is supplied separately to support packed-QKV input.
-        const float* q_ptr = args->query +
-            static_cast<size_t>(batch_idx) * args->q_batch_stride +
-            static_cast<size_t>(head_idx) * static_cast<size_t>(head_size);
-
-        // Step 1: QK^T GEMV for this KV chunk (M = 1)
-        const float* k_block = k_cache_head + static_cast<size_t>(ir) * static_cast<size_t>(head_size);
-        // Clamp the window start to this chunk: skip its masked prefix, or all of a fully masked chunk.
-        // Initialize skipped scores because bias, masking, and reduction still visit the full chunk.
-        const ptrdiff_t visible_start = local_window_size >= 0
-            ? std::min(static_cast<ptrdiff_t>(row_size_kv),
-                       std::max(ptrdiff_t{0}, past_seqlen + 1 - local_window_size - ir))
-            : 0;
-        if (visible_start > 0) {
-            std::fill_n(scores, visible_start, std::numeric_limits<float>::lowest());
-        }
-        MlasGQADecodeQK(q_ptr, k_block + visible_start * head_size,
-                        static_cast<std::ptrdiff_t>(row_size_kv) - visible_start,
-                        head_size, scale, scores + visible_start);
-
-        // Step 1b: Apply attention bias if present
-        if (args->attention_bias != nullptr) {
-            const ptrdiff_t bias_seqlen_stride =
-                static_cast<ptrdiff_t>(args->attention_bias_seqlen_stride);
-            const ptrdiff_t bias_matrix_size = bias_seqlen_stride;  // S=1
-            // The bias tensor has shape [batch|1, num_heads|1, S, T]; the batch stride
-            // uses the actual head extent (1 when the head dim is broadcast).
-            const ptrdiff_t bias_head_extent =
-                args->attention_bias_broadcast_head ? 1 : static_cast<ptrdiff_t>(num_heads);
-            ptrdiff_t bias_offset = 0;
-            if (!args->attention_bias_broadcast_batch) {
-                bias_offset += static_cast<ptrdiff_t>(batch_idx) *
-                               bias_head_extent * bias_matrix_size;
-            }
-            if (!args->attention_bias_broadcast_head) {
-                bias_offset += static_cast<ptrdiff_t>(head_idx) * bias_matrix_size;
-            }
-            const float* bias_row = args->attention_bias + bias_offset + ir;
-            for (ptrdiff_t jcol = 0; jcol < static_cast<ptrdiff_t>(row_size_kv); ++jcol) {
-                scores[jcol] += bias_row[jcol];
-            }
+    for (;;) {
+        const ptrdiff_t task_index = ctx->next_task.fetch_add(1, std::memory_order_relaxed);
+        if (task_index >= ctx->task_count) {
+            break;
         }
 
-        // Step 2: Apply causal mask
-        const ptrdiff_t global_q_pos = past_seqlen;  // sequence_length=1, q_idx=0
-        const ptrdiff_t causal_limit = global_q_pos + 1;
-        for (ptrdiff_t jcol = 0; jcol < static_cast<ptrdiff_t>(row_size_kv); ++jcol) {
-            ptrdiff_t kv_pos = ir + jcol;
-            if (kv_pos >= causal_limit) {
-                scores[jcol] = std::numeric_limits<float>::lowest();
-            }
-        }
+        const ptrdiff_t chunk_idx = task_index % chunk_count;
+        const ptrdiff_t kv_head_idx = (task_index / chunk_count) % kv_num_heads;
+        const ptrdiff_t batch_idx = task_index / (chunk_count * kv_num_heads);
 
-        // Apply local window masking if enabled
-        if (local_window_size >= 0) {
-            const ptrdiff_t window_start =
-                (causal_limit > local_window_size) ? (causal_limit - local_window_size) : 0;
-            for (ptrdiff_t jcol = 0; jcol < static_cast<ptrdiff_t>(row_size_kv); ++jcol) {
-                ptrdiff_t kv_pos = ir + jcol;
-                if (kv_pos < window_start) {
-                    scores[jcol] = std::numeric_limits<float>::lowest();
+        const ptrdiff_t chunk_start = chunk_idx * chunk_size;
+        const ptrdiff_t chunk_end = std::min(chunk_start + chunk_size, total_seqlen);
+        const ptrdiff_t row_start = std::max(chunk_start, window_start);
+        const ptrdiff_t row_end = std::min(chunk_end, causal_limit);
+        const ptrdiff_t row_count = row_end - row_start;
+
+        const size_t kv_offset =
+            (static_cast<size_t>(batch_idx) * static_cast<size_t>(kv_num_heads) + static_cast<size_t>(kv_head_idx)) *
+                kv_head_stride +
+            static_cast<size_t>(std::max<ptrdiff_t>(row_start, 0)) * static_cast<size_t>(head_size);
+        const float* k_rows = args->k_cache + kv_offset;
+        const float* v_rows = args->v_cache + kv_offset;
+
+        const ptrdiff_t first_head = kv_head_idx * group_size;
+
+        // Output (or partial output) for head h of this task, and the stride between heads.
+        auto head_output = [&](ptrdiff_t head_idx) -> float* {
+            if (use_partials) {
+                const ptrdiff_t partial_index = (batch_idx * num_heads + head_idx) * chunk_count + chunk_idx;
+                return args->flash_decoding_partials + partial_index * partial_stride + 2;
+            }
+            return args->output +
+                   (static_cast<size_t>(batch_idx) * static_cast<size_t>(num_heads) + static_cast<size_t>(head_idx)) *
+                       static_cast<size_t>(head_size);
+        };
+        const size_t output_stride = use_partials ? static_cast<size_t>(chunk_count * partial_stride)
+                                                  : static_cast<size_t>(head_size);
+
+        if (row_count <= 0) {
+            // Entire chunk is outside the visible range.
+            for (ptrdiff_t g = 0; g < group_size; ++g) {
+                float* out = head_output(first_head + g);
+                std::fill_n(out, head_size, 0.0f);
+                if (use_partials) {
+                    out[-2] = std::numeric_limits<float>::lowest();
+                    out[-1] = 0.0f;
                 }
             }
-        }
-
-        // Step 3: Compute local softmax statistics (m, l) and exp scores
-#if defined(MLAS_TARGET_AMD64) || defined(MLAS_TARGET_LARCH64)
-        float rowmax = mlas_platform.ReduceMaximumF32Kernel(scores, row_size_kv);
-#else
-        float rowmax = MlasReduceMaximumF32Kernel(scores, row_size_kv);
-#endif
-
-        // Pointer to this task's partial in the partials buffer
-        const ptrdiff_t partial_index =
-            (batch_idx * num_heads + head_idx) * kv_chunk_count + kv_chunk_idx;
-        float* partial = args->flash_decoding_partials + partial_index * partial_stride;
-        float* partial_m = partial;
-        float* partial_l = partial + 1;
-        float* partial_output = partial + 2;
-
-        if (rowmax == std::numeric_limits<float>::lowest()) {
-            // Entire chunk is masked: store sentinel
-            *partial_m = std::numeric_limits<float>::lowest();
-            *partial_l = 0.0f;
-            memset(partial_output, 0, static_cast<size_t>(head_size) * sizeof(float));
             continue;
         }
 
-        *partial_m = rowmax;
-        float negmax = -rowmax;
-#if defined(MLAS_TARGET_AMD64)
-        float rowsum = mlas_platform.ComputeSumExpF32Kernel(scores, scores, row_size_kv, &negmax);
-#else
-        float rowsum = MlasComputeSumExpF32Kernel(scores, scores, row_size_kv, &negmax);
-#endif
-        *partial_l = rowsum;
+        for (ptrdiff_t g0 = 0; g0 < group_size; g0 += static_cast<ptrdiff_t>(ctx->head_tile)) {
+            const size_t tile = static_cast<size_t>(std::min<ptrdiff_t>(ctx->head_tile, group_size - g0));
+            const ptrdiff_t tile_head = first_head + g0;
+            const float* q_ptr = args->query + static_cast<size_t>(batch_idx) * args->q_batch_stride +
+                                 static_cast<size_t>(tile_head) * static_cast<size_t>(head_size);
 
-        // Step 4: S_exp * V_block -> partial_output (M = 1)
-        const float* v_block = v_cache_head + static_cast<size_t>(ir) * static_cast<size_t>(head_size);
-        // The masked prefix has zero weight; avoid reading its values as well as its keys.
-        MlasGQADecodeSV(scores + visible_start, v_block + visible_start * head_size,
-                static_cast<std::ptrdiff_t>(row_size_kv) - visible_start,
-                head_size, partial_output);
+            ctx->qk_kernel(q_ptr, tile, k_rows, static_cast<size_t>(row_count), static_cast<size_t>(head_size),
+                           args->scale, scores, static_cast<size_t>(row_count));
+
+            float row_max[MlasGQADecodeMaxHeadTile];
+            float row_sum[MlasGQADecodeMaxHeadTile];
+            for (size_t g = 0; g < tile; ++g) {
+                const ptrdiff_t head_idx = tile_head + static_cast<ptrdiff_t>(g);
+                float* head_scores = scores + g * static_cast<size_t>(row_count);
+
+                if (args->attention_bias != nullptr) {
+                    // Bias shape [batch|1, num_heads|1, S=1, T].
+                    const ptrdiff_t bias_row_size = static_cast<ptrdiff_t>(args->attention_bias_seqlen_stride);
+                    const ptrdiff_t bias_head_extent = args->attention_bias_broadcast_head ? 1 : num_heads;
+                    ptrdiff_t bias_offset = 0;
+                    if (!args->attention_bias_broadcast_batch) {
+                        bias_offset += batch_idx * bias_head_extent * bias_row_size;
+                    }
+                    if (!args->attention_bias_broadcast_head) {
+                        bias_offset += head_idx * bias_row_size;
+                    }
+                    const float* bias_row = args->attention_bias + bias_offset + row_start;
+                    for (ptrdiff_t t = 0; t < row_count; ++t) {
+                        head_scores[t] += bias_row[t];
+                    }
+                }
+
+#if defined(MLAS_TARGET_AMD64) || defined(MLAS_TARGET_LARCH64)
+                float m = mlas_platform.ReduceMaximumF32Kernel(head_scores, static_cast<size_t>(row_count));
+#else
+                float m = MlasReduceMaximumF32Kernel(head_scores, static_cast<size_t>(row_count));
+#endif
+                float l = 0.0f;
+                if (m > std::numeric_limits<float>::lowest()) {
+                    float negmax = -m;
+#if defined(MLAS_TARGET_AMD64)
+                    l = mlas_platform.ComputeSumExpF32Kernel(head_scores, head_scores, static_cast<size_t>(row_count),
+                                                             &negmax);
+#else
+                    l = MlasComputeSumExpF32Kernel(head_scores, head_scores, static_cast<size_t>(row_count), &negmax);
+#endif
+                } else {
+                    // Every visible score is masked: give the rows zero weight.
+                    m = std::numeric_limits<float>::lowest();
+                    std::fill_n(head_scores, row_count, 0.0f);
+                }
+                row_max[g] = m;
+                row_sum[g] = l;
+            }
+
+            float* out = head_output(tile_head);
+            ctx->sv_kernel(scores, static_cast<size_t>(row_count), tile, v_rows, static_cast<size_t>(row_count),
+                           static_cast<size_t>(head_size), out, output_stride);
+
+            for (size_t g = 0; g < tile; ++g) {
+                float* head_out = out + g * output_stride;
+                if (use_partials) {
+                    head_out[-2] = row_max[g];
+                    head_out[-1] = row_sum[g];
+                } else {
+                    const ptrdiff_t head_idx = tile_head + static_cast<ptrdiff_t>(g);
+                    const float factor =
+                        MlasGQAFinalScale(row_max[g], row_sum[g], has_sink, has_sink ? MlasGQAHeadSink(args, head_idx) : 0.0f);
+                    for (ptrdiff_t h = 0; h < head_size; ++h) {
+                        head_out[h] *= factor;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -571,6 +612,7 @@ MlasFlashDecodingGQAReduceThreaded(
     const ptrdiff_t kv_chunk_count = static_cast<ptrdiff_t>(args->kv_chunk_count);
     const ptrdiff_t thread_count = static_cast<ptrdiff_t>(args->thread_count);
     const ptrdiff_t partial_stride = 2 + head_size;
+    const bool has_sink = args->head_sink != nullptr || args->use_smooth_softmax;
 
     // Total reduction tasks: one per (batch, head)
     const ptrdiff_t total_task_count = batch_size * num_heads;
@@ -638,152 +680,10 @@ MlasFlashDecodingGQAReduceThreaded(
         }
 
         // output = sum_c(rescale_c * partial_output_c) / global_l
-        float inv_l = (global_l > 0.0f) ? (1.0f / global_l) : 0.0f;
+        const float factor = MlasGQAFinalScale(global_m, global_l, has_sink,
+                                               has_sink ? MlasGQAHeadSink(args, head_idx) : 0.0f);
         for (ptrdiff_t i = 0; i < head_size; ++i) {
-            output_ptr[i] *= inv_l;
-        }
-    }
-}
-
-//
-// Decode kernel for sequence_length == 1 without KV-split (batch * heads >=
-// thread_count). Parallelizes over (batch, head); each task attends the single
-// query token to the whole KV cache with a pair of GEMVs and a two-pass softmax.
-// Decode needs no causal masking (the single new token is the most recent
-// position and attends to every cached token); only optional local-window
-// masking and additive bias are applied.
-//
-void
-MlasGQADecodeGQAThreaded(
-    void* argptr,
-    std::ptrdiff_t thread_id
-)
-{
-    const MlasFlashAttentionGQAArgs* args =
-        reinterpret_cast<MlasFlashAttentionGQAArgs*>(argptr);
-
-    const ptrdiff_t batch_size = static_cast<ptrdiff_t>(args->batch_size);
-    const ptrdiff_t num_heads = static_cast<ptrdiff_t>(args->num_heads);
-    const ptrdiff_t kv_num_heads = static_cast<ptrdiff_t>(args->kv_num_heads);
-    const ptrdiff_t total_seqlen = static_cast<ptrdiff_t>(args->total_seqlen);
-    const ptrdiff_t head_size = static_cast<ptrdiff_t>(args->head_size);
-    const ptrdiff_t local_window_size = static_cast<ptrdiff_t>(args->local_window_size);
-    const float scale = args->scale;
-
-    float* buffer = args->buffer;
-    const ptrdiff_t buffer_size_per_thread = static_cast<ptrdiff_t>(args->buffer_size_per_thread);
-    const ptrdiff_t thread_count = static_cast<ptrdiff_t>(args->thread_count);
-
-    const size_t kv_num_heads_factor = static_cast<size_t>(num_heads / kv_num_heads);
-    const size_t kv_head_stride =
-        static_cast<size_t>(args->seqlen_present_kv) * static_cast<size_t>(head_size);
-
-#if defined(MLAS_TARGET_AMD64) || defined(MLAS_TARGET_LARCH64)
-    auto&& mlas_platform = GetMlasPlatform();
-#endif
-
-    // One task per (batch, head).
-    const ptrdiff_t total_task_count = batch_size * num_heads;
-
-    ptrdiff_t task_start = 0;
-    ptrdiff_t task_end = 0;
-    ptrdiff_t quotient = total_task_count / thread_count;
-    ptrdiff_t remainder = total_task_count % thread_count;
-    if (thread_id < remainder) {
-        task_start = (quotient + 1) * thread_id;
-        task_end = task_start + quotient + 1;
-    } else {
-        task_start = quotient * thread_id + remainder;
-        task_end = task_start + quotient;
-    }
-
-    // Local-window low bound: decode can attend to KV positions [window_start, total_seqlen).
-    // causal_limit == past_seqlen + 1 == total_seqlen for the single new token.
-    const ptrdiff_t window_start =
-        (local_window_size >= 0 && total_seqlen > local_window_size) ? (total_seqlen - local_window_size) : 0;
-
-    // Per-thread scratch: scores[total_seqlen] followed by temp_output[head_size].
-    char* buffer_ptr = reinterpret_cast<char*>(buffer) + thread_id * buffer_size_per_thread;
-    float* scores = reinterpret_cast<float*>(buffer_ptr);
-    float* temp_output = scores + total_seqlen;
-
-    for (ptrdiff_t task_index = task_start; task_index < task_end; ++task_index) {
-        const ptrdiff_t head_idx = task_index % num_heads;
-        const ptrdiff_t batch_idx = task_index / num_heads;
-
-        // KV head index for GQA head sharing.
-        const size_t kv_head_idx = static_cast<size_t>(head_idx) / kv_num_heads_factor;
-        const size_t kv_batch_head_offset =
-            (static_cast<size_t>(batch_idx) * static_cast<size_t>(kv_num_heads) + kv_head_idx) *
-            kv_head_stride;
-        const float* k_cache_head = args->k_cache + kv_batch_head_offset;
-        const float* v_cache_head = args->v_cache + kv_batch_head_offset;
-
-        // Q pointer: layout [batch, num_heads, 1, head_size]; batch stride supplied
-        // separately to support packed-QKV input.
-        const float* q_ptr = args->query +
-            static_cast<size_t>(batch_idx) * args->q_batch_stride +
-            static_cast<size_t>(head_idx) * static_cast<size_t>(head_size);
-
-        // Step 1: QK^T GEMV -> scores[0..T)
-        MlasGQADecodeQK(q_ptr, k_cache_head, total_seqlen, head_size, scale, scores);
-
-        // Step 1b: additive attention bias (shape [batch|1, num_heads|1, S=1, T]).
-        if (args->attention_bias != nullptr) {
-            const ptrdiff_t bias_matrix_size =
-                static_cast<ptrdiff_t>(args->attention_bias_seqlen_stride);  // S == 1
-            const ptrdiff_t bias_head_extent =
-                args->attention_bias_broadcast_head ? 1 : static_cast<ptrdiff_t>(num_heads);
-            ptrdiff_t bias_offset = 0;
-            if (!args->attention_bias_broadcast_batch) {
-                bias_offset += static_cast<ptrdiff_t>(batch_idx) * bias_head_extent * bias_matrix_size;
-            }
-            if (!args->attention_bias_broadcast_head) {
-                bias_offset += static_cast<ptrdiff_t>(head_idx) * bias_matrix_size;
-            }
-            const float* bias_row = args->attention_bias + bias_offset;
-            for (ptrdiff_t t = 0; t < total_seqlen; ++t) {
-                scores[t] += bias_row[t];
-            }
-        }
-
-        // Step 2: local-window masking (no causal mask needed for decode).
-        if (window_start > 0) {
-            for (ptrdiff_t t = 0; t < window_start; ++t) {
-                scores[t] = std::numeric_limits<float>::lowest();
-            }
-        }
-
-        // Step 3: softmax over scores[0..T).
-#if defined(MLAS_TARGET_AMD64) || defined(MLAS_TARGET_LARCH64)
-        float rowmax = mlas_platform.ReduceMaximumF32Kernel(scores, total_seqlen);
-#else
-        float rowmax = MlasReduceMaximumF32Kernel(scores, total_seqlen);
-#endif
-
-        // Output layout: [batch, sequence_length=1, num_heads, head_size]
-        float* output_ptr = args->output +
-            (static_cast<size_t>(batch_idx) * static_cast<size_t>(num_heads) +
-             static_cast<size_t>(head_idx)) * static_cast<size_t>(head_size);
-
-        if (rowmax == std::numeric_limits<float>::lowest()) {
-            memset(output_ptr, 0, static_cast<size_t>(head_size) * sizeof(float));
-            continue;
-        }
-
-        float negmax = -rowmax;
-#if defined(MLAS_TARGET_AMD64)
-        float rowsum = mlas_platform.ComputeSumExpF32Kernel(scores, scores, total_seqlen, &negmax);
-#else
-        float rowsum = MlasComputeSumExpF32Kernel(scores, scores, total_seqlen, &negmax);
-#endif
-
-        // Step 4: S_exp * V GEMV -> temp_output, then normalize by 1/l.
-        MlasGQADecodeSV(scores, v_cache_head, total_seqlen, head_size, temp_output);
-
-        const float inv_l = (rowsum > 0.0f) ? (1.0f / rowsum) : 0.0f;
-        for (ptrdiff_t h = 0; h < head_size; ++h) {
-            output_ptr[h] = temp_output[h] * inv_l;
+            output_ptr[i] *= factor;
         }
     }
 }
@@ -799,27 +699,38 @@ MlasFlashAttentionGQA(
         return;
     }
     if (args->sequence_length == 1) {
-        // Decode: M = 1, use the GEMV kernels (no SGEMM packing overhead).
-        if (args->flash_decoding_partials != nullptr) {
-            // Flash decoding: two-phase approach when KV is partitioned across threads.
-            // Phase 1: parallel partial computation over (batch, head, kv_chunk).
-            MlasExecuteThreaded(
-                MlasFlashDecodingGQAThreaded,
-                static_cast<void*>(args),
-                static_cast<std::ptrdiff_t>(args->thread_count),
-                ThreadPool
-            );
-            // Phase 2: reduce partials into final output (parallel over batch*heads).
+        // Decode: M = 1, use the grouped GEMV kernels (no SGEMM packing overhead).
+        const size_t group_size = static_cast<size_t>(args->num_heads / args->kv_num_heads);
+        const bool split = args->flash_decoding_partials != nullptr && args->kv_chunk_count > 1;
+
+        MlasGQADecodeContext ctx;
+        ctx.args = args;
+        ctx.qk_kernel = MlasGQADecodeQKKernel;
+        ctx.sv_kernel = MlasGQADecodeSVKernel;
+        const auto& platform = GetMlasPlatform();
+        if (args->head_size % 8 == 0 && platform.GQADecodeQKKernel != nullptr &&
+            platform.GQADecodeSVKernel != nullptr) {
+            ctx.qk_kernel = platform.GQADecodeQKKernel;
+            ctx.sv_kernel = platform.GQADecodeSVKernel;
+        }
+        ctx.chunk_count = split ? args->kv_chunk_count : 1;
+        ctx.chunk_size = split ? args->kv_block_size : std::max(args->total_seqlen, 1);
+        ctx.task_count = static_cast<ptrdiff_t>(args->batch_size) * args->kv_num_heads * ctx.chunk_count;
+        const size_t scratch_rows = args->buffer_size_per_thread / sizeof(float);
+        ctx.head_tile = std::max<size_t>(
+            1, std::min({group_size, MlasGQADecodeMaxHeadTile, scratch_rows / static_cast<size_t>(ctx.chunk_size)}));
+        ctx.next_task.store(0, std::memory_order_relaxed);
+
+        MlasExecuteThreaded(
+            MlasGQADecodeThreaded,
+            static_cast<void*>(&ctx),
+            std::min<std::ptrdiff_t>(args->thread_count, ctx.task_count),
+            ThreadPool
+        );
+        if (split) {
+            // Combine the per-chunk partials in fixed chunk order (parallel over batch * heads).
             MlasExecuteThreaded(
                 MlasFlashDecodingGQAReduceThreaded,
-                static_cast<void*>(args),
-                static_cast<std::ptrdiff_t>(args->thread_count),
-                ThreadPool
-            );
-        } else {
-            // Single-pass decode parallelized over (batch, head).
-            MlasExecuteThreaded(
-                MlasGQADecodeGQAThreaded,
                 static_cast<void*>(args),
                 static_cast<std::ptrdiff_t>(args->thread_count),
                 ThreadPool

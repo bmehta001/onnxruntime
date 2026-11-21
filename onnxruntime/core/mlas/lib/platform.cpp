@@ -720,6 +720,8 @@ Return Value:
                 // TODO(vraspar): check if this really goes here or if there are other platform reqs that we need to fulfill
                 this->LutGenKernel = &MlasLutGenKernelAvx2;
                 this->LayerNormF32Kernel = &MlasLayerNormKernelAvx2;
+                this->GQADecodeQKKernel = &MlasGQADecodeQKKernelAvx2;
+                this->GQADecodeSVKernel = &MlasGQADecodeSVKernelAvx2;
                 if ((Cpuid1[2] & (1u << 29)) != 0) {
                     this->LayerNormF16Kernel = &MlasLayerNormKernelF16Avx2;
                 }

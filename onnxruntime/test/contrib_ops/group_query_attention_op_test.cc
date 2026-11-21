@@ -2710,6 +2710,216 @@ TEST(GroupQueryAttentionTest, FlashDecoding_LocalWindow_Reference_CPU) {
   }
 }
 
+// Grouped decode must match an FP64 reference for group sizes that exercise every register tile and the
+// per-pass head limit, head sizes with and without a vector kernel, odd chunk lengths, local windows, and
+// attention sinks. Results must be bitwise identical for any thread count.
+TEST(GroupQueryAttentionTest, FlashDecoding_GroupedHeads_Reference_CPU) {
+  constexpr int batch_size = 2;
+  constexpr int total_length = 77;
+  constexpr int cache_capacity = 80;
+  constexpr int pool_threads = 7;
+  concurrency::ThreadPool thread_pool(&Env::Default(), ThreadOptions{}, nullptr, pool_threads,
+                                      concurrency::kSpinDurationDefault, false);
+  struct HeadConfig {
+    int num_heads;
+    int kv_num_heads;
+    int head_size;
+  };
+  // Group sizes 3, 6, 7, 8, 20 and 1; head size 24 has no vector kernel.
+  const HeadConfig head_configs[] = {{6, 2, 64}, {12, 2, 128}, {14, 2, 32}, {8, 1, 24}, {20, 1, 8}, {5, 5, 256}};
+  for (const HeadConfig& config : head_configs) {
+    const int num_heads = config.num_heads;
+    const int kv_num_heads = config.kv_num_heads;
+    const int head_size = config.head_size;
+    const int group_size = num_heads / kv_num_heads;
+    for (int kv_block_size : {13, 0}) {
+      for (int window_size : {-1, 30}) {
+        for (int sink_mode : {0, 1, 2}) {
+          for (int head_limit : {16, 5}) {
+            SCOPED_TRACE(testing::Message() << "heads=" << num_heads << "/" << kv_num_heads << " head_size="
+                                            << head_size << " kv_block=" << kv_block_size << " window="
+                                            << window_size << " sink_mode=" << sink_mode
+                                            << " head_limit=" << head_limit);
+            const int chunk_size = kv_block_size > 0 ? kv_block_size : total_length;
+            const int kv_chunk_count = (total_length + chunk_size - 1) / chunk_size;
+            const int first_token = window_size < 0 ? 0 : total_length - window_size;
+            const float scale = 1.0f / std::sqrt(static_cast<float>(head_size));
+            InlinedVector<float> query(batch_size * num_heads * head_size);
+            InlinedVector<float> key(batch_size * kv_num_heads * cache_capacity * head_size);
+            InlinedVector<float> value(key.size());
+            InlinedVector<float> sink(num_heads);
+            std::mt19937 random(7);
+            std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+            for (auto& element : query) element = 2.0f * distribution(random);
+            for (auto& element : key) element = 2.0f * distribution(random);
+            for (auto& element : value) element = distribution(random);
+            for (auto& element : sink) element = 3.0f * distribution(random);
+            for (int cache_head = 0; cache_head < batch_size * kv_num_heads; ++cache_head) {
+              for (int token = 0; token < cache_capacity; ++token) {
+                if (token < first_token || token >= total_length) {
+                  const size_t offset = (static_cast<size_t>(cache_head) * cache_capacity + token) * head_size;
+                  std::fill_n(key.begin() + offset, head_size, std::numeric_limits<float>::quiet_NaN());
+                  std::fill_n(value.begin() + offset, head_size, std::numeric_limits<float>::quiet_NaN());
+                }
+              }
+            }
+
+            const int heads_per_pass = std::min(group_size, head_limit);
+            auto run = [&](int thread_count, MLAS_THREADPOOL* pool) {
+              InlinedVector<float> scratch(static_cast<size_t>(thread_count) * heads_per_pass * chunk_size);
+              InlinedVector<float> partials(batch_size * num_heads * kv_chunk_count * (2 + head_size),
+                                            std::numeric_limits<float>::quiet_NaN());
+              InlinedVector<float> output(query.size(), std::numeric_limits<float>::quiet_NaN());
+              MlasFlashAttentionGQAArgs args{};
+              args.batch_size = batch_size;
+              args.num_heads = num_heads;
+              args.kv_num_heads = kv_num_heads;
+              args.sequence_length = 1;
+              args.total_seqlen = total_length;
+              args.head_size = head_size;
+              args.past_seqlen = total_length - 1;
+              args.local_window_size = window_size;
+              args.seqlen_present_kv = cache_capacity;
+              args.q_block_size = 1;
+              args.kv_block_size = chunk_size;
+              args.scale = scale;
+              args.thread_count = thread_count;
+              args.buffer = scratch.data();
+              args.buffer_size_per_thread = static_cast<size_t>(heads_per_pass) * chunk_size * sizeof(float);
+              args.query = query.data();
+              args.q_batch_stride = static_cast<size_t>(num_heads) * head_size;
+              args.k_cache = key.data();
+              args.v_cache = value.data();
+              args.output = output.data();
+              args.flash_decoding_partials = kv_chunk_count > 1 ? partials.data() : nullptr;
+              args.kv_chunk_count = kv_chunk_count > 1 ? kv_chunk_count : 0;
+              args.head_sink = sink_mode == 1 ? sink.data() : nullptr;
+              args.use_smooth_softmax = sink_mode == 2;
+              MlasFlashAttentionGQA(&args, pool);
+              return output;
+            };
+            const InlinedVector<float> output = run(pool_threads, &thread_pool);
+            const InlinedVector<float> serial_output = run(1, nullptr);
+            ASSERT_EQ(output.size(), serial_output.size());
+            EXPECT_EQ(std::memcmp(output.data(), serial_output.data(), output.size() * sizeof(float)), 0);
+
+            for (int batch = 0; batch < batch_size; ++batch) {
+              for (int head = 0; head < num_heads; ++head) {
+                const size_t query_offset = (static_cast<size_t>(batch) * num_heads + head) * head_size;
+                const int kv_head = head / group_size;
+                const size_t cache_offset =
+                    (static_cast<size_t>(batch) * kv_num_heads + kv_head) * cache_capacity * head_size;
+                InlinedVector<double> scores(total_length);
+                const double sink_logit = sink_mode == 1 ? sink[head] : 0.0;
+                double maximum = sink_mode != 0 ? sink_logit : -std::numeric_limits<double>::infinity();
+                for (int token = first_token; token < total_length; ++token) {
+                  double score = 0.0;
+                  for (int channel = 0; channel < head_size; ++channel) {
+                    score += static_cast<double>(query[query_offset + channel]) *
+                             key[cache_offset + token * head_size + channel];
+                  }
+                  scores[token] = score * scale;
+                  maximum = std::max(maximum, scores[token]);
+                }
+                double denominator = sink_mode != 0 ? std::exp(sink_logit - maximum) : 0.0;
+                for (int token = first_token; token < total_length; ++token) {
+                  scores[token] = std::exp(scores[token] - maximum);
+                  denominator += scores[token];
+                }
+                for (int channel = 0; channel < head_size; ++channel) {
+                  double weighted_value = 0.0;
+                  for (int token = first_token; token < total_length; ++token) {
+                    weighted_value += scores[token] * value[cache_offset + token * head_size + channel];
+                  }
+                  EXPECT_NEAR(output[query_offset + channel], weighted_value / denominator, 2e-5);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// head_sink and smooth_softmax use the flash kernels; they must agree with the reference softmax path for
+// prefill with a past cache and for single-token decode.
+TEST(GroupQueryAttentionTest, FlashAttention_HeadSinkMatchesNaive_CPU) {
+  constexpr int num_heads = 6;
+  constexpr int kv_num_heads = 2;
+  constexpr int head_size = 16;
+  constexpr int past_length = 150;
+  constexpr int capacity = 160;
+  constexpr int hidden_size = num_heads * head_size;
+  constexpr int kv_hidden_size = kv_num_heads * head_size;
+  std::mt19937 random(11);
+  std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+  auto random_vector = [&](size_t size, float magnitude) {
+    std::vector<float> data(size);
+    for (auto& element : data) element = magnitude * distribution(random);
+    return data;
+  };
+  const std::vector<float> past_key = random_vector(static_cast<size_t>(kv_num_heads) * capacity * head_size, 2.0f);
+  const std::vector<float> past_value = random_vector(past_key.size(), 1.0f);
+  const std::vector<float> head_sink = random_vector(num_heads, 3.0f);
+
+  for (int sequence_length : {1, 7}) {
+    const std::vector<float> query = random_vector(static_cast<size_t>(sequence_length) * hidden_size, 2.0f);
+    const std::vector<float> key = random_vector(static_cast<size_t>(sequence_length) * kv_hidden_size, 2.0f);
+    const std::vector<float> value = random_vector(key.size(), 1.0f);
+    for (bool use_head_sink : {true, false}) {
+      for (int local_window_size : {-1, 40}) {
+        auto run = [&](const char* disable_flash) {
+          ScopedEnvironmentVariables scoped_env_vars{EnvVarMap{{"ORT_GQA_DISABLE_FLASH_ATTENTION", disable_flash}}};
+          OpTester tester("GroupQueryAttention", 1, onnxruntime::kMSDomain);
+          tester.AddAttribute<int64_t>("num_heads", num_heads);
+          tester.AddAttribute<int64_t>("kv_num_heads", kv_num_heads);
+          tester.AddAttribute<int64_t>("local_window_size", local_window_size);
+          tester.AddAttribute<int64_t>("smooth_softmax", use_head_sink ? 0 : 1);
+          tester.AddInput<float>("query", {1, sequence_length, hidden_size}, query);
+          tester.AddInput<float>("key", {1, sequence_length, kv_hidden_size}, key);
+          tester.AddInput<float>("value", {1, sequence_length, kv_hidden_size}, value);
+          tester.AddInput<float>("past_key", {1, kv_num_heads, capacity, head_size}, past_key);
+          tester.AddInput<float>("past_value", {1, kv_num_heads, capacity, head_size}, past_value);
+          tester.AddInput<int32_t>("seqlens_k", {1}, {past_length + sequence_length - 1});
+          tester.AddInput<int32_t>("total_sequence_length", {1}, {past_length + sequence_length});
+          tester.AddOptionalInputEdge<float>();    // cos_cache
+          tester.AddOptionalInputEdge<float>();    // sin_cache
+          tester.AddOptionalInputEdge<int64_t>();  // position_ids
+          tester.AddOptionalInputEdge<float>();    // attention_bias
+          if (use_head_sink) {
+            tester.AddInput<float>("head_sink", {num_heads}, head_sink);
+          }
+          tester.AddOutput<float>("output", {1, sequence_length, hidden_size},
+                                  std::vector<float>(query.size(), 0.0f));
+          tester.AddOutput<float>("present_key", {1, kv_num_heads, capacity, head_size},
+                                  std::vector<float>(past_key.size(), 0.0f));
+          tester.AddOutput<float>("present_value", {1, kv_num_heads, capacity, head_size},
+                                  std::vector<float>(past_value.size(), 0.0f));
+          std::vector<float> output;
+          tester.SetCustomOutputVerifier([&output](const std::vector<OrtValue>& fetches, const std::string&) {
+            const Tensor& tensor = fetches[0].Get<Tensor>();
+            output.assign(tensor.Data<float>(), tensor.Data<float>() + tensor.Shape().Size());
+          });
+          std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+          execution_providers.push_back(DefaultCpuExecutionProvider());
+          tester.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+          return output;
+        };
+        SCOPED_TRACE(testing::Message() << "sequence_length=" << sequence_length << " head_sink=" << use_head_sink
+                                        << " window=" << local_window_size);
+        const std::vector<float> flash = run("0");
+        const std::vector<float> naive = run("1");
+        ASSERT_EQ(flash.size(), query.size());
+        ASSERT_EQ(naive.size(), query.size());
+        for (size_t i = 0; i < flash.size(); ++i) {
+          EXPECT_NEAR(flash[i], naive[i], 1e-5f) << "output element " << i;
+        }
+      }
+    }
+  }
+}
+
 // Borrowed CPU caches must match an FP64 reference with sliding windows and unused cache capacity.
 TEST(GroupQueryAttentionTest, SharedKV_ReadOnlyCache_Reference_CPU) {
   constexpr int num_heads = 8;

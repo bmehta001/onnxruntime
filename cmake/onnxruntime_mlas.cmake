@@ -353,6 +353,7 @@ function(setup_mlas_source_for_windows)
     set_source_files_properties(${mlas_platform_srcs_avx2} PROPERTIES COMPILE_FLAGS "/arch:AVX2")
 
     set_source_files_properties(${MLAS_SRC_DIR}/layernorm_kernel_avx2.cpp PROPERTIES COMPILE_FLAGS "/arch:AVX2")
+    set_source_files_properties(${MLAS_SRC_DIR}/flashattn_gqa_kernel_avx2.cpp PROPERTIES COMPILE_FLAGS "/arch:AVX2")
 
     set(mlas_platform_srcs_avx512
       ${MLAS_SRC_DIR}/intrinsics/avx512/gelu_avx512f.cpp
@@ -371,6 +372,7 @@ function(setup_mlas_source_for_windows)
       ${mlas_platform_srcs_avx}
       ${mlas_platform_srcs_avx2}
       ${MLAS_SRC_DIR}/layernorm_kernel_avx2.cpp
+      ${MLAS_SRC_DIR}/flashattn_gqa_kernel_avx2.cpp
       ${MLAS_SRC_DIR}/rotary_embedding_kernel_avx2.h
       ${MLAS_SRC_DIR}/rotary_embedding_kernel_avx2.cpp
       ${MLAS_SRC_DIR}/rotary_embedding_kernel_avx2.cpp
@@ -1033,6 +1035,7 @@ else()
           ${MLAS_SRC_DIR}/qkv_quant_common.h
           ${MLAS_SRC_DIR}/qkv_quant_kernel_avx2.cpp
           ${MLAS_SRC_DIR}/layernorm_kernel_avx2.cpp
+          ${MLAS_SRC_DIR}/flashattn_gqa_kernel_avx2.cpp
         )
         if(CMAKE_CXX_COMPILER_VERSION GREATER_EQUAL 13.1 AND NOT(APPLE))
           set(mlas_platform_srcs_avx2

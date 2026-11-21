@@ -29,6 +29,18 @@ inline FlashAttentionBlockSizes GetFlashAttentionBlockSizes(int l2_cache_size, i
   return {std::min(kv_block_size, 2 * head_size), kv_block_size};
 }
 
+// KV chunk length for the single-token (decode) flash path. It depends only on the total
+// sequence length, never on the thread count, so decode results are thread-count invariant.
+// Aims for ~16 chunks (enough tasks to occupy the thread pool even with few KV heads) while
+// keeping each chunk long enough to amortize the per-chunk softmax and combine overhead.
+inline int GetDecodeKvChunkSize(int total_seqlen) {
+  constexpr int kTargetChunks = 16;
+  constexpr int kMinChunk = 64;
+  constexpr int kMaxChunk = 512;
+  const int chunk = ((total_seqlen + kTargetChunks - 1) / kTargetChunks + 15) / 16 * 16;
+  return std::max(1, std::min(total_seqlen, std::clamp(chunk, kMinChunk, kMaxChunk)));
+}
+
 template <typename T>
 Status Check_Q_K_V(const T* query, const T* key, const T* value, const int num_heads, const int kv_num_heads,
                    int& batch_size, int& sequence_length, int& kv_sequence_length,

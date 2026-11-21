@@ -778,6 +778,39 @@ typedef void(MLASCALL MLAS_LAYERNORM_F16_KERNEL)(
     bool Simplified
 );
 
+//
+// Single-token GroupQueryAttention decode GEMVs for a group of query heads that
+// share one K/V head. Each K/V row is streamed once for the whole group.
+// Query and Key/Value rows are contiguous with a stride of HeadSize elements.
+//
+// QK: Scores[g * ScoresStride + t] = Scale * dot(Query[g], Key[t]).
+//
+typedef void(MLASCALL MLAS_GQA_DECODE_QK_KERNEL)(
+    const float* Query,
+    size_t GroupSize,
+    const float* Key,
+    size_t RowCount,
+    size_t HeadSize,
+    float Scale,
+    float* Scores,
+    size_t ScoresStride
+);
+
+//
+// SV: Output[g * OutputStride + h] = sum_t Probs[g * ProbsStride + t] * Value[t][h],
+// accumulated in increasing t order. Output is overwritten.
+//
+typedef void(MLASCALL MLAS_GQA_DECODE_SV_KERNEL)(
+    const float* Probs,
+    size_t ProbsStride,
+    size_t GroupSize,
+    const float* Value,
+    size_t RowCount,
+    size_t HeadSize,
+    float* Output,
+    size_t OutputStride
+);
+
 typedef
 void
 (MLASCALL MLAS_QLINEAR_BINARY_OP_S8_KERNEL)(
@@ -1529,6 +1562,11 @@ MlasReorderOutputNchwBlock16Avx512F(
     MLAS_LAYERNORM_F32_KERNEL MlasLayerNormKernelAvx2;
     MLAS_LAYERNORM_F16_KERNEL MlasLayerNormKernelF16Avx2;
 #endif
+
+#if defined(MLAS_TARGET_AMD64)
+    MLAS_GQA_DECODE_QK_KERNEL MlasGQADecodeQKKernelAvx2;
+    MLAS_GQA_DECODE_SV_KERNEL MlasGQADecodeSVKernelAvx2;
+#endif
 }
 
 //
@@ -1985,6 +2023,8 @@ MLAS_COMPUTE_TANH_FP16_KERNEL* TanhFP16KernelRoutine = nullptr;
     MLAS_CAST_F32_TO_F16_KERNEL* CastF32ToF16Kernel;
     MLAS_LAYERNORM_F32_KERNEL* LayerNormF32Kernel{nullptr};
     MLAS_LAYERNORM_F16_KERNEL* LayerNormF16Kernel{nullptr};
+    MLAS_GQA_DECODE_QK_KERNEL* GQADecodeQKKernel{nullptr};
+    MLAS_GQA_DECODE_SV_KERNEL* GQADecodeSVKernel{nullptr};
 
     const MLAS_ROPE_DISPATCH* RopeDispatch{nullptr};
     const MLAS_HGEMM_DISPATCH* HGemmDispatch{nullptr};
