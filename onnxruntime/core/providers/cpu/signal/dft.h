@@ -1,8 +1,11 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#pragma once
+
 #include "core/common/common.h"
 #include "core/framework/op_kernel.h"
+#include "core/providers/cpu/signal/fft.h"
 
 namespace onnxruntime {
 
@@ -11,6 +14,7 @@ class DFT final : public OpKernel {
   bool is_onesided_ = true;
   int64_t axis_ = 0;
   bool is_inverse_ = false;
+  mutable signal::fft::PlanCache plan_cache_;
 
  public:
   explicit DFT(const OpKernelInfo& info) : OpKernel(info) {
@@ -27,6 +31,7 @@ class DFT final : public OpKernel {
 
 class STFT final : public OpKernel {
   bool is_onesided_ = true;
+  mutable signal::fft::PlanCache plan_cache_;
 
  public:
   explicit STFT(const OpKernelInfo& info) : OpKernel(info) {
