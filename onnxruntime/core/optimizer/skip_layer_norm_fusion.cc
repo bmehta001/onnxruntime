@@ -25,7 +25,74 @@ static bool IsSupportedDataType(const Node& node) {
   return true;
 }
 
-static bool CheckFirstAdd(Node& add, ProviderType providertype) {
+static bool HasRank(const NodeArg& arg, int rank) {
+  const TensorShapeProto* shape = arg.Shape();
+  return shape != nullptr && shape->dim_size() == rank;
+}
+
+static bool HasRankAtMostOne(const NodeArg& arg) {
+  const TensorShapeProto* shape = arg.Shape();
+  return shape != nullptr && shape->dim_size() <= 1;
+}
+
+// Returns true if `arg` is computed from `source` through a chain of single-data-input ops that keep every dimension
+// except the last one unchanged for inputs of rank >= 1:
+//   - MatMul with a 2D second input,
+//   - Add/Sub/Mul/Div and BiasGelu whose other input has rank <= 1,
+//   - unary elementwise activations.
+// None of these ops can raise the rank above max(rank, 1), so when `source` and `arg` both have rank 3 the
+// leading dimensions of `arg` provably equal those of `source`, even if they are unnamed in shape inference
+// (e.g. the FFN residual in transformer exports with dynamic batch/sequence dims).
+static bool HasSameLeadingDimsAs(const Graph& graph, const NodeArg* arg, const NodeArg* source) {
+  constexpr int kMaxChainLength = 16;
+  for (int i = 0; i < kMaxChainLength; ++i) {
+    if (arg == source) {
+      return true;
+    }
+
+    const Node* node = graph.GetProducerNode(arg->Name());
+    if (node == nullptr) {
+      return false;
+    }
+
+    const auto& inputs = node->InputDefs();
+    const NodeArg* next = nullptr;
+    if (graph_utils::IsSupportedOptypeVersionAndDomain(*node, "MatMul", {1, 9, 13})) {
+      if (HasRank(*inputs[1], 2)) {
+        next = inputs[0];
+      }
+    } else if (graph_utils::IsSupportedOptypeVersionAndDomain(*node, "Add", {7, 13, 14}) ||
+               graph_utils::IsSupportedOptypeVersionAndDomain(*node, "Sub", {7, 13, 14}) ||
+               graph_utils::IsSupportedOptypeVersionAndDomain(*node, "Mul", {7, 13, 14}) ||
+               graph_utils::IsSupportedOptypeVersionAndDomain(*node, "Div", {7, 13, 14})) {
+      if (HasRankAtMostOne(*inputs[1])) {
+        next = inputs[0];
+      } else if (HasRankAtMostOne(*inputs[0])) {
+        next = inputs[1];
+      }
+    } else if (graph_utils::IsSupportedOptypeVersionAndDomain(*node, "BiasGelu", {1}, kMSDomain)) {
+      if (HasRankAtMostOne(*inputs[1])) {
+        next = inputs[0];
+      }
+    } else if (graph_utils::IsSupportedOptypeVersionAndDomain(*node, "Gelu", {1}, kMSDomain) ||
+               graph_utils::IsSupportedOptypeVersionAndDomain(*node, "Gelu", {20}) ||
+               graph_utils::IsSupportedOptypeVersionAndDomain(*node, "Relu", {6, 13, 14}) ||
+               graph_utils::IsSupportedOptypeVersionAndDomain(*node, "Tanh", {6, 13}) ||
+               graph_utils::IsSupportedOptypeVersionAndDomain(*node, "Sigmoid", {6, 13}) ||
+               graph_utils::IsSupportedOptypeVersionAndDomain(*node, "Erf", {9, 13})) {
+      next = inputs[0];
+    }
+
+    if (next == nullptr) {
+      return false;
+    }
+    arg = next;
+  }
+
+  return false;
+}
+
+static bool CheckFirstAdd(const Graph& graph, Node& add, ProviderType providertype) {
   if (providertype != add.GetExecutionProviderType() ||
       !IsSupportedDataType(add) ||
       add.GetOutputEdgesCount() != 1) {
@@ -58,7 +125,24 @@ static bool CheckFirstAdd(Node& add, ProviderType providertype) {
       }
     }
   }
-  return is_valid_input;
+  if (is_valid_input) {
+    return true;
+  }
+
+  // Dynamic-shape exports usually leave batch/sequence dims unnamed after MatMul/Reshape, so they cannot be compared
+  // above. The SkipLayerNormalization kernel does not support broadcasting the batch dim of its first input, so only
+  // fuse when the hidden dims are known and equal and one input is provably derived from the other with the same
+  // leading dims.
+  const auto& hidden1 = add_input1_shape->dim(2);
+  const auto& hidden2 = add_input2_shape->dim(2);
+  if (!utils::HasDimValue(hidden1) || !utils::HasDimValue(hidden2) ||
+      hidden1.dim_value() != hidden2.dim_value()) {
+    return false;
+  }
+
+  const NodeArg* input1 = add.InputDefs()[0];
+  const NodeArg* input2 = add.InputDefs()[1];
+  return HasSameLeadingDimsAs(graph, input1, input2) || HasSameLeadingDimsAs(graph, input2, input1);
 }
 
 // Add2 is the 2nd add of the to be fused sub-graph
@@ -210,7 +294,7 @@ Status SkipLayerNormFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
       p_add1 = const_cast<Node*>(&edges[0]->GetNode());
       p_add2 = const_cast<Node*>(&edges[1]->GetNode());
 
-      if (CheckFirstAdd(*p_add1, ln_node.GetExecutionProviderType()) &&
+      if (CheckFirstAdd(graph, *p_add1, ln_node.GetExecutionProviderType()) &&
           CheckSecondAdd(graph, *p_add2, ln_node.GetExecutionProviderType()) &&
           !graph.NodeProducesGraphOutput(*p_add1) &&
           !graph.NodeProducesGraphOutput(*p_add2)) {
@@ -227,7 +311,7 @@ Status SkipLayerNormFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
         p_add1 = const_cast<Node*>(&edges[0]->GetNode());
         p_add2 = const_cast<Node*>(&edges[1]->GetNode());
 
-        if (CheckFirstAdd(*p_add1, ln_node.GetExecutionProviderType()) &&
+        if (CheckFirstAdd(graph, *p_add1, ln_node.GetExecutionProviderType()) &&
             CheckSecondAdd(graph, *p_add2, ln_node.GetExecutionProviderType()) &&
             !graph.NodeProducesGraphOutput(*p_add1) &&
             !graph.NodeProducesGraphOutput(*p_add2)) {
@@ -243,7 +327,7 @@ Status SkipLayerNormFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
                                 edges, logger)) {
         p_add1 = const_cast<Node*>(&edges[0]->GetNode());
 
-        if (CheckFirstAdd(*p_add1, ln_node.GetExecutionProviderType()) &&
+        if (CheckFirstAdd(graph, *p_add1, ln_node.GetExecutionProviderType()) &&
             !graph.NodeProducesGraphOutput(*p_add1)) {
           matched_format = Format::Format3;
         }

@@ -1702,6 +1702,125 @@ TEST_F(GraphTransformationTests, SkipLayerNormFusion_3DGamma_NoFusion) {
                                         TransformerLevel::Level2, 1, nullptr, post_graph_checker));
 }
 
+// Builds Add(y, x) -> LayerNormalization, where y = Add(b2, MatMul(Relu(Add(MatMul(x, W1), b1)), W2)) is the
+// transformer FFN branch. When `residual_from_input` is set, the residual Add uses a separate graph input of the same
+// static shape as x instead of x itself, so the leading dims of the two Add inputs are not provably equal.
+static void BuildDynamicShapeFfnSkipLayerNorm(ModelTestBuilder& builder, const std::vector<int64_t>& input_shape,
+                                              bool residual_from_input) {
+  constexpr int64_t hidden_size = 4;
+  constexpr int64_t inner_size = 8;
+  auto* x = builder.MakeInput<float>(std::optional<std::vector<int64_t>>{input_shape});
+  auto* w1 = builder.MakeInitializer<float>({hidden_size, inner_size}, -1.0f, 1.0f);
+  auto* b1 = builder.MakeInitializer<float>({inner_size}, -1.0f, 1.0f);
+  auto* w2 = builder.MakeInitializer<float>({inner_size, hidden_size}, -1.0f, 1.0f);
+  auto* b2 = builder.MakeInitializer<float>({hidden_size}, -1.0f, 1.0f);
+  auto* gamma = builder.MakeInitializer<float>({hidden_size}, -1.0f, 1.0f);
+  auto* beta = builder.MakeInitializer<float>({hidden_size}, -0.5f, 0.5f);
+
+  auto* mm1_out = builder.MakeIntermediate();
+  auto* bias1_out = builder.MakeIntermediate();
+  auto* relu_out = builder.MakeIntermediate();
+  auto* mm2_out = builder.MakeIntermediate();
+  auto* bias2_out = builder.MakeIntermediate();
+  auto* residual_out = builder.MakeIntermediate();
+  auto* output = builder.MakeOutput();
+
+  builder.AddNode("MatMul", {x, w1}, {mm1_out});
+  builder.AddNode("Add", {mm1_out, b1}, {bias1_out});
+  builder.AddNode("Relu", {bias1_out}, {relu_out});
+  builder.AddNode("MatMul", {relu_out, w2}, {mm2_out});
+  builder.AddNode("Add", {b2, mm2_out}, {bias2_out});
+  NodeArg* residual = residual_from_input
+                          ? builder.MakeInput<float>(std::optional<std::vector<int64_t>>{input_shape})
+                          : x;
+  builder.AddNode("Add", {bias2_out, residual}, {residual_out});
+  builder.AddNode("LayerNormalization", {residual_out, gamma, beta}, {output})
+      .AddAttribute("axis", static_cast<int64_t>(-1));
+}
+
+static Status CheckSkipLayerNormFused(Graph& graph, bool expect_fused) {
+  auto op_to_count = CountOpsInGraph(graph);
+  TEST_RETURN_IF_NOT(op_to_count["com.microsoft.SkipLayerNormalization"] == (expect_fused ? 1 : 0));
+  TEST_RETURN_IF_NOT(op_to_count["LayerNormalization"] == (expect_fused ? 0 : 1));
+  TEST_RETURN_IF_NOT(op_to_count["Add"] == (expect_fused ? 2 : 3));
+  return Status::OK();
+}
+
+// Dynamic-shape exports leave batch/sequence dims unnamed after MatMul, but the FFN residual is provably the same
+// shape as its input, so it can still be fused.
+TEST_F(GraphTransformationTests, SkipLayerNormFusion_DynamicShape_DerivedResidual) {
+  for (const auto& input_shape : std::vector<std::vector<int64_t>>{{-1, -1, 4}, {2, -1, 4}}) {
+    auto build_test_case = [&input_shape](ModelTestBuilder& builder) {
+      BuildDynamicShapeFfnSkipLayerNorm(builder, input_shape, /*residual_from_input*/ false);
+    };
+    auto post_graph_checker = [](Graph& graph) { return CheckSkipLayerNormFused(graph, true); };
+    ASSERT_STATUS_OK(TestGraphTransformer(build_test_case, 17, *logger_, std::make_unique<SkipLayerNormFusion>(),
+                                          TransformerLevel::Level2, 1, nullptr, post_graph_checker));
+  }
+}
+
+// The residual comes from an unrelated input with unknown leading dims. The Add may broadcast the batch dim, which
+// SkipLayerNormalization does not support, so it must not be fused.
+TEST_F(GraphTransformationTests, SkipLayerNormFusion_DynamicShape_UnrelatedResidual_NoFusion) {
+  for (const auto& input_shape : std::vector<std::vector<int64_t>>{{-1, -1, 4}, {1, -1, 4}}) {
+    auto build_test_case = [&input_shape](ModelTestBuilder& builder) {
+      BuildDynamicShapeFfnSkipLayerNorm(builder, input_shape, /*residual_from_input*/ true);
+    };
+    auto post_graph_checker = [](Graph& graph) { return CheckSkipLayerNormFused(graph, false); };
+    ASSERT_STATUS_OK(TestGraphTransformer(build_test_case, 17, *logger_, std::make_unique<SkipLayerNormFusion>(),
+                                          TransformerLevel::Level2, 1, nullptr, post_graph_checker));
+  }
+}
+
+// The derivation chain must be shape preserving. Here the residual branch adds a rank-3 tensor with unknown leading
+// dims, which may broadcast the batch dim, or the hidden size of the input is unknown.
+TEST_F(GraphTransformationTests, SkipLayerNormFusion_DynamicShape_UnprovableChain_NoFusion) {
+  auto build_broadcast_chain = [](ModelTestBuilder& builder) {
+    constexpr int64_t hidden_size = 4;
+    auto* x = builder.MakeInput<float>(std::optional<std::vector<int64_t>>{{-1, -1, hidden_size}});
+    auto* other = builder.MakeInput<float>(std::optional<std::vector<int64_t>>{{-1, -1, hidden_size}});
+    auto* w = builder.MakeInitializer<float>({hidden_size, hidden_size}, -1.0f, 1.0f);
+    auto* gamma = builder.MakeInitializer<float>({hidden_size}, -1.0f, 1.0f);
+    auto* beta = builder.MakeInitializer<float>({hidden_size}, -0.5f, 0.5f);
+    auto* mm_out = builder.MakeIntermediate();
+    auto* add_other_out = builder.MakeIntermediate();
+    auto* residual_out = builder.MakeIntermediate();
+    auto* output = builder.MakeOutput();
+    builder.AddNode("MatMul", {x, w}, {mm_out});
+    builder.AddNode("Add", {mm_out, other}, {add_other_out});
+    builder.AddNode("Add", {add_other_out, x}, {residual_out});
+    builder.AddNode("LayerNormalization", {residual_out, gamma, beta}, {output})
+        .AddAttribute("axis", static_cast<int64_t>(-1));
+  };
+
+  auto build_unknown_hidden = [](ModelTestBuilder& builder) {
+    constexpr int64_t hidden_size = 4;
+    auto* x = builder.MakeInput<float>(std::optional<std::vector<int64_t>>{{-1, -1, -1}});
+    auto* w = builder.MakeInitializer<float>({hidden_size, hidden_size}, -1.0f, 1.0f);
+    auto* gamma = builder.MakeInitializer<float>({hidden_size}, -1.0f, 1.0f);
+    auto* beta = builder.MakeInitializer<float>({hidden_size}, -0.5f, 0.5f);
+    auto* mm_out = builder.MakeIntermediate();
+    auto* residual_out = builder.MakeIntermediate();
+    auto* output = builder.MakeOutput();
+    builder.AddNode("MatMul", {x, w}, {mm_out});
+    builder.AddNode("Add", {mm_out, x}, {residual_out});
+    builder.AddNode("LayerNormalization", {residual_out, gamma, beta}, {output})
+        .AddAttribute("axis", static_cast<int64_t>(-1));
+  };
+
+  auto post_graph_checker = [](Graph& graph) {
+    auto op_to_count = CountOpsInGraph(graph);
+    TEST_RETURN_IF_NOT(op_to_count["com.microsoft.SkipLayerNormalization"] == 0);
+    TEST_RETURN_IF_NOT(op_to_count["LayerNormalization"] == 1);
+    return Status::OK();
+  };
+
+  ASSERT_STATUS_OK(TestGraphTransformer(build_broadcast_chain, 17, *logger_, std::make_unique<SkipLayerNormFusion>(),
+                                        TransformerLevel::Level2, 1, nullptr, post_graph_checker));
+  ASSERT_STATUS_OK(TestGraphTransformer(build_unknown_hidden, 17, *logger_, std::make_unique<SkipLayerNormFusion>(),
+                                        TransformerLevel::Level2, 1, nullptr, post_graph_checker));
+}
+
 TEST_F(GraphTransformationTests, GroupQueryAttentionFusionTest) {
   TestGQAFusion(
       MODEL_FOLDER "fusion/gqa_fusion_quantized_simple.onnx", 1, 0, logger_.get(),
