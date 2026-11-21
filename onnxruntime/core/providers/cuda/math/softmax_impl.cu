@@ -258,12 +258,12 @@ Status dispatch_strided_softmax_forward(SoftmaxComputeStreamT stream, output_t* 
   return CUDA_CALL(cudaGetLastError());
 }
 
-#define SPECIALIZED_STRIDED_SOFTMAX_IMPL(input_t, output_t, acc_t)                                  \
-  template Status dispatch_strided_softmax_forward<input_t, output_t, acc_t, false>(              \
-      SoftmaxComputeStreamT stream, output_t * dst, const input_t* src, int64_t outer,            \
-      int64_t axis_dim, int64_t inner);                                                           \
-  template Status dispatch_strided_softmax_forward<input_t, output_t, acc_t, true>(               \
-      SoftmaxComputeStreamT stream, output_t * dst, const input_t* src, int64_t outer,            \
+#define SPECIALIZED_STRIDED_SOFTMAX_IMPL(input_t, output_t, acc_t)                     \
+  template Status dispatch_strided_softmax_forward<input_t, output_t, acc_t, false>(   \
+      SoftmaxComputeStreamT stream, output_t * dst, const input_t* src, int64_t outer, \
+      int64_t axis_dim, int64_t inner);                                                \
+  template Status dispatch_strided_softmax_forward<input_t, output_t, acc_t, true>(    \
+      SoftmaxComputeStreamT stream, output_t * dst, const input_t* src, int64_t outer, \
       int64_t axis_dim, int64_t inner);
 
 SPECIALIZED_STRIDED_SOFTMAX_IMPL(float, float, float)
