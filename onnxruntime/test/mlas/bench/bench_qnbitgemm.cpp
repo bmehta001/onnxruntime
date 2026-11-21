@@ -213,10 +213,12 @@ static void QNBit2BitRealisticShapesArgs(benchmark::Benchmark* b) {
 BENCHMARK(QNBITGEMM<float, 2>)->Apply(QNBit2BitRealisticShapesArgs)->UseRealTime();
 
 // This test gets benchmark arguments from environment variables.
-template <typename AType, size_t BlkBitWidth>
+// ORT_QNBITGEMM_BITS selects the weight bit width (2, 4 or 8, default 4).
+template <typename AType>
 void QNBITGEMM_ENV(benchmark::State& state) {
   using onnxruntime::ParseEnvironmentVariableWithDefault;
 
+  const auto BlkBitWidth = ParseEnvironmentVariableWithDefault<size_t>("ORT_QNBITGEMM_BITS", 4);
   const auto BlkLen = ParseEnvironmentVariableWithDefault<size_t>("ORT_QNBITGEMM_BLKLEN", 32);
   const auto M = ParseEnvironmentVariableWithDefault<size_t>("ORT_QNBITGEMM_M", 1);
   const auto N = ParseEnvironmentVariableWithDefault<size_t>("ORT_QNBITGEMM_N", 4096);
@@ -227,9 +229,17 @@ void QNBITGEMM_ENV(benchmark::State& state) {
   const auto ComputeType = ParseEnvironmentVariableWithDefault<int32_t>("ORT_QNBITGEMM_COMPUTE_TYPE",
                                                                         static_cast<int32_t>(SQNBIT_CompFp32));
 
-  RunQNBitGemmBenchmark<AType, BlkBitWidth>(BlkLen, M, N, K, Threads, Symmetric, HasBias,
-                                            static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(ComputeType),
-                                            state);
+  const auto compute_type = static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(ComputeType);
+  if (BlkBitWidth == 2) {
+    RunQNBitGemmBenchmark<AType, 2>(BlkLen, M, N, K, Threads, Symmetric, HasBias, compute_type, state);
+  } else if (BlkBitWidth == 4) {
+    RunQNBitGemmBenchmark<AType, 4>(BlkLen, M, N, K, Threads, Symmetric, HasBias, compute_type, state);
+  } else if (BlkBitWidth == 8) {
+    RunQNBitGemmBenchmark<AType, 8>(BlkLen, M, N, K, Threads, Symmetric, HasBias, compute_type, state);
+  } else {
+    state.SkipWithError("ORT_QNBITGEMM_BITS must be 2, 4 or 8.");
+    return;
+  }
 
   std::ostringstream s;
   s << "BlkBitWidth:" << BlkBitWidth << "/BlkLen:" << BlkLen
@@ -239,4 +249,4 @@ void QNBITGEMM_ENV(benchmark::State& state) {
   state.SetLabel(s.str());
 }
 
-BENCHMARK(QNBITGEMM_ENV<float, 4>)->UseRealTime();
+BENCHMARK(QNBITGEMM_ENV<float>)->UseRealTime();
