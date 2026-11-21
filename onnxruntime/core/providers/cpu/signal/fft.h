@@ -325,9 +325,14 @@ class ComplexFftPlan {
         case 5:
           Pass5<kForward>(pass.ido, pass.l1, in, out, tw);
           break;
+        case 7:
+          PassOdd<kForward, 7>(7, pass.ido, pass.l1, in, out, tw, radix_roots_.data() + pass.roots_offset);
+          break;
+        case 11:
+          PassOdd<kForward, 11>(11, pass.ido, pass.l1, in, out, tw, radix_roots_.data() + pass.roots_offset);
+          break;
         default:
-          PassGeneric<kForward>(pass.radix, pass.ido, pass.l1, in, out, tw,
-                                radix_roots_.data() + pass.roots_offset);
+          PassOdd<kForward, 0>(pass.radix, pass.ido, pass.l1, in, out, tw, radix_roots_.data() + pass.roots_offset);
           break;
       }
       std::swap(in, out);
@@ -491,10 +496,12 @@ class ComplexFftPlan {
     }
   }
 
-  // Odd radix p > 5. `roots` holds exp(-2*pi*i*j/p) for j in [0, p).
-  template <bool kForward, typename V>
-  static void PassGeneric(size_t radix, size_t ido, size_t l1, const Complex<V>* in, Complex<V>* out,
-                          const Complex<T>* tw, const Complex<T>* roots) {
+  // Odd radix p > 5. `roots` holds exp(-2*pi*i*j/p) for j in [0, p). A non-zero kRadix fixes p at compile time so
+  // the butterfly is fully unrolled.
+  template <bool kForward, size_t kRadix, typename V>
+  static void PassOdd(size_t runtime_radix, size_t ido, size_t l1, const Complex<V>* in, Complex<V>* out,
+                      const Complex<T>* tw, const Complex<T>* roots) {
+    const size_t radix = kRadix != 0 ? kRadix : runtime_radix;
     const size_t half = radix / 2;
     for (size_t k = 0; k < l1; ++k) {
       const Complex<V>* src = in + ido * radix * k;

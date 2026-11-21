@@ -1069,7 +1069,7 @@ static void TestDFTLengthsAgainstReference(int since_version, const vector<int64
 
 // Lengths whose factors are 2, 3, 4, 5 and larger odd primes handled by the mixed-radix passes.
 TEST(SignalOpsTest, DFT20_Float_mixed_radix_lengths) {
-  TestDFTLengthsAgainstReference<float>(kOpsetVersion20, {1, 2, 3, 5, 6, 12, 15, 30, 45, 49, 60, 77, 400, 480});
+  TestDFTLengthsAgainstReference<float>(kOpsetVersion20, {1, 2, 3, 5, 6, 12, 15, 30, 45, 49, 60, 77, 121, 343, 400, 480, 1331});
 }
 
 TEST(SignalOpsTest, DFT20_Double_mixed_radix_lengths) {
@@ -1148,7 +1148,7 @@ TEST(SignalOpsTest, DFT20_Float_batched_signals_match_single_signal) {
     bool inverse;
   };
   constexpr Mode kModes[] = {{false, true, false}, {false, false, false}, {true, false, false}, {true, false, true}, {false, false, true}, {true, true, true}};
-  for (int64_t n : {7, 97, 400, 401}) {
+  for (int64_t n : {7, 77, 97, 400, 401}) {
     for (const Mode& m : kModes) {
       const bool irfft = m.onesided && m.inverse;
       const int64_t in_len = irfft ? n / 2 + 1 : n;
