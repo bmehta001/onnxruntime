@@ -35,6 +35,7 @@ Abstract:
 
 #include "sqnbitgemm_m1_sym_kernel_avx2_int8_blklen32.h"
 #include "sqnbitgemm_m1_sym_kernel_avx2_int8_blklen64.h"
+#include "sqnbitgemm_m1_kernel_avx2_int8_q8.h"
 
 void
 MlasCastF16ToF32KernelAvx2(const unsigned short* src_fp16, float* dst_fp32, size_t size)
@@ -634,6 +635,15 @@ SQ8BitGemmKernel_BlkSum_CompInt8_avx2(
     const float* /*QuantBBlkSum2*/
 )
 {
+    if constexpr (!vnni) {
+        if (BlkLen >= 32 && CountM == 1) {
+            MlasQ8Int8GemmM1KernelAvx2(
+                BlkLen, QuantA, QuantAScale, QuantBData, QuantBScale, C, CountN, BlockCountK, Bias, ABlockSum, QuantBBlkSum
+            );
+            return CountM;
+        }
+    }
+
     if (BlkLen == 16) {
         MlasQ8Int8GemmKernelBlkLen16Avx2<vnni>(
             QuantA,
