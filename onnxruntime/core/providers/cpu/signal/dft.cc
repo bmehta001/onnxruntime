@@ -247,26 +247,75 @@ void RunDft(const DftSetup<T>& s, const U* const* xs, size_t x_stride, const T* 
   }
 }
 
+// Work buffers for the ranges of one parallel loop, allocated up front in one block from the kernel's temp-space
+// allocator. A running range claims a free slot with an atomic flag and releases it when done; at most one range per
+// thread runs at a time, so `slots` = degree of parallelism suffices. Allocating a fresh large buffer in every range
+// made the workers fault in new pages concurrently, and a mutex-based pool parked threads under contention; both kept
+// the lane path from scaling.
+template <typename V>
+class LaneBufferSlots {
+ public:
+  LaneBufferSlots(const AllocatorPtr& allocator, size_t size, size_t slots)
+      : size_(size),
+        slots_(slots),
+        memory_(IAllocator::MakeUniquePtr<Complex<V>>(allocator, SafeInt<size_t>(size) * slots)),
+        busy_(std::make_unique<std::atomic<bool>[]>(slots)) {}
+  ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(LaneBufferSlots);
+
+  // Returns a free slot index, or slots_ if none is free; the caller then uses its own buffer.
+  size_t Acquire() {
+    for (size_t i = 0; i < slots_; ++i) {
+      bool expected = false;
+      if (!busy_[i].load(std::memory_order_relaxed) &&
+          busy_[i].compare_exchange_strong(expected, true, std::memory_order_acquire)) {
+        return i;
+      }
+    }
+    return slots_;
+  }
+
+  Complex<V>* Buffer(size_t slot) const { return memory_.get() + slot * size_; }
+  size_t Slots() const { return slots_; }
+  void Release(size_t slot) { busy_[slot].store(false, std::memory_order_release); }
+
+ private:
+  size_t size_;
+  size_t slots_;
+  IAllocatorUniquePtr<Complex<V>> memory_;
+  std::unique_ptr<std::atomic<bool>[]> busy_;
+};
+
 // Runs `count` independent transforms on the operator thread pool. get_signal(i) returns the input and output base
 // pointers of signal i. Signals are transformed in groups of kLanes using the SIMD lane type. A partial last group
 // fills its unused lanes with a copy of its first signal and discards their results, so every signal takes the same
-// code path regardless of its position, the batch size or the thread count. Each worker allocates its buffers once.
+// code path regardless of its position, the batch size or the thread count.
 template <typename T, typename U, typename GetSignal>
-void RunDfts(concurrency::ThreadPool* thread_pool, const DftSetup<T>& setup, size_t count, size_t x_stride,
-             const T* window, size_t y_step, const GetSignal& get_signal) {
+void RunDfts(concurrency::ThreadPool* thread_pool, AllocatorPtr allocator, const DftSetup<T>& setup, size_t count,
+             size_t x_stride, const T* window, size_t y_step, const GetSignal& get_signal) {
   using Vec = typename VectorLane<T>::type;
   constexpr size_t kLanes = LaneTraits<Vec>::kLanes;
   const size_t groups = (count + kLanes - 1) / kLanes;
   const size_t memory_size = setup.buffer_size + setup.scratch_size;
+  const auto parallelism = static_cast<size_t>(concurrency::ThreadPool::DegreeOfParallelism(thread_pool));
+  LaneBufferSlots<Vec> buffers(allocator, memory_size, std::max<size_t>(1, std::min(groups, parallelism)));
 
-  // A group costs about as much compute as one scalar transform but moves kLanes signals.
+  // Charge a group the work of kLanes transforms. SIMD lanes speed up the arithmetic, but a group still takes several
+  // times longer than one scalar transform; a lower estimate makes the pool use too few threads for small lengths.
   const double work = static_cast<double>(std::max(setup.n, setup.scratch_size));
   const TensorOpCost cost{static_cast<double>(kLanes * setup.samples * sizeof(U)),
                           static_cast<double>(kLanes * setup.output_size * 2 * sizeof(T)),
-                          5.0 * work * std::max(1.0, std::log2(work))};
+                          static_cast<double>(kLanes) * 5.0 * work * std::max(1.0, std::log2(work))};
   concurrency::ThreadPool::TryParallelFor(
       thread_pool, static_cast<std::ptrdiff_t>(groups), cost, [&](std::ptrdiff_t first, std::ptrdiff_t last) {
-        auto memory = std::make_unique<Complex<Vec>[]>(memory_size);
+        const size_t slot = buffers.Acquire();
+        std::unique_ptr<Complex<Vec>[]> fallback;
+        Complex<Vec>* memory = nullptr;
+        if (slot < buffers.Slots()) {
+          memory = buffers.Buffer(slot);
+        } else {
+          fallback = std::make_unique<Complex<Vec>[]>(memory_size);
+          memory = fallback.get();
+        }
         const U* xs[kLanes];
         T* ys[kLanes];
         for (std::ptrdiff_t g = first; g < last; ++g) {
@@ -280,8 +329,10 @@ void RunDfts(concurrency::ThreadPool* thread_pool, const DftSetup<T>& setup, siz
               ys[l] = nullptr;
             }
           }
-          RunDft<T, U, Vec>(setup, xs, x_stride, window, ys, y_step, memory.get(), memory.get() + setup.buffer_size,
-                            active);
+          RunDft<T, U, Vec>(setup, xs, x_stride, window, ys, y_step, memory, memory + setup.buffer_size, active);
+        }
+        if (slot < buffers.Slots()) {
+          buffers.Release(slot);
         }
       });
 }
@@ -315,7 +366,9 @@ Status DiscreteFourierTransform(OpKernelContext* ctx, PlanCache& cache, const Te
 
   const U* X_data = reinterpret_cast<const U*>(X->Data<T>());
   T* Y_data = Y->MutableData<T>();
-  RunDfts<T, U>(ctx->GetOperatorThreadPool(), setup, total_dfts, x_stride, nullptr, y_step,
+  AllocatorPtr allocator;
+  ORT_RETURN_IF_ERROR(ctx->GetTempSpaceAllocator(&allocator));
+  RunDfts<T, U>(ctx->GetOperatorThreadPool(), std::move(allocator), setup, total_dfts, x_stride, nullptr, y_step,
                 [&](size_t i, const U*& x, T*& y) {
                   size_t x_offset = 0;
                   size_t y_offset = 0;
@@ -463,8 +516,10 @@ Status ShortTimeFourierTransform(OpKernelContext* ctx, PlanCache& cache, bool is
 
   // Every (batch, frame) pair is an independent transform. signal_data is U*, so one increment advances one input
   // sample, including both lanes for complex input.
-  RunDfts<T, U>(ctx->GetOperatorThreadPool(), setup, narrow<size_t>(batch_size) * frames, 1, window_data,
-                output_components, [&](size_t i, const U*& x, T*& y) {
+  AllocatorPtr allocator;
+  ORT_RETURN_IF_ERROR(ctx->GetTempSpaceAllocator(&allocator));
+  RunDfts<T, U>(ctx->GetOperatorThreadPool(), std::move(allocator), setup, narrow<size_t>(batch_size) * frames, 1,
+                window_data, output_components, [&](size_t i, const U*& x, T*& y) {
                   const size_t batch_idx = i / frames;
                   const size_t frame_idx = i % frames;
                   x = signal_data + batch_idx * batch_stride + frame_idx * step;
