@@ -78,6 +78,10 @@ Status GatherCopyData(const Tensor* indices_tensor, const uint8_t* src_base, uin
   // Iterate a [first, last) range of the flattened M x N gather positions incrementally, as per-element division
   // and an out-of-line memcpy dominate when block_size is small.
   auto copy_range = [&](ptrdiff_t first, ptrdiff_t last, auto copy_block) {
+    // TryParallelFor may invoke fn(0, 0) for an empty range; avoid dividing by N == 0.
+    if (first >= last) {
+      return;
+    }
     int64_t batch = static_cast<int64_t>(first / N);
     int64_t i = static_cast<int64_t>(first % N);
     const uint8_t* src_batch = src_base + batch * data_batch_bytes;

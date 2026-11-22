@@ -44,6 +44,18 @@ TYPED_TEST(GatherOpTest, Gather_axis0) {
   run_test(true);
 }
 
+TEST(GatherOpTest, Gather_empty_indices_no_thread_pool) {
+  // A single-threaded session has no intra-op pool, so the copy loop is invoked with an empty [0, 0) range.
+  OpTester test("Gather");
+  test.AddAttribute<int64_t>("axis", 0LL);
+  test.AddInput<float>("data", {2, 3, 4}, std::vector<float>(24, 1.0f));
+  test.AddInput<int64_t>("indices", {0}, {});
+  test.AddOutput<float>("output", {0, 3, 4}, {});
+  SessionOptions so;
+  so.intra_op_param.thread_pool_size = 1;
+  test.Run(so, OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, nullptr);
+}
+
 TYPED_TEST(GatherOpTest, Gather_negative_axis) {
   // To test for NNAPI EP, we need the indices to be initializers
   auto run_test = [](bool indices_is_initializer) {
