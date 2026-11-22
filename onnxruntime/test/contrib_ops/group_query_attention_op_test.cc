@@ -2842,8 +2842,100 @@ TEST(GroupQueryAttentionTest, FlashDecoding_GroupedHeads_Reference_CPU) {
   }
 }
 
-// head_sink and smooth_softmax use the flash kernels; they must agree with the reference softmax path for
-// prefill with a past cache and for single-token decode.
+// The MLAS prefill kernel must fold an attention sink into the softmax denominator for every query tile,
+// including tiles split across KV blocks and with a local window.
+TEST(GroupQueryAttentionTest, FlashAttention_PrefillSink_Reference_CPU) {
+  constexpr int num_heads = 4;
+  constexpr int kv_num_heads = 2;
+  constexpr int head_size = 16;
+  constexpr int sequence_length = 5;
+  constexpr int past_length = 20;
+  constexpr int total_length = past_length + sequence_length;
+  constexpr int cache_capacity = 32;
+  constexpr int q_block_size = 2;
+  constexpr int kv_block_size = 8;
+  constexpr int group_size = num_heads / kv_num_heads;
+  std::mt19937 random(5);
+  std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+  InlinedVector<float> query(num_heads * sequence_length * head_size);
+  InlinedVector<float> key(kv_num_heads * cache_capacity * head_size);
+  InlinedVector<float> value(key.size());
+  InlinedVector<float> sink(num_heads);
+  for (auto& element : query) element = 2.0f * distribution(random);
+  for (auto& element : key) element = 2.0f * distribution(random);
+  for (auto& element : value) element = distribution(random);
+  for (auto& element : sink) element = 3.0f * distribution(random);
+  const float scale = 1.0f / std::sqrt(static_cast<float>(head_size));
+
+  for (bool use_head_sink : {true, false}) {
+    for (int window_size : {-1, 10}) {
+      SCOPED_TRACE(testing::Message() << "head_sink=" << use_head_sink << " window=" << window_size);
+      InlinedVector<float> scratch(q_block_size * (2 + kv_block_size + head_size));
+      InlinedVector<float> output(sequence_length * num_heads * head_size, std::numeric_limits<float>::quiet_NaN());
+      MlasFlashAttentionGQAArgs args{};
+      args.batch_size = 1;
+      args.num_heads = num_heads;
+      args.kv_num_heads = kv_num_heads;
+      args.sequence_length = sequence_length;
+      args.total_seqlen = total_length;
+      args.head_size = head_size;
+      args.past_seqlen = past_length;
+      args.local_window_size = window_size;
+      args.seqlen_present_kv = cache_capacity;
+      args.q_block_size = q_block_size;
+      args.kv_block_size = kv_block_size;
+      args.scale = scale;
+      args.thread_count = 1;
+      args.buffer = scratch.data();
+      args.buffer_size_per_thread = scratch.size() * sizeof(float);
+      args.query = query.data();
+      args.q_batch_stride = query.size();
+      args.k_cache = key.data();
+      args.v_cache = value.data();
+      args.output = output.data();
+      args.head_sink = use_head_sink ? sink.data() : nullptr;
+      args.use_smooth_softmax = !use_head_sink;
+      MlasFlashAttentionGQA(&args, nullptr);
+
+      for (int head = 0; head < num_heads; ++head) {
+        const size_t cache_offset = static_cast<size_t>(head / group_size) * cache_capacity * head_size;
+        const double sink_logit = use_head_sink ? sink[head] : 0.0;
+        for (int row = 0; row < sequence_length; ++row) {
+          const size_t query_offset = (static_cast<size_t>(head) * sequence_length + row) * head_size;
+          const int causal_limit = past_length + row + 1;
+          const int first_token = (window_size >= 0 && causal_limit > window_size) ? causal_limit - window_size : 0;
+          InlinedVector<double> scores(total_length);
+          double maximum = sink_logit;
+          for (int token = first_token; token < causal_limit; ++token) {
+            double score = 0.0;
+            for (int channel = 0; channel < head_size; ++channel) {
+              score += static_cast<double>(query[query_offset + channel]) *
+                       key[cache_offset + token * head_size + channel];
+            }
+            scores[token] = score * scale;
+            maximum = std::max(maximum, scores[token]);
+          }
+          double denominator = std::exp(sink_logit - maximum);
+          for (int token = first_token; token < causal_limit; ++token) {
+            scores[token] = std::exp(scores[token] - maximum);
+            denominator += scores[token];
+          }
+          for (int channel = 0; channel < head_size; ++channel) {
+            double weighted_value = 0.0;
+            for (int token = first_token; token < causal_limit; ++token) {
+              weighted_value += scores[token] * value[cache_offset + token * head_size + channel];
+            }
+            const size_t output_offset = (static_cast<size_t>(row) * num_heads + head) * head_size + channel;
+            EXPECT_NEAR(output[output_offset], weighted_value / denominator, 2e-5);
+          }
+        }
+      }
+    }
+  }
+}
+
+// head_sink and smooth_softmax must give the same result whether the op selects the flash kernels (decode)
+// or the reference softmax path (prefill with a past cache).
 TEST(GroupQueryAttentionTest, FlashAttention_HeadSinkMatchesNaive_CPU) {
   constexpr int num_heads = 6;
   constexpr int kv_num_heads = 2;

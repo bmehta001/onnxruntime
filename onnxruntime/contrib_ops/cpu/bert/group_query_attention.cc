@@ -800,6 +800,8 @@ Status GroupQueryAttention<T>::Compute(OpKernelContext* context) const {
     // Non-quantized flash attention path (float only). Uses the tiled online-softmax
     // kernel to avoid materializing the full attention score matrix. Falls back to the
     // naive path when an unsupported feature is requested (softcap or QK output).
+    // Attention sinks (head_sink / smooth softmax) use the flash path only for decode;
+    // for short prefill the naive path is faster at small head sizes (e.g. gpt-oss).
     //
     // Prefill (sequence_length > 1) uses the tiled kernel; single-token decode
     // (sequence_length == 1 with total_sequence_length > 1) uses the dedicated GEMV
@@ -812,6 +814,7 @@ Status GroupQueryAttention<T>::Compute(OpKernelContext* context) const {
                              is_unidirectional_ &&
                              parameters.total_sequence_length > 1 &&
                              softcap_ == 0.0f &&
+                             (sequence_length == 1 || (!use_smooth_softmax_ && head_sink_data == nullptr)) &&
                              output_qk == nullptr &&
                              ((attention_present_key != nullptr && attention_present_value != nullptr) || read_only_cache);
       if (use_flash) {
