@@ -643,11 +643,20 @@ Status QMoECPU<T>::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr all
     return Status::OK();
   }
 
-  // If scales are prepacked, they are constant initializers.
-  if (input_idx == 3) {
-    return Status::OK();
-  }
-  if (input_idx == 6) {
+  // The scales follow their weights (input 2 -> 3, 5 -> 6) in PrePack order. When the QNBit packed
+  // buffer already holds them, claim the initializer so the session can release it once no other
+  // consumer needs it. Nothing is cached for it: the packed weight buffer (and its sharing hash)
+  // carries the scales.
+  if (input_idx == 3 || input_idx == 6) {
+    const QNBitPackedExperts& packed = (input_idx == 3) ? qnbit_fc1_ : qnbit_fc2_;
+    if (packed.packed_size_per_expert != 0 && packed.scales_in_packed) {
+      auto& shape_only = (input_idx == 3) ? fc1_scales_shape_only_ : fc2_scales_shape_only_;
+      shape_only.emplace(tensor.DataType(), tensor.Shape(), nullptr, tensor.Location());
+      is_packed = true;
+      if (prepacked_weights != nullptr) {
+        prepacked_weights->has_kernel_owned_packed_weights_ = true;
+      }
+    }
     return Status::OK();
   }
 
@@ -1149,14 +1158,28 @@ Status QMoECPU<T>::InitQNBitPacked(QNBitPackedExperts& packed, const QNBitEligib
   packed.scales_packed = MlasQNBitGemmScalesPacked(
       static_cast<size_t>(cols), static_cast<size_t>(expert_weight_bits_), static_cast<size_t>(block_size_),
       qnbit_compute_type_, packed.has_zero_point, &mlas_backend_kernel_selector_config_);
+  // CompInt8 copies the scales into the packed buffer (with the block sums) where the platform uses
+  // the block-sum kernels: every x64 CompInt8 kernel and 8-bit elsewhere. MlasQNBitGemmBatch then
+  // reads them from there and ignores QuantBScale. Elsewhere (e.g. the ARM64 NEON 4-bit CompInt8
+  // kernel) only a backend that reports MlasQNBitGemmScalesPacked folds them.
+  bool scales_in_packed = (qnbit_compute_type_ == SQNBIT_CompInt8);
+#if !defined(MLAS_TARGET_AMD64_IX86)
+  scales_in_packed = scales_in_packed && (expert_weight_bits_ == 8 || packed.scales_packed);
+#endif
+  packed.scales_in_packed = scales_in_packed || packed.scales_packed;
 
   if constexpr (std::is_same_v<T, MLFloat16>) {
-    // The MLAS kernels take fp32 scales; convert the constant fp16 scales once.
-    const size_t scales_count = static_cast<size_t>(num_experts * rows * (cols / block_size_));
-    packed.scales_fp32 = IAllocator::MakeUniquePtr<float>(alloc, scales_count, true);
-    MlasConvertHalfToFloatBuffer(eligibility.scales->template Data<MLFloat16>(), packed.scales_fp32.get(), scales_count);
+    // The MLAS kernels take fp32 scales; convert the constant fp16 scales once when they read them.
+    if (!packed.scales_in_packed) {
+      const size_t scales_count = static_cast<size_t>(num_experts * rows * (cols / block_size_));
+      packed.scales_fp32 = IAllocator::MakeUniquePtr<float>(alloc, scales_count, true);
+      MlasConvertHalfToFloatBuffer(eligibility.scales->template Data<MLFloat16>(), packed.scales_fp32.get(),
+                                   scales_count);
+    }
   } else {
     ORT_UNUSED_PARAMETER(num_experts);
+    ORT_UNUSED_PARAMETER(rows);
+    ORT_UNUSED_PARAMETER(alloc);
   }
   return Status::OK();
 }
@@ -1186,8 +1209,17 @@ Status QMoECPU<T>::PrePackQNBitExperts(const Tensor& tensor, int input_idx, Allo
   ORT_RETURN_IF_ERROR(InitQNBitPacked(packed, eligibility, num_experts, rows, cols, alloc));
 
   const float* scales_fp32 = nullptr;
+  IAllocatorUniquePtr<float> pack_scales_fp32;
   if constexpr (std::is_same_v<T, MLFloat16>) {
     scales_fp32 = packed.scales_fp32.get();
+    if (scales_fp32 == nullptr) {
+      // The kernels read the scales from the packed buffer, so convert them only for packing.
+      const size_t scales_count = static_cast<size_t>(eligibility.scales->Shape().Size());
+      pack_scales_fp32 = IAllocator::MakeUniquePtr<float>(alloc, scales_count, true);
+      MlasConvertHalfToFloatBuffer(eligibility.scales->template Data<MLFloat16>(), pack_scales_fp32.get(),
+                                   scales_count);
+      scales_fp32 = pack_scales_fp32.get();
+    }
   } else {
     scales_fp32 = eligibility.scales->template Data<float>();
   }
@@ -1211,10 +1243,7 @@ Status QMoECPU<T>::PrePackQNBitExperts(const Tensor& tensor, int input_idx, Allo
 
   // Same two-step sequence as MatMulNBits::PrePack: pack the quantized data, then (where the
   // platform folds them into B) finalize the scales / block sums with a nullptr QuantBData call.
-  bool finalize_scales = (qnbit_compute_type_ == SQNBIT_CompInt8);
-#if !defined(MLAS_TARGET_AMD64_IX86)
-  finalize_scales = finalize_scales && (nbits == 8 || packed.scales_packed);
-#endif
+  const bool finalize_scales = packed.scales_in_packed && qnbit_compute_type_ == SQNBIT_CompInt8;
 
   // Experts pack independently into disjoint regions, so spread them over a load-time pool
   // (the session pool is not reachable from PrePack; same approach as MatMulNBits::PrePack).
@@ -1290,10 +1319,10 @@ Status QMoECPU<T>::Compute(OpKernelContext* context) const {
         context->Input<Tensor>(0),
         context->Input<Tensor>(1),
         ((packed_fc1_ != nullptr) || (packed_fc1_lut_cache_ != nullptr) || (qnbit_fc1_.packed != nullptr)) ? nullptr : context->Input<Tensor>(2),
-        context->Input<Tensor>(3),
+        fc1_scales_shape_only_.has_value() ? &*fc1_scales_shape_only_ : context->Input<Tensor>(3),
         context->Input<Tensor>(4),
         ((packed_fc2_ != nullptr) || (packed_fc2_lut_cache_ != nullptr) || (qnbit_fc2_.packed != nullptr)) ? nullptr : context->Input<Tensor>(5),
-        context->Input<Tensor>(6),
+        fc2_scales_shape_only_.has_value() ? &*fc2_scales_shape_only_ : context->Input<Tensor>(6),
         context->Input<Tensor>(7),
         context->Input<Tensor>(8),
         context->Input<Tensor>(9),
@@ -1740,7 +1769,7 @@ Status QMoECPU<T>::ComputeCommon(OpKernelContext* context, const ComputeInputs& 
     qnbit_workspace = qnbit_workspace_ptr.get();
   }
   // fp32 [E, N, K/block] scales for the kernels: the scales input itself for T == float, the copy
-  // converted at PrePack for T == MLFloat16.
+  // converted at PrePack for T == MLFloat16. Unused (and possibly null) when scales_in_packed.
   const float* qnbit_fc1_scales = nullptr;
   const float* qnbit_fc2_scales = nullptr;
   if constexpr (std::is_same_v<T, MLFloat16>) {
@@ -1755,7 +1784,7 @@ Status QMoECPU<T>::ComputeCommon(OpKernelContext* context, const ComputeInputs& 
                             const float* A, size_t M, size_t N, size_t K,
                             const float* bias, float* C,
                             std::byte* gemm_workspace, concurrency::ThreadPool* gemm_tp) {
-    const float* scales = packed.scales_packed
+    const float* scales = packed.scales_in_packed
                               ? nullptr
                               : scales_base + static_cast<size_t>(expert_idx) * N * (K / qnbit_blk);
     const uint8_t* zero_points = packed.has_zero_point
@@ -1903,7 +1932,7 @@ Status QMoECPU<T>::ComputeCommon(OpKernelContext* context, const ComputeInputs& 
                                static_cast<size_t>(e) * packed.packed_size_per_expert;
           p.QuantBDataWorkspace = b;
           p.PackedQuantBData = b;
-          p.QuantBScale = packed.scales_packed ? nullptr : scales_base + static_cast<size_t>(e) * n * (k / qnbit_blk);
+          p.QuantBScale = packed.scales_in_packed ? nullptr : scales_base + static_cast<size_t>(e) * n * (k / qnbit_blk);
           p.QuantBZeroPoint = packed.has_zero_point ? zp_base + static_cast<size_t>(e * zp_expert_stride) : nullptr;
           if (is_fc1 ? has_fc1_bias : has_fc2_bias) {
             if constexpr (std::is_same_v<T, MLFloat16>) {
@@ -2051,7 +2080,8 @@ Status QMoECPU<T>::ComputeCommon(OpKernelContext* context, const ComputeInputs& 
 
       if (is_fc1_block_wise) {
         const int64_t fc1_blocks_per_row = fc1_scales_dims[2];
-        fc1_scales_ptr = fc1_scales_data + expert_idx * fc1_out_features * fc1_blocks_per_row;
+        // Null when the scales were released after QNBit packing (only the QNBit GEMM runs then).
+        fc1_scales_ptr = (fc1_scales_data == nullptr) ? nullptr : fc1_scales_data + expert_idx * fc1_out_features * fc1_blocks_per_row;
         fc1_zp_ptr = (fc1_zp_data == nullptr) ? nullptr : fc1_zp_data + expert_idx * fc1_zp_expert_stride;
       } else {
         fc1_scales_ptr = fc1_scales_data + expert_idx * fc1_out_features;
@@ -2312,7 +2342,7 @@ Status QMoECPU<T>::ComputeCommon(OpKernelContext* context, const ComputeInputs& 
 
       if (is_fc2_block_wise) {
         const int64_t fc2_blocks_per_row = fc2_scales_dims[2];
-        fc2_scales_ptr = fc2_scales_data + expert_idx * hidden_size * fc2_blocks_per_row;
+        fc2_scales_ptr = (fc2_scales_data == nullptr) ? nullptr : fc2_scales_data + expert_idx * hidden_size * fc2_blocks_per_row;
         fc2_zp_ptr = (fc2_zp_data == nullptr) ? nullptr : fc2_zp_data + expert_idx * fc2_zp_expert_stride;
       } else {
         fc2_scales_ptr = fc2_scales_data + expert_idx * hidden_size;

@@ -6074,9 +6074,11 @@ struct QMoEBlockWiseCase {
   int bits{4};
   bool with_zero_points{false};
   int accuracy_level{0};
-  // Expected number of pre-packed expert weights (0 or 2), or -1 to skip the check. The output
-  // check alone cannot tell the QNBit path from the dequantize fallback, so 8-bit cases (where the
-  // fallback never pre-packs) also assert this; the 4-bit fallback pre-packs too, so it cannot.
+  // Expected number of pre-packed inputs, or -1 to skip the check: the expert weights (0 or 2), plus
+  // their scales (2 more) when the int8 path folds them into the packed weights and the scales
+  // initializers are released. The output check alone cannot tell the QNBit path from the
+  // dequantize fallback, so 8-bit cases (where the fallback never pre-packs) also assert this; the
+  // 4-bit fallback pre-packs the weights too, so it cannot.
   int expected_prepacked{-1};
   // Intra-op threads, or 0 for the default pool. With at least as many active experts as threads
   // the kernel runs one expert per thread instead of batching them into one MLAS dispatch, so this
@@ -6332,15 +6334,19 @@ void RunQMoECpuBlockWiseSwiGLU(const QMoEBlockWiseCase& c, float tolerance,
     tester.Run(so, OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &eps, {}, &prepacked_session_1, &shared);
     ASSERT_EQ(shared, static_cast<size_t>(0));
   }
-  ASSERT_EQ(prepacked_session_1, tester.GetNumPrePackedWeightsShared());
-  // Both expert weights pre-pack on every platform (the legacy 4-bit path pre-packs too), so a
-  // count of 2 proves the sharing round trip below exercises real buffers.
-  ASSERT_EQ(prepacked_session_1, static_cast<size_t>(2));
+  // Both expert weights pre-pack on every platform (the legacy 4-bit path pre-packs too), so two
+  // shared buffers prove the sharing round trip below exercises real buffers. Scales released into
+  // the int8 packed weights count as pre-packed but are never cached, so they add 0 or 2.
+  ASSERT_EQ(tester.GetNumPrePackedWeightsShared(), static_cast<size_t>(2));
+  ASSERT_TRUE(prepacked_session_1 == 2 || prepacked_session_1 == 4) << prepacked_session_1;
+  if (c.expected_prepacked >= 0) {
+    ASSERT_EQ(prepacked_session_1, static_cast<size_t>(c.expected_prepacked));
+  }
   {
     auto eps = cpu_ep();
     tester.Run(so, OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &eps, {}, &prepacked_session_2, &shared);
     ASSERT_EQ(prepacked_session_1, prepacked_session_2);
-    ASSERT_EQ(shared, prepacked_session_2);
+    ASSERT_EQ(shared, static_cast<size_t>(2));
   }
 }
 }  // namespace
@@ -6384,9 +6390,23 @@ TEST(MoETest, QMoETest_CPU_Int4_BlockWise_SwiGLU_Fp16) {
   RunQMoECpuBlockWiseSwiGLU<MLFloat16>({5, 4, 128, 64, 32, 2, true}, 0.02f);
 }
 
-// 8-bit experts pre-pack only on the QNBit path, so the pre-pack count proves which path ran.
+// 8-bit experts pre-pack only on the QNBit path, so the pre-pack count proves which path ran. That
+// path uses int8 activations, which fold the scales into the packed weights, so the two scales
+// initializers are released (pre-packed) too.
 static int ExpectedInt8QNBitPrepacks(int block_size) {
-  return MlasIsQNBitGemmAvailable(8, static_cast<size_t>(block_size), SQNBIT_CompInt8) ? 2 : 0;
+  return MlasIsQNBitGemmAvailable(8, static_cast<size_t>(block_size), SQNBIT_CompInt8) ? 4 : 0;
+}
+
+// Expected pre-packed input count for a 4-bit block-wise int8-activation run: the two expert
+// weights, plus the two scales initializers on x64, where every CompInt8 kernel reads the scales
+// copy in the packed weights so the originals are released. -1 (unchecked) elsewhere: there it
+// depends on the backend (e.g. KleidiAI folds the scales, the NEON kernel reads the originals).
+static int ExpectedInt4Int8ActivationPrepacks() {
+#if defined(_M_AMD64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+  return MlasIsQNBitGemmAvailable(4, 32, SQNBIT_CompInt8) ? 4 : -1;
+#else
+  return -1;
+#endif
 }
 
 TEST(MoETest, QMoETest_CPU_Int8_BlockWise_SwiGLU) {
@@ -6409,7 +6429,31 @@ TEST(MoETest, QMoETest_CPU_Int8_BlockWise_SwiGLU_Int8Activations) {
 
 TEST(MoETest, QMoETest_CPU_Int4_BlockWise_SwiGLU_Int8Activations) {
   // accuracy_level=4 opts into int8 activations, as for MatMulNBits.
-  RunQMoECpuBlockWiseSwiGLU<float>({5, 4, 128, 64, 32, 2, true, 4, false, 4}, 0.05f);
+  QMoEBlockWiseCase c{5, 4, 128, 64, 32, 2, true, 4, false, 4};
+  c.expected_prepacked = ExpectedInt4Int8ActivationPrepacks();
+  RunQMoECpuBlockWiseSwiGLU<float>(c, 0.05f);
+}
+
+TEST(MoETest, QMoETest_CPU_Int4_BlockWise_SwiGLU_Fp16_Int8Activations) {
+  // fp16 scales are converted to fp32 only for packing when the int8 kernels read them from the
+  // packed weights; the scales initializers are then released.
+  QMoEBlockWiseCase c{5, 4, 128, 64, 32, 2, true, 4, false, 4};
+  c.expected_prepacked = ExpectedInt4Int8ActivationPrepacks();
+  RunQMoECpuBlockWiseSwiGLU<MLFloat16>(c, 0.05f);
+}
+
+TEST(MoETest, QMoETest_CPU_Int4_BlockWise_SwiGLU_ScalesReleasedOnlyForInt8) {
+  // The fp32-activation kernels read the original scales at compute time, so only the int8 path
+  // may release them (pre-pack count 4 instead of 2); both runs must still match the reference.
+  if (ExpectedInt4Int8ActivationPrepacks() < 0 || !MlasIsQNBitGemmAvailable(4, 32, SQNBIT_CompFp32)) {
+    GTEST_SKIP() << "scale release is only deterministic on x64 with both 4-bit QNBit compute types";
+  }
+  QMoEBlockWiseCase c{5, 4, 128, 64, 32, 2, true};
+  c.expected_prepacked = 2;
+  RunQMoECpuBlockWiseSwiGLU<float>(c, 0.01f);
+  c.min_accuracy_level = "4";
+  c.expected_prepacked = 4;
+  RunQMoECpuBlockWiseSwiGLU<float>(c, 0.05f);
 }
 
 TEST(MoETest, QMoETest_CPU_Int4_BlockWise_SwiGLU_AccuracyLevel4SelectsInt8) {
@@ -6518,8 +6562,9 @@ TEST(MoETest, QMoETest_CPU_Int4_BlockWise_SwiGLU_MinAccuracyLevelSessionOption) 
 }
 
 TEST(MoETest, QMoETest_CPU_Int4_BlockWise_SwiGLU_MinAccuracyLevelSharedPrePackedWeights) {
-  RunQMoECpuBlockWiseSwiGLU<float>({3, 4, 64, 64, 32, 2, true, 4, false, 0, -1, 0, "4"}, 0.05f,
-                                   /*share_prepacked_weights_across_sessions*/ true);
+  QMoEBlockWiseCase c{3, 4, 64, 64, 32, 2, true, 4, false, 0, -1, 0, "4"};
+  c.expected_prepacked = ExpectedInt4Int8ActivationPrepacks();
+  RunQMoECpuBlockWiseSwiGLU<float>(c, 0.05f, /*share_prepacked_weights_across_sessions*/ true);
 }
 
 TEST(MoETest, QMoETest_CPU_BlockWise_SwiGLU_InvalidMinAccuracyLevel) {

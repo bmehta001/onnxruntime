@@ -8,6 +8,7 @@
 #include "core/mlas/inc/mlas_q4.h"
 #include "core/mlas/inc/mlas_qnbit.h"
 #include "contrib_ops/cpu/moe/moe_base_cpu.h"
+#include <optional>
 #include <vector>
 
 namespace onnxruntime {
@@ -66,9 +67,12 @@ class QMoECPU final : public OpKernel, public MoEBaseCPU {
   struct QNBitPackedExperts {
     IAllocatorUniquePtr<void> packed;  // num_experts * packed_size_per_expert bytes
     size_t packed_size_per_expert{0};
-    IAllocatorUniquePtr<float> scales_fp32;  // fp32 copy of the [E, rows, cols/block_size] scales (T == MLFloat16 only)
-    bool scales_packed{false};               // scales are folded into `packed`; pass no QuantBScale at compute time
-    bool has_zero_point{false};              // packed with the constant zero points; pass the expert's slice at compute time
+    // fp32 copy of the [E, rows, cols/block_size] scales (T == MLFloat16 only, and only when the
+    // kernels read the scales at compute time, i.e. !scales_in_packed).
+    IAllocatorUniquePtr<float> scales_fp32;
+    bool scales_packed{false};     // MlasQNBitGemmScalesPacked: the backend folds the scales into `packed`
+    bool scales_in_packed{false};  // the kernels read the scales only from `packed`; pass no QuantBScale
+    bool has_zero_point{false};    // packed with the constant zero points; pass the expert's slice at compute time
   };
   // Result of QNBitGemmEligible. `ineligible_reason` is set only when a block-wise node misses the
   // path for a reason worth surfacing (row-wise scales and a disabled path leave it null).
@@ -113,6 +117,11 @@ class QMoECPU final : public OpKernel, public MoEBaseCPU {
   MLAS_QNBIT_GEMM_COMPUTE_TYPE qnbit_compute_type_{SQNBIT_CompFp32};
   QNBitPackedExperts qnbit_fc1_;
   QNBitPackedExperts qnbit_fc2_;
+  // Set when PrePack claimed the FC1/FC2 scales initializer because its values live only in the
+  // QNBit packed buffer, so the session can release it. The data-less tensor keeps the scales
+  // shape for input validation; its data must never be read.
+  std::optional<Tensor> fc1_scales_shape_only_;
+  std::optional<Tensor> fc2_scales_shape_only_;
 };
 
 }  // namespace contrib
