@@ -679,21 +679,26 @@ Status LayerNormImpl::ComputeWithoutContext(
   // Launch one normalization job per logical row in X. For each row we either:
   //  - use the generic NumPy-style broadcasting path, or
   //  - use the existing fast-path based on broadcast_param.
-  concurrency::ThreadPool::TryBatchParallelFor(
-      thread_pool, static_cast<int32_t>(params.num_rows),
-      [&](ptrdiff_t task_idx) {
-        if (params.use_generic_broadcast) {
-          ComputeJobGeneric(X_data, scale_data, bias_data, task_idx, params,
-                            scf, bif,
-                            epsilon, simplified, Y_data, mean_data, inv_std_dev_data);
-        } else {
-          ComputeJob(X_data, scale_data, bias_data, task_idx,
-                     params.norm_size, params.broadcast_param,
-                     scf, bif,
-                     epsilon, simplified, Y_data, mean_data, inv_std_dev_data, alloc);
+  // The per-row cost lets the thread pool run small inputs (e.g. per-head q/k norms during decode, a few rows of
+  // 128 elements) inline instead of dispatching a batch per thread for well under a microsecond of work each.
+  const double norm_size = static_cast<double>(params.norm_size);
+  const TensorOpCost row_cost{norm_size * sizeof(T) * 2, norm_size * sizeof(T), norm_size * 4};
+  concurrency::ThreadPool::TryParallelFor(
+      thread_pool, static_cast<std::ptrdiff_t>(params.num_rows), row_cost,
+      [&](std::ptrdiff_t first, std::ptrdiff_t last) {
+        for (std::ptrdiff_t task_idx = first; task_idx < last; ++task_idx) {
+          if (params.use_generic_broadcast) {
+            ComputeJobGeneric(X_data, scale_data, bias_data, task_idx, params,
+                              scf, bif,
+                              epsilon, simplified, Y_data, mean_data, inv_std_dev_data);
+          } else {
+            ComputeJob(X_data, scale_data, bias_data, task_idx,
+                       params.norm_size, params.broadcast_param,
+                       scf, bif,
+                       epsilon, simplified, Y_data, mean_data, inv_std_dev_data, alloc);
+          }
         }
-      },
-      0);
+      });
 
   return Status::OK();
 }
