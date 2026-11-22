@@ -889,6 +889,7 @@ struct GqaQuerySeqlensCase {
   std::optional<std::vector<int64_t>> query_seqlens_shape;
   std::optional<int> kv_sequence_length;  // length of the new key/value when it differs from S
   bool omit_present_outputs = false;      // leave present_key / present_value unconnected
+  bool omit_query_seqlens = false;        // leave input 16 unconnected; query_seqlens then only sets expectations
 };
 
 // Appends one right-padded query chunk to a past/present KV cache through query_seqlens (input 16) and
@@ -965,8 +966,10 @@ static void RunGQAQuerySeqlensTest(GqaTargetEp target_ep,
   tester.AddOptionalInputEdge<float>();    // v_scale
   tester.AddOptionalInputEdge<T>();        // q_norm_weight
   tester.AddOptionalInputEdge<T>();        // k_norm_weight
-  tester.AddInput<int32_t>("query_seqlens", test_case.query_seqlens_shape.value_or(std::vector<int64_t>{batch_size}),
-                           test_case.query_seqlens);
+  if (!test_case.omit_query_seqlens) {
+    tester.AddInput<int32_t>("query_seqlens", test_case.query_seqlens_shape.value_or(std::vector<int64_t>{batch_size}),
+                             test_case.query_seqlens);
+  }
 
   tester.AddOutput<T>("output", {batch_size, sequence_length, hidden_size},
                       std::vector<T>(static_cast<size_t>(batch_size) * sequence_length * hidden_size, T(0.0f)));
@@ -989,10 +992,12 @@ static void RunGQAQuerySeqlensTest(GqaTargetEp target_ep,
     for (int b = 0; b < batch_size; ++b) {
       for (int s = 0; s < valid_length[b]; ++s) {
         const float expected = static_cast<float>(past_length[b] + s + 2) / 2.0f;
+        // Long caches give outputs where one fp16/bf16 ulp exceeds 0.1, so allow a relative error too.
+        const float tolerance = std::max(0.1f, expected * 0.01f);
         for (int d = 0; d < hidden_size; ++d) {
           const float actual = static_cast<float>(output[(static_cast<size_t>(b) * sequence_length + s) * hidden_size + d]);
-          EXPECT_NEAR(actual, expected, 0.1f) << "batch=" << b << " row=" << s << " channel=" << d
-                                              << " past=" << past_length[b] << " valid=" << valid_length[b];
+          EXPECT_NEAR(actual, expected, tolerance) << "batch=" << b << " row=" << s << " channel=" << d
+                                                   << " past=" << past_length[b] << " valid=" << valid_length[b];
         }
       }
       // Rows [0, P + Q) of the cache are the past followed by the valid new rows; later rows are unspecified.
@@ -1116,6 +1121,50 @@ TEST(GroupQueryAttentionTest, QuerySeqlensBatchedChunks_CUDA) {
     mixed.seqlens_k = {7, 15};
     mixed.query_seqlens = {8, 8};
     RunGQAQuerySeqlensTest<MLFloat16>(GqaTargetEp::kCuda, mixed);
+  }
+}
+
+// A long cache with few heads makes flash attention split the KV sequence. Every split, including those past the
+// live keys, must write its accumulator rows, since the combine step reads them without prior initialization.
+TEST(GroupQueryAttentionTest, SplitKvLongCache_CUDA) {
+  if (!DefaultCudaExecutionProvider()) {
+    GTEST_SKIP() << "CUDA EP not available";
+  }
+  ScopedEnvironmentVariables scoped_env_vars{{
+      {"ORT_DISABLE_FLASH_ATTENTION", "0"},
+      {"ORT_ENABLE_CUDNN_FLASH_ATTENTION", "0"},
+      {"ORT_ENABLE_XQA", "0"},
+  }};
+  constexpr int capacity = 2048;
+  // Fixed-length decode and chunks (no query_seqlens), including a short live length in a long buffer.
+  for (const auto& [sequence_length, seqlens_k] :
+       std::vector<std::pair<int, int32_t>>{{1, 63}, {1, 1500}, {1, 2047}, {4, 1203}}) {
+    SCOPED_TRACE(MakeString("fixed S=", sequence_length, " seqlens_k=", seqlens_k));
+    GqaQuerySeqlensCase test_case;
+    test_case.sequence_length = sequence_length;
+    test_case.cache_capacity = capacity;
+    test_case.total_sequence_length = capacity;
+    test_case.seqlens_k = {seqlens_k};
+    test_case.query_seqlens = {sequence_length};
+    test_case.omit_query_seqlens = true;
+    RunGQAQuerySeqlensTest<MLFloat16>(GqaTargetEp::kCuda, test_case);
+  }
+  // Right-padded chunks and idle entries through query_seqlens.
+  struct PaddedCase {
+    int sequence_length;
+    std::vector<int32_t> seqlens_k;
+    std::vector<int32_t> query_seqlens;
+  };
+  for (const auto& padded : std::vector<PaddedCase>{{8, {1502}, {3}}, {8, {300, 1999}, {1, 8}}, {1, {1700, 900}, {0, 1}}}) {
+    SCOPED_TRACE(MakeString("padded S=", padded.sequence_length, " batch=", padded.seqlens_k.size()));
+    GqaQuerySeqlensCase test_case;
+    test_case.batch_size = static_cast<int>(padded.seqlens_k.size());
+    test_case.sequence_length = padded.sequence_length;
+    test_case.cache_capacity = capacity;
+    test_case.total_sequence_length = capacity;
+    test_case.seqlens_k = padded.seqlens_k;
+    test_case.query_seqlens = padded.query_seqlens;
+    RunGQAQuerySeqlensTest<MLFloat16>(GqaTargetEp::kCuda, test_case);
   }
 }
 
