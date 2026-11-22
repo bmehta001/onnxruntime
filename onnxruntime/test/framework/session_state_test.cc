@@ -1320,6 +1320,43 @@ class PrePackingTestOpKernel : public OpKernel {
   IAllocatorUniquePtr<void> weight_packed_;
 };
 
+// Packs a buffer whose second value is the node name length, so consumers of the same initializer produce
+// identical packings only when their node names have the same length.
+class NodeDependentPrePackingTestOpKernel : public OpKernel {
+ public:
+  NodeDependentPrePackingTestOpKernel(const OpKernelInfo& info) : OpKernel(info) {}
+  Status Compute(OpKernelContext* /*context*/) const override { return Status::OK(); }
+
+  Status UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>& prepacked_buffers,
+                                   gsl::span<const size_t> /*prepacked_buffer_sizes*/,
+                                   int /*input_idx*/,
+                                   /*out*/ bool& used_shared_buffers) override {
+    weight_packed_ = std::move(prepacked_buffers[0]);
+    used_shared_buffers = true;
+    return Status::OK();
+  }
+
+  Status PrePack(const Tensor& tensor, int /*input_idx*/, AllocatorPtr alloc,
+                 /*out*/ bool& is_packed, /*out*/ PrePackedWeights* prepacked_weights) override {
+    constexpr size_t weight_packed_len = sizeof(float) * 2;
+    auto packed = IAllocator::MakeUniquePtr<void>(alloc, weight_packed_len, true);
+    float* data = static_cast<float*>(packed.get());
+    data[0] = tensor.Data<float>()[0];
+    data[1] = static_cast<float>(Node().Name().size());
+    if (prepacked_weights != nullptr) {
+      prepacked_weights->buffers_.push_back(std::move(packed));
+      prepacked_weights->buffer_sizes_.push_back(weight_packed_len);
+    }
+    is_packed = true;
+    return Status::OK();
+  }
+
+  const float* PackedData() const { return static_cast<const float*>(weight_packed_.get()); }
+
+ private:
+  BufferUniquePtr weight_packed_;
+};
+
 class BrokenPrePackingTestOpKernel : public OpKernel {
  public:
   BrokenPrePackingTestOpKernel(const OpKernelInfo& info) : OpKernel(info) {}
@@ -1722,6 +1759,11 @@ void RegisterPrePackingTestSchemaOnce() {
         .Input(0, "Input_0", "input 0", "tensor(float)")
         .Input(1, "Input_1", "input 1", "tensor(float)")
         .Output(0, "output_0", "docstr for output_0.", "tensor(float)");
+    ONNX_OPERATOR_SCHEMA(NodeDependentPrePackingTest)
+        .SetDoc("Faking a node whose packed weights depend on the node")
+        .Input(0, "Input_0", "input 0", "tensor(float)")
+        .Input(1, "Input_1", "input 1", "tensor(float)")
+        .Output(0, "output_0", "docstr for output_0.", "tensor(float)");
 #if !defined(ORT_NO_EXCEPTIONS)
     ONNX_OPERATOR_SCHEMA(ThrowingPrePackingTest)
         .SetDoc("Faking a throwing node for parallel PrePack")
@@ -1898,6 +1940,19 @@ class SessionStateTestSharedInitalizersWithPrePacking : public ::testing::Test {
                          [state = blocking_prepack_test_state](
                              FuncManager&, const OpKernelInfo& info, std::unique_ptr<OpKernel>& out) -> Status {
                            out = std::make_unique<BlockingPrePackingTestOpKernel>(info, state);
+                           return Status::OK();
+                         })));
+
+    auto node_dependent_kernel_def = KernelDefBuilder()
+                                         .SetName("NodeDependentPrePackingTest")
+                                         .Provider(kCpuExecutionProvider)
+                                         .SinceVersion(1)
+                                         .Build();
+
+    ASSERT_STATUS_OK(kernel_registry->Register(
+        KernelCreateInfo(std::move(node_dependent_kernel_def),
+                         [](FuncManager&, const OpKernelInfo& info, std::unique_ptr<OpKernel>& out) -> Status {
+                           out = std::make_unique<NodeDependentPrePackingTestOpKernel>(info);
                            return Status::OK();
                          })));
 
@@ -2258,6 +2313,68 @@ TEST_F(SessionStateTestSharedInitalizersWithPrePacking, OuterParallelPrepackIsDi
                                                       kernel_registry_manager));
   EXPECT_FALSE(parallel_prepack_test_state->OuterParallelismObserved());
   EXPECT_EQ(parallel_prepack_test_state->PrePackCallCount(), 4U);
+}
+
+// Consumers of the same initializer reuse one pre-packed buffer when they pack identically, and keep separate
+// buffers when their packings differ.
+TEST_F(SessionStateTestSharedInitalizersWithPrePacking, SameInitializerConsumersShareOnlyIdenticalPackings) {
+  for (const char* parallel : {"0", "1"}) {
+    SCOPED_TRACE(parallel);
+    SessionOptions sess_options;
+    ASSERT_STATUS_OK(sess_options.config_options.AddConfigEntry(kOrtSessionOptionsEnableParallelPrepack, parallel));
+
+    Model model("same_initializer_consumers", false, ModelMetaData(), PathString(),
+                IOnnxRuntimeOpSchemaRegistryList(), domain_to_version,
+                std::vector<ONNX_NAMESPACE::FunctionProto>(),
+                DefaultLoggingManager().DefaultLogger());
+    Graph& graph = model.MainGraph();
+    TypeProto type;
+    type.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT);
+    type.mutable_tensor_type()->mutable_shape()->add_dim()->set_dim_value(1);
+    NodeArg& weight = graph.GetOrCreateNodeArg("shared_weight", &type);
+    for (const std::string node_name : {"a", "b", "cc"}) {
+      NodeArg& input = graph.GetOrCreateNodeArg(node_name + "_input", &type);
+      NodeArg& output = graph.GetOrCreateNodeArg(node_name + "_output", &type);
+      graph.AddNode(node_name, "NodeDependentPrePackingTest", "", {&input, &weight}, {&output});
+    }
+    ONNX_NAMESPACE::TensorProto tensor;
+    tensor.add_dims(1);
+    tensor.add_float_data(3.0f);
+    tensor.set_data_type(TensorProto_DataType_FLOAT);
+    tensor.set_name("shared_weight");
+    graph.AddInitializedTensor(tensor);
+    ASSERT_STATUS_OK(graph.Resolve());
+    PlaceAllNodesToCPUEP(graph);
+
+    SessionState session_state(graph,
+                               execution_providers,
+                               tp.get(),
+                               nullptr, /*inter_op_thread_pool*/
+                               dtm,
+                               edlm,
+                               DefaultLoggingManager().DefaultLogger(),
+                               profiler,
+                               sess_options);
+    ASSERT_STATUS_OK(session_state.FinalizeSessionState(std::basic_string<PATH_CHAR_TYPE>(),
+                                                        kernel_registry_manager));
+
+    EXPECT_EQ(session_state.GetNumberOfPrepacksCounter(), 3U);
+    EXPECT_EQ(graph.GetPrepacked().GetKeyToBlob().size(), 2U);
+
+    std::unordered_map<std::string, const float*> packed_by_node;
+    for (const auto& node : graph.Nodes()) {
+      const auto* kernel =
+          static_cast<const NodeDependentPrePackingTestOpKernel*>(session_state.GetKernel(node.Index()));
+      ASSERT_NE(kernel->PackedData(), nullptr);
+      packed_by_node[node.Name()] = kernel->PackedData();
+    }
+    EXPECT_EQ(packed_by_node["a"], packed_by_node["b"]);
+    EXPECT_NE(packed_by_node["a"], packed_by_node["cc"]);
+    EXPECT_EQ(packed_by_node["a"][0], 3.0f);
+    EXPECT_EQ(packed_by_node["a"][1], 1.0f);
+    EXPECT_EQ(packed_by_node["cc"][0], 3.0f);
+    EXPECT_EQ(packed_by_node["cc"][1], 2.0f);
+  }
 }
 
 // Pre-packing enabled + no shared initializers, however, we put all the pre-packs

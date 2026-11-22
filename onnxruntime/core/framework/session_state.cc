@@ -495,6 +495,12 @@ static std::string GenerateKeyForPrepackedWeightsMap(const std::string& op_type,
   return ss_1.str();
 }
 
+// Name-based keys never collide with content-hash keys, which contain only digits after the '+'.
+static std::string GenerateNameKeyForPrepackedWeightsMap(const std::string& op_type,
+                                                         const std::string& initializer_name) {
+  return op_type + "+name:" + initializer_name;
+}
+
 Status SessionState::PrepackConstantInitializedTensors(
     InlinedHashMap<std::string, size_t>& constant_initializers_use_count,
     const std::unordered_map<std::string, const OrtValue*>& initializers_to_share_map) {
@@ -720,22 +726,45 @@ Status SessionState::PrepackConstantInitializedTensors(
                                                     is_packed,
                                                     &weights_to_be_filled_in));
 
+                // Some kernels (non-CPU related kernels) do not share their pre-packed results
+                // even though they set is_packed = true so we leave it up to them.
+                // We can change their behavior if we wish do so in a separate PR
+                const bool has_packed_buffers = is_packed && !weights_to_be_filled_in.buffers_.empty();
+
+                // Content-hash keys are only required to match blobs loaded from disk or to save blobs to disk.
+                // Otherwise key by initializer name: hashing every packed byte is a significant part of session
+                // creation for multi-GB models. Computed before taking the bookkeeping lock so it doesn't
+                // serialize parallel PrePack.
+                const bool use_content_key = prepacked_for_graph->IsSaveModeOn() ||
+                                             prepacked_for_graph->HasWeightsFromDisk();
+                std::string prepacked_weights_container_key;
+                if (has_packed_buffers) {
+                  prepacked_weights_container_key =
+                      use_content_key ? GenerateKeyForPrepackedWeightsMap(node.OpType(), weights_to_be_filled_in)
+                                      : GenerateNameKeyForPrepackedWeightsMap(node.OpType(), input_name);
+                }
+
                 if (guard_bookkeeping) {
                   bookkeeping_lock.lock();
                 }
 
-                // Some kernels (non-CPU related kernels) do not share their pre-packed results
-                // even though they set is_packed = true so we leave it up to them.
-                // We can change their behavior if we wish do so in a separate PR
-                if (is_packed && !weights_to_be_filled_in.buffers_.empty()) {
-                  const auto& op_type = node.OpType();
-                  const std::string prepacked_weights_container_key = GenerateKeyForPrepackedWeightsMap(
-                      op_type,
-                      weights_to_be_filled_in);
-
-                  // See if we can use pre-packed data from disk
+                if (has_packed_buffers) {
+                  // See if we can use pre-packed data from disk or from another consumer of the same initializer
                   const auto* weights_to_use = prepacked_for_graph->GetPrepackedWeights(
                       prepacked_weights_container_key);
+
+                  bool validated = false;
+                  if (weights_to_use != nullptr && !use_content_key) {
+                    if (weights_to_use->IsEquivalentTo(weights_to_be_filled_in)) {
+                      validated = true;
+                    } else {
+                      // Another consumer of this initializer produced a different packing (e.g. different node
+                      // attributes). Fall back to the content key so the packings are kept apart.
+                      prepacked_weights_container_key =
+                          GenerateKeyForPrepackedWeightsMap(node.OpType(), weights_to_be_filled_in);
+                      weights_to_use = prepacked_for_graph->GetPrepackedWeights(prepacked_weights_container_key);
+                    }
+                  }
 
                   if (weights_to_use == nullptr) {
                     // In this case pre-packed container owns the data
@@ -743,7 +772,7 @@ Status SessionState::PrepackConstantInitializedTensors(
                                                                  std::move(weights_to_be_filled_in));
                     weights_to_use = prepacked_for_graph->GetPrepackedWeights(prepacked_weights_container_key);
                     assert(weights_to_use != nullptr);
-                  } else {
+                  } else if (!validated) {
                     ORT_RETURN_IF_ERROR(ValidatePrePackedWeights(
                         weights_to_be_filled_in, *weights_to_use, node.Name()));
                   }

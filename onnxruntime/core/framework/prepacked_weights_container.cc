@@ -66,6 +66,7 @@ void PrepackedWeightsForGraph::InsertPrepackedWeights(const std::string& key, Pr
   // We may have duplicate entries mapped from disk if the same weight is pre-packed from subgraphs and
   // up the tree by the same kernel with the same result. The map prevents this from happening.
   key_to_blobs_.emplace(key, std::move(packed_weight));
+  has_weights_from_disk_ = true;
 }
 
 void PrepackedWeightsForGraph::WritePackedMaybeForSave(const std::string& weight_name, const std::string& key,

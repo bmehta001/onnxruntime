@@ -135,6 +135,12 @@ class PrepackedWeightsForGraph {
     save_mode_on_ = value;
   }
 
+  // True if InsertPrepackedWeights() was called, i.e. pre-packed blobs were loaded from disk. Those blobs are
+  // keyed by a hash of their contents, so lookups against them require computing the same content hash.
+  bool HasWeightsFromDisk() const noexcept {
+    return has_weights_from_disk_;
+  }
+
   const KeysPerWeight* GetKeysForWeightForSaving(const std::string& weight_name) const {
     auto hit = weight_prepacks_for_saving_.find(weight_name);
     if (hit != weight_prepacks_for_saving_.end()) {
@@ -170,6 +176,7 @@ class PrepackedWeightsForGraph {
  private:
   PrepackedKeyToBlobMap& key_to_blobs_;
   bool save_mode_on_;
+  bool has_weights_from_disk_ = false;
   WeightToPrePacksMap weight_prepacks_for_saving_;
 };
 
