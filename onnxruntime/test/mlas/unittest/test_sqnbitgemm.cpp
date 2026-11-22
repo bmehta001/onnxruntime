@@ -366,19 +366,19 @@ class MlasSQNBitGemmTest : public MlasTestBase {
   }
 
   /**
-   * @brief Test CompInt8 with an explicitly built quantized B that uses the full 0..15 range of
+   * @brief Test with an explicitly built quantized B that uses the full 0..15 range of
    *        4-bit weights and, more importantly, of zero points.
    *
    * Test() above derives the zero points from random input data with MlasQuantizeBlockwise(),
    * which yields values very close to 8 for every block. That leaves the asymmetric
    * (per-element zero point subtraction) kernels effectively unverified. In particular the AVX2
-   * M=1 CompInt8 kernels subtract the zero point inside the dot product instead of applying it
-   * through the precomputed block sums, so they are the only ones sensitive to the actual zero
-   * point value.
+   * M=1 kernels subtract the zero point inside the dot product instead of applying it through
+   * the precomputed block sums, so they are the only ones sensitive to the actual zero point value.
    */
-  void TestFullRangeZeroPointCompInt8(size_t M, size_t N, size_t K, bool WithThreadpool, bool WithBias) {
-    if (!MlasIsQNBitGemmAvailable(BlkBitWidth, BlkLen, SQNBIT_CompInt8)) {
-      GTEST_SKIP() << "CompInt8 is not available for this block size.";
+  void TestFullRangeZeroPoint(size_t M, size_t N, size_t K, MLAS_QNBIT_GEMM_COMPUTE_TYPE ComputeType,
+                              bool WithThreadpool, bool WithBias) {
+    if (!MlasIsQNBitGemmAvailable(BlkBitWidth, BlkLen, ComputeType)) {
+      GTEST_SKIP() << ComputeTypeName(ComputeType) << " is not available for this block size.";
     }
 
     static_assert(BlkBitWidth == 4, "only implemented for 4-bit quantized B");
@@ -428,7 +428,7 @@ class MlasSQNBitGemmTest : public MlasTestBase {
 
     void* Workspace = nullptr;
     if (const auto WorkspaceSize = MlasQNBitGemmBatchWorkspaceSize(M, N, K, 1, BlkBitWidth, BlkLen,
-                                                                   /* has zero point */ true, SQNBIT_CompInt8, nullptr);
+                                                                   /* has zero point */ true, ComputeType, nullptr);
         WorkspaceSize > 0) {
       Workspace = BufferWorkspace.GetBuffer(WorkspaceSize);
     }
@@ -436,10 +436,10 @@ class MlasSQNBitGemmTest : public MlasTestBase {
     void* PackedQuantBDataWorkspace = nullptr;
     if (const auto PackedQuantBDataSize = MlasQNBitGemmPackQuantBDataSize(N, K, BlkBitWidth, BlkLen,
                                                                           /* has zero point */ true,
-                                                                          SQNBIT_CompInt8, nullptr);
+                                                                          ComputeType, nullptr);
         PackedQuantBDataSize > 0) {
       PackedQuantBDataWorkspace = BufferPackedQuantBData.GetBuffer(PackedQuantBDataSize);
-      MlasQNBitGemmPackQuantBData(N, K, BlkBitWidth, BlkLen, SQNBIT_CompInt8, QuantBData, PackedQuantBDataWorkspace,
+      MlasQNBitGemmPackQuantBData(N, K, BlkBitWidth, BlkLen, ComputeType, QuantBData, PackedQuantBDataWorkspace,
                                   QuantBScale, /* has zero point */ true, QuantBZeroPoint,
                                   GetMlasThreadPool(), nullptr);
     }
@@ -450,10 +450,34 @@ class MlasSQNBitGemmTest : public MlasTestBase {
              Bias,
              C, /* ldc */ N,
              Workspace,
-             SQNBIT_CompInt8,
+             ComputeType,
              Threadpool,
              nullptr,
              nullptr);
+
+    if (ComputeType == SQNBIT_CompFp32) {
+      for (size_t m = 0; m < M; ++m) {
+        for (size_t n = 0; n < N; ++n) {
+          double sum = Bias == nullptr ? 0.0 : Bias[n];
+          double magnitude = Bias == nullptr ? 0.0 : std::abs(Bias[n]);
+          for (size_t k = 0; k < K; ++k) {
+            const size_t k_blk = k / BlkLen;
+            const uint8_t b_zp_byte = QuantBZeroPoint[n * ((BlockCountK + 1) / 2) + k_blk / 2];
+            const int32_t b_zp = (k_blk & 1) ? (b_zp_byte >> 4) : (b_zp_byte & 0x0F);
+            const uint8_t qb_byte = QuantBData[(n * BlockCountK * BlkLen + k) / 2];
+            const int32_t qb = (k & 1) ? (qb_byte >> 4) : (qb_byte & 0x0F);
+            const double b = static_cast<double>(qb - b_zp) * QuantBScale[n * BlockCountK + k_blk];
+            sum += static_cast<double>(A[m * K + k]) * b;
+            magnitude += std::abs(static_cast<double>(A[m * K + k]) * b);
+          }
+          const double tolerance = 1e-4 * magnitude + 1e-5;
+          ASSERT_NEAR(static_cast<double>(C[m * N + n]), sum, tolerance)
+              << "@[" << m << "x" << n << "], M=" << M << ", N=" << N << ", K=" << K
+              << ", BlkLen=" << BlkLen;
+        }
+      }
+      return;
+    }
 
     // reference: same integer arithmetic as the kernels, accumulated in double
     int8_t* QuantAData = BufferQuantAData.GetBuffer(M * BlockCountK * BlkLen);
@@ -938,28 +962,30 @@ class SQNBitGemmKleidiAIShortExecuteTest : public MlasTestFixture<MlasSQNBitGemm
 };
 
 /**
- * @brief Registers CompInt8 tests with an explicitly built quantized B that covers the full
- *        zero point range. See MlasSQNBitGemmTest::TestFullRangeZeroPointCompInt8().
+ * @brief Registers tests with an explicitly built quantized B that covers the full zero point
+ *        range. See MlasSQNBitGemmTest::TestFullRangeZeroPoint().
  */
 template <size_t BlkBitWidth, size_t BlkLen>
 class SQNBitGemmFullRangeZeroPointShortExecuteTest : public MlasTestFixture<MlasSQNBitGemmTest<BlkBitWidth, BlkLen>> {
  public:
   explicit SQNBitGemmFullRangeZeroPointShortExecuteTest(size_t M, size_t N, size_t K,
+                                                        MLAS_QNBIT_GEMM_COMPUTE_TYPE ComputeType,
                                                         bool WithThreadpool, bool WithBias)
-      : M_(M), N_(N), K_(K), WithThreadpool_(WithThreadpool), WithBias_(WithBias) {
+      : M_(M), N_(N), K_(K), ComputeType_(ComputeType), WithThreadpool_(WithThreadpool), WithBias_(WithBias) {
   }
 
   void TestBody() override {
-    MlasTestFixture<MlasSQNBitGemmTest<BlkBitWidth, BlkLen>>::mlas_tester->TestFullRangeZeroPointCompInt8(
-        M_, N_, K_, WithThreadpool_, WithBias_);
+    MlasTestFixture<MlasSQNBitGemmTest<BlkBitWidth, BlkLen>>::mlas_tester->TestFullRangeZeroPoint(
+        M_, N_, K_, ComputeType_, WithThreadpool_, WithBias_);
   }
 
-  static size_t RegisterSingleTest(size_t M, size_t N, size_t K, bool WithThreadpool, bool WithBias) {
+  static size_t RegisterSingleTest(size_t M, size_t N, size_t K, MLAS_QNBIT_GEMM_COMPUTE_TYPE ComputeType,
+                                   bool WithThreadpool, bool WithBias) {
     std::stringstream ss;
     ss << "FullRangeZeroPoint/" << (WithThreadpool ? "Threaded" : "SingleThread")
        << "/M" << M << "xN" << N << "xK" << K
        << "/hasBias" << WithBias
-       << "/computeTypeInt8";
+       << "/computeType" << ComputeTypeName(ComputeType);
     auto test_name = ss.str();
 
     testing::RegisterTest(
@@ -970,7 +996,7 @@ class SQNBitGemmFullRangeZeroPointShortExecuteTest : public MlasTestFixture<Mlas
         __FILE__,
         __LINE__,
         [=]() -> MlasTestFixture<MlasSQNBitGemmTest<BlkBitWidth, BlkLen>>* {
-          return new SQNBitGemmFullRangeZeroPointShortExecuteTest(M, N, K, WithThreadpool, WithBias);
+          return new SQNBitGemmFullRangeZeroPointShortExecuteTest(M, N, K, ComputeType, WithThreadpool, WithBias);
         });
 
     return 1;
@@ -979,27 +1005,30 @@ class SQNBitGemmFullRangeZeroPointShortExecuteTest : public MlasTestFixture<Mlas
   static size_t RegisterShortExecuteTests() {
     size_t tests_registered = 0;
 
-    // M=1 uses dedicated GEMV kernels on some platforms (e.g. the AVX2 CompInt8 M=1 kernels,
-    // which are the only ones applying the zero point per element inside the dot product).
+    // M=1 uses dedicated GEMV kernels on some platforms (e.g. the AVX2 M=1 kernels, which are
+    // the only ones applying the zero point per element inside the dot product).
     // The N values cover the 4 column blocking and its 1..3 column remainder, the K values
     // cover even and odd block counts and a partial trailing block.
-    for (size_t N : {1, 2, 3, 4, 7, 16, 96, 130}) {
-      for (size_t K : {32, 96, 129, 256}) {
-        tests_registered += RegisterSingleTest(1, N, K, /*WithThreadpool=*/false, /*WithBias=*/false);
+    for (MLAS_QNBIT_GEMM_COMPUTE_TYPE ComputeType : {SQNBIT_CompFp32, SQNBIT_CompInt8}) {
+      for (size_t N : {1, 2, 3, 4, 7, 16, 96, 130}) {
+        for (size_t K : {32, 96, 129, 256}) {
+          tests_registered += RegisterSingleTest(1, N, K, ComputeType, /*WithThreadpool=*/false, /*WithBias=*/false);
+        }
       }
-    }
-    tests_registered += RegisterSingleTest(1, 96, 256, /*WithThreadpool=*/false, /*WithBias=*/true);
-    tests_registered += RegisterSingleTest(1, 1027, 1031, /*WithThreadpool=*/true, /*WithBias=*/true);
+      tests_registered += RegisterSingleTest(1, 96, 256, ComputeType, /*WithThreadpool=*/false, /*WithBias=*/true);
+      tests_registered += RegisterSingleTest(1, 1027, 1031, ComputeType, /*WithThreadpool=*/true, /*WithBias=*/true);
 
-    // M > 1 for comparison: these go through the block sum based zero point correction.
-    tests_registered += RegisterSingleTest(2, 96, 256, /*WithThreadpool=*/false, /*WithBias=*/false);
-    tests_registered += RegisterSingleTest(11, 96, 129, /*WithThreadpool=*/false, /*WithBias=*/true);
+      // M > 1 for comparison: these go through the block sum based zero point correction.
+      tests_registered += RegisterSingleTest(2, 96, 256, ComputeType, /*WithThreadpool=*/false, /*WithBias=*/false);
+      tests_registered += RegisterSingleTest(11, 96, 129, ComputeType, /*WithThreadpool=*/false, /*WithBias=*/true);
+    }
 
     return tests_registered;
   }
 
  private:
   size_t M_, N_, K_;
+  MLAS_QNBIT_GEMM_COMPUTE_TYPE ComputeType_;
   bool WithThreadpool_, WithBias_;
 };
 
