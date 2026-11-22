@@ -15,6 +15,7 @@
 #include "core/common/inlined_containers.h"
 #include "core/common/safeint.h"
 #include "core/common/narrow.h"
+#include "core/common/parse_string.h"
 #include "core/framework/tensor_type_and_shape.h"
 #include "core/util/math.h"
 #include "core/platform/env_var_utils.h"
@@ -24,6 +25,8 @@
 #include "contrib_ops/cpu/moe/moe_helper.h"
 
 #include <atomic>
+#include <optional>
+#include <string>
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -130,7 +133,7 @@ constexpr const char* kUseMlasQ4GemmMoe = "ORT_USE_MLAS_Q4_GEMM_MOE";
 // block-wise 4/8-bit experts. Unset: the attribute decides for 4-bit; 8-bit has no fp32 kernel
 // and uses int8 activations at every level. "fp32": fp32 activations only, so 8-bit keeps the
 // dequantize path. "int8": int8 activations (accuracy_level 4). "0": path disabled. Any other
-// value is an error.
+// value is an error. Ignored when the session sets kOrtSessionOptionsMlasQNBitMinAccuracyLevel.
 constexpr const char* kQMoEQNBitGemmEnv = "ORT_QMOE_CPU_QNBIT_GEMM";
 
 // Tag appended to the prepacked shape buffer to mark the QNBit-packed layout (see PrePackQNBitExperts).
@@ -933,6 +936,14 @@ QMoECPU<T>::QMoECPU(const OpKernelInfo& op_kernel_info)
   ORT_ENFORCE(deferred_scale == "0" || deferred_scale == "1",
               kOrtSessionOptionsCpuQmoeDeferredScale, " must be '0' or '1', got '", deferred_scale, "'.");
   deferred_scale_ = deferred_scale == "1";
+  const std::string min_accuracy_level_str =
+      op_kernel_info.GetConfigOptions().GetConfigOrDefault(kOrtSessionOptionsMlasQNBitMinAccuracyLevel, "");
+  int64_t min_accuracy_level = 0;
+  ORT_ENFORCE(min_accuracy_level_str.empty() ||
+                  (TryParseStringWithClassicLocale(min_accuracy_level_str, min_accuracy_level) &&
+                   min_accuracy_level >= 0 && min_accuracy_level <= 4),
+              "Invalid value for session config ", kOrtSessionOptionsMlasQNBitMinAccuracyLevel, ": '",
+              min_accuracy_level_str, "'. Expected an integer in [0, 4].");
   ORT_ENFORCE(activation_type_ != ActivationType::SwiGLU || swiglu_fusion_ == 1,
               "CPU QMoE only supports interleaved SwiGLU format. Please set swiglu_fusion=1.");
   ORT_ENFORCE(op_kernel_info.GetAttr<int64_t>("expert_weight_bits", &expert_weight_bits_).IsOK());
@@ -1013,12 +1024,24 @@ QMoECPU<T>::QMoECPU(const OpKernelInfo& op_kernel_info)
   // dequantize+SGEMM path they replace, so for 4-bit they need accuracy_level=4 as in MatMulNBits
   // and the default is fp32 activations. 8-bit has no fp32 kernel; unlike MatMulNBits (which
   // dequantizes at level 0) it uses int8 activations at every level, since that is the only way
-  // onto these kernels. The environment variable overrides the attribute.
-  accuracy_level_ = op_kernel_info.GetAttrOrDefault<int64_t>("accuracy_level", 0);
+  // onto these kernels. The session's minimum accuracy level raises the attribute as in
+  // MatMulNBits. The environment variable is a process-wide fallback: it overrides the attribute
+  // only when the session does not set the minimum, so a per-session choice is never silently
+  // replaced by the environment.
+  accuracy_level_ = std::max(op_kernel_info.GetAttrOrDefault<int64_t>("accuracy_level", 0), min_accuracy_level);
   bool allow_int8_compute = (accuracy_level_ == 4);
   bool allow_fp32_compute = true;
   bool fp32_compute_forced = false;
-  const auto qnbit_gemm_env = ParseEnvironmentVariable<std::string>(kQMoEQNBitGemmEnv);
+  const auto qnbit_gemm_env = min_accuracy_level_str.empty()
+                                  ? ParseEnvironmentVariable<std::string>(kQMoEQNBitGemmEnv)
+                                  : std::optional<std::string>{};
+  if (!min_accuracy_level_str.empty() && ParseEnvironmentVariable<std::string>(kQMoEQNBitGemmEnv).has_value()) {
+    static std::atomic<bool> env_ignored_logged{false};
+    if (!env_ignored_logged.exchange(true)) {
+      LOGS_DEFAULT(WARNING) << kQMoEQNBitGemmEnv << " is ignored because the session sets "
+                            << kOrtSessionOptionsMlasQNBitMinAccuracyLevel << ".";
+    }
+  }
   if (qnbit_gemm_env.has_value()) {
     if (*qnbit_gemm_env == "0") {
       use_qnbit_gemm_ = false;

@@ -772,10 +772,11 @@ static const char* const kOrtSessionOptionsMlasLutGemm = "mlas.use_lut_gemm";
 // - "1": Use CompFp32 instead of CompInt8 for eligible accuracy-level-4 nodes.
 static const char* const kOrtSessionOptionsMlasQNBitForceFp32 = "mlas.qnbit.force_fp32";
 
-// Minimum accuracy level for MatMulNBits CPU kernels. Nodes whose accuracy_level attribute is lower are raised to
-// this value at kernel construction. The raised level is subject to the same per-platform availability as the
-// attribute, e.g. "4" only selects the int8 compute path where MLAS supports it for the node's bits/block_size and
-// otherwise falls back to fp32. "mlas.qnbit.force_fp32" applies to nodes raised to level 4 as well.
+// Minimum accuracy level for MatMulNBits and QMoE CPU kernels. Nodes whose accuracy_level attribute is lower are
+// raised to this value at kernel construction. The raised level is subject to the same per-platform availability as
+// the attribute, e.g. "4" only selects the int8 compute path where MLAS supports it for the node's bits/block_size and
+// otherwise falls back to fp32. "mlas.qnbit.force_fp32" applies to MatMulNBits nodes raised to level 4 as well.
+// For QMoE, setting this key (to any value) also disables the ORT_QMOE_CPU_QNBIT_GEMM environment variable override.
 // Option values:
 // - "0": Use the accuracy_level attribute of each node. [DEFAULT]
 // - "1" to "4": Use max(accuracy_level attribute, this value).

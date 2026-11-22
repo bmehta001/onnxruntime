@@ -6082,6 +6082,10 @@ struct QMoEBlockWiseCase {
   // the kernel runs one expert per thread instead of batching them into one MLAS dispatch, so this
   // selects which of the two QNBit dispatch paths a case exercises.
   int intra_op_num_threads{0};
+  // Session config mlas.qnbit.min_accuracy_level, or empty to leave it unset.
+  std::string min_accuracy_level{};
+  // When non-empty, the run must fail with an error containing this text.
+  std::string expected_failure{};
 };
 
 // `output_out`, when set, receives the run's output as fp32 so callers can compare the results of
@@ -6276,6 +6280,14 @@ void RunQMoECpuBlockWiseSwiGLU(const QMoEBlockWiseCase& c, float tolerance,
       so.intra_op_param.thread_pool_size = c.intra_op_num_threads;
       so.use_per_session_threads = true;
     }
+    if (!c.min_accuracy_level.empty()) {
+      ASSERT_STATUS_OK(so.config_options.AddConfigEntry(kOrtSessionOptionsMlasQNBitMinAccuracyLevel,
+                                                        c.min_accuracy_level.c_str()));
+    }
+    if (!c.expected_failure.empty()) {
+      tester.Run(so, OpTester::ExpectResult::kExpectFailure, c.expected_failure, {}, nullptr, &eps);
+      return;
+    }
     size_t prepacked = 0, shared = 0;
     tester.Run(so, OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &eps, {}, &prepacked, &shared);
     if (c.expected_prepacked >= 0) {
@@ -6306,6 +6318,10 @@ void RunQMoECpuBlockWiseSwiGLU(const QMoEBlockWiseCase& c, float tolerance,
   Tensor::InitOrtValue(DataTypeImpl::GetType<uint8_t>(), TensorShape({num_experts, hidden_size, inter_size / pack}),
                        const_cast<uint8_t*>(fc2_weights.data()), OrtMemoryInfo(CPU, OrtAllocatorType::OrtDeviceAllocator), fc2_value);
   SessionOptions so;
+  if (!c.min_accuracy_level.empty()) {
+    ASSERT_STATUS_OK(so.config_options.AddConfigEntry(kOrtSessionOptionsMlasQNBitMinAccuracyLevel,
+                                                      c.min_accuracy_level.c_str()));
+  }
   ASSERT_STATUS_OK(so.AddInitializer("fc1_experts_weights", &fc1_value));
   ASSERT_STATUS_OK(so.AddInitializer("fc2_experts_weights", &fc2_value));
   tester.EnableSharingOfPrePackedWeightsAcrossSessions();
@@ -6453,6 +6469,66 @@ TEST(MoETest, QMoETest_CPU_Int4_BlockWise_SwiGLU_DisabledByEnv) {
   // "0" keeps the previous paths; the output still matches the exact reference.
   ScopedEnvironmentVariables scoped_env_vars{EnvVarMap{{"ORT_QMOE_CPU_QNBIT_GEMM", "0"}}};
   RunQMoECpuBlockWiseSwiGLU<float>({5, 4, 128, 64, 32, 2, true}, 0.01f);
+}
+
+TEST(MoETest, QMoETest_CPU_Int4_BlockWise_SwiGLU_MinAccuracyLevelSessionOption) {
+  // The session's minimum accuracy level raises a level-0 node to 4, which must select the same
+  // int8 kernels as the node attribute (bitwise identical output), take precedence over the
+  // environment override, and act only as a floor.
+  if (!MlasIsQNBitGemmAvailable(4, 32, SQNBIT_CompInt8) || !MlasIsQNBitGemmAvailable(4, 32, SQNBIT_CompFp32)) {
+    GTEST_SKIP() << "platform lacks one of the 4-bit QNBit compute types";
+  }
+  const QMoEBlockWiseCase base{5, 4, 128, 64, 32, 2, true};
+  std::vector<float> by_default, level4_attr, level4_key, key_over_env, key_floor_only, key_zero_over_env;
+  RunQMoECpuBlockWiseSwiGLU<float>(base, 0.01f, false, &by_default);
+  {
+    QMoEBlockWiseCase c = base;
+    c.accuracy_level = 4;
+    RunQMoECpuBlockWiseSwiGLU<float>(c, 0.05f, false, &level4_attr);
+  }
+  {
+    QMoEBlockWiseCase c = base;
+    c.min_accuracy_level = "4";
+    RunQMoECpuBlockWiseSwiGLU<float>(c, 0.05f, false, &level4_key);
+  }
+  {
+    ScopedEnvironmentVariables scoped_env_vars{EnvVarMap{{"ORT_QMOE_CPU_QNBIT_GEMM", "fp32"}}};
+    QMoEBlockWiseCase c = base;
+    c.min_accuracy_level = "4";
+    RunQMoECpuBlockWiseSwiGLU<float>(c, 0.05f, false, &key_over_env);
+  }
+  {
+    QMoEBlockWiseCase c = base;
+    c.accuracy_level = 4;
+    c.min_accuracy_level = "0";
+    RunQMoECpuBlockWiseSwiGLU<float>(c, 0.05f, false, &key_floor_only);
+  }
+  {
+    ScopedEnvironmentVariables scoped_env_vars{EnvVarMap{{"ORT_QMOE_CPU_QNBIT_GEMM", "int8"}}};
+    QMoEBlockWiseCase c = base;
+    c.min_accuracy_level = "0";
+    RunQMoECpuBlockWiseSwiGLU<float>(c, 0.01f, false, &key_zero_over_env);
+  }
+  ASSERT_FALSE(level4_attr.empty());
+  EXPECT_EQ(level4_key, level4_attr);
+  EXPECT_EQ(key_over_env, level4_attr);
+  EXPECT_EQ(key_floor_only, level4_attr);
+  EXPECT_EQ(key_zero_over_env, by_default);
+  EXPECT_NE(level4_key, by_default);
+}
+
+TEST(MoETest, QMoETest_CPU_Int4_BlockWise_SwiGLU_MinAccuracyLevelSharedPrePackedWeights) {
+  RunQMoECpuBlockWiseSwiGLU<float>({3, 4, 64, 64, 32, 2, true, 4, false, 0, -1, 0, "4"}, 0.05f,
+                                   /*share_prepacked_weights_across_sessions*/ true);
+}
+
+TEST(MoETest, QMoETest_CPU_BlockWise_SwiGLU_InvalidMinAccuracyLevel) {
+  for (const char* value : {"5", "-1", "abc"}) {
+    QMoEBlockWiseCase c{5, 4, 128, 64, 32, 2, true};
+    c.min_accuracy_level = value;
+    c.expected_failure = "Expected an integer in [0, 4]";
+    RunQMoECpuBlockWiseSwiGLU<float>(c, 0.05f);
+  }
 }
 
 TEST(MoETest, QMoETest_CPU_Int8_BlockWise_SwiGLU_DisabledByEnv) {
