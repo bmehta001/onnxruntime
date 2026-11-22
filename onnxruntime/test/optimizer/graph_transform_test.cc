@@ -735,6 +735,81 @@ TEST_F(GraphTransformationTests, ConstantFoldingCopiesAliasedTensorBuffer) {
       post_graph_checker));
 }
 
+TEST_F(GraphTransformationTests, ConstantFoldingReshapeAliasesLargeInitializer) {
+  // A large initializer consumed both directly and through a Reshape (like a tied embedding / lm_head weight)
+  // should be folded into an initializer that shares the source buffer rather than a private copy.
+  std::vector<float> values(16 * 32);
+  for (size_t i = 0; i < values.size(); ++i) {
+    values[i] = static_cast<float>(i) - 100.f;
+  }
+
+  std::string weight_name;
+  std::string reshaped_name;
+  auto build_test_case = [&](ModelTestBuilder& builder) {
+    auto* input = builder.MakeInput<float>(std::vector<int64_t>{16, 32}, -1.f, 1.f);
+    auto* weight = builder.MakeInitializer<float>({16, 32}, values);
+    auto* shape = builder.MakeInitializer<int64_t>({2}, {32, 16});
+    auto* add_out = builder.MakeOutput();
+    auto* reshape_out = builder.MakeOutput();
+    builder.AddNode("Add", {input, weight}, {add_out});
+    builder.AddNode("Reshape", {weight, shape}, {reshape_out});
+    weight_name = weight->Name();
+    reshaped_name = reshape_out->Name();
+  };
+
+  auto pre_graph_checker = [](Graph& graph) {
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["Reshape"] == 1);
+    // Mimic session initialization, which moves large initializers into OrtValues before optimization.
+    ORT_RETURN_IF_ERROR(graph.ConvertInitializersIntoOrtValues());
+    return Status::OK();
+  };
+
+  auto post_graph_checker = [&](Graph& graph) {
+    TEST_RETURN_IF_NOT(CountOpsInGraph(graph)["Reshape"] == 0);
+
+    OrtValue weight_value;
+    OrtValue reshaped_value;
+    TEST_RETURN_IF_NOT(graph.GetOrtValueInitializer(weight_name, weight_value));
+    TEST_RETURN_IF_NOT(graph.GetOrtValueInitializer(reshaped_name, reshaped_value));
+    const Tensor& reshaped = reshaped_value.Get<Tensor>();
+    TEST_RETURN_IF_NOT(reshaped.DataRaw() == weight_value.Get<Tensor>().DataRaw());
+    TEST_RETURN_IF_NOT(reshaped.Shape() == TensorShape({32, 16}));
+    weight_value = OrtValue();
+
+    // The alias must stay valid after the source initializer is removed (e.g. once its consumers have prepacked).
+    graph.RemoveInitializedTensor(weight_name);
+
+    const ONNX_NAMESPACE::TensorProto* reshaped_proto = nullptr;
+    TEST_RETURN_IF_NOT(graph.GetInitializedTensor(reshaped_name, reshaped_proto));
+    Initializer initializer{graph, *reshaped_proto, graph.ModelPath()};
+    TEST_RETURN_IF_NOT(SpanEq(initializer.dims(), AsSpan<int64_t>({32, 16})));
+    TEST_RETURN_IF_NOT(std::equal(values.begin(), values.end(), initializer.data<float>()));
+
+    // Serializing the optimized graph must inline the aliased data.
+    const auto graph_proto = static_cast<const Graph&>(graph).ToGraphProto();
+    const auto it = std::find_if(graph_proto.initializer().begin(), graph_proto.initializer().end(),
+                                 [&](const ONNX_NAMESPACE::TensorProto& t) { return t.name() == reshaped_name; });
+    TEST_RETURN_IF_NOT(it != graph_proto.initializer().end());
+    TEST_RETURN_IF_NOT(!utils::HasExternalData(*it));
+    TEST_RETURN_IF_NOT(it->raw_data().size() == values.size() * sizeof(float));
+    TEST_RETURN_IF_NOT(std::memcmp(it->raw_data().data(), values.data(), it->raw_data().size()) == 0);
+    return Status::OK();
+  };
+
+  const ConfigOptions empty_config_options;
+  auto cpu_ep = std::make_unique<CPUExecutionProvider>(CPUExecutionProviderInfo());
+
+  ASSERT_STATUS_OK(TestGraphTransformer(
+      build_test_case,
+      13,
+      *logger_,
+      std::make_unique<ConstantFolding>(*cpu_ep, false, empty_config_options),
+      TransformerLevel::Level1,
+      1,
+      pre_graph_checker,
+      post_graph_checker));
+}
+
 TEST_F(GraphTransformationTests, ConstantFoldingNodesOnDifferentEP) {
   constexpr const ORTCHAR_T* model_uri = MODEL_FOLDER "fusion/fuse-conv-bn-mul-add-unsqueeze.onnx";
   std::shared_ptr<Model> model;

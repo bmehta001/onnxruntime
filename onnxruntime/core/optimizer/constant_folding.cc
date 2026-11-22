@@ -106,6 +106,93 @@ static bool ConstantFoldShapeNode(Graph& graph, Node& node) {
   return is_concrete_shape;  // convert to constant if this is true
 }
 
+// Folds a node that only reinterprets the shape of a constant initializer (Reshape, Squeeze, Unsqueeze, Flatten,
+// Identity) into an initializer that aliases the source data instead of a copy. This matters for large weights that
+// are consumed in two layouts, e.g. tied embedding / lm_head weights where a Reshape feeds MatMulNBits, which would
+// otherwise duplicate the whole weight in private memory.
+//   - In-memory source (graph OrtValue): the new OrtValue is a view of the source buffer and keeps the source
+//     OrtValue alive, so the source can later be removed (e.g. after prepacking) without invalidating the alias.
+//   - External file source: the new TensorProto references the same external data with the new dims.
+// Returns false (without modifying the graph) when aliasing is not applicable; the regular folding path is then used.
+static bool ConstantFoldReshapeAsAlias(Graph& graph, Node& node,
+                                       const InlinedHashSet<std::string_view>& compatible_execution_providers,
+                                       const InlinedHashSet<std::string>& excluded_initializers) {
+  const auto& op_type = node.OpType();
+  if (!(node.Domain() == kOnnxDomain || node.Domain() == kOnnxDomainAlias) ||
+      !(op_type == "Reshape" || op_type == "Squeeze" || op_type == "Unsqueeze" || op_type == "Flatten" ||
+        op_type == "Identity")) {
+    return false;
+  }
+
+  if (!graph_utils::IsSupportedProvider(node, compatible_execution_providers) || node.InputDefs().empty() ||
+      node.OutputDefs().size() != 1 || !node.OutputDefs()[0]->Exists()) {
+    return false;
+  }
+
+  InitializedTensorSet constant_inputs;
+  if (!graph_utils::AllNodeInputsAreConstant(graph, node, constant_inputs, excluded_initializers)) {
+    return false;
+  }
+
+  NodeArg& output_def = *node.MutableOutputDefs()[0];
+  const auto* output_type = output_def.TypeAsProto();
+  const auto* output_shape = output_def.Shape();
+  if (output_type == nullptr || !utils::HasTensorType(*output_type) || output_shape == nullptr) {
+    return false;
+  }
+
+  TensorShapeVector output_dims;
+  output_dims.reserve(output_shape->dim_size());
+  for (const auto& dim : output_shape->dim()) {
+    if (!utils::HasDimValue(dim) || dim.dim_value() < 0) {
+      return false;
+    }
+    output_dims.push_back(dim.dim_value());
+  }
+  const TensorShape new_shape(output_dims);
+
+  const std::string& input_name = node.InputDefs()[0]->Name();
+  const ONNX_NAMESPACE::TensorProto* src_proto = graph_utils::GetConstantInitializer(graph, input_name);
+  if (src_proto == nullptr || src_proto->data_type() != output_type->tensor_type().elem_type() ||
+      src_proto->data_type() == ONNX_NAMESPACE::TensorProto_DataType_STRING ||
+      utils::GetTensorShapeFromTensorProto(*src_proto).Size() != new_shape.Size()) {
+    return false;
+  }
+
+  ONNX_NAMESPACE::TensorProto alias_proto;
+  OrtValue alias_value;
+  if (OrtValue src_value; graph.GetOrtValueInitializer(input_name, src_value, /*check_outer_scope*/ true)) {
+    const Tensor& src_tensor = src_value.Get<Tensor>();
+    if (src_tensor.Location().device.Type() != OrtDevice::CPU || src_tensor.Shape().Size() != new_shape.Size()) {
+      return false;
+    }
+
+    auto alias_tensor = std::make_unique<Tensor>(src_tensor.DataType(), new_shape,
+                                                 const_cast<void*>(src_tensor.DataRaw()), src_tensor.Location());
+    alias_value.Init(alias_tensor.release(), DataTypeImpl::GetType<Tensor>(),
+                     [keep_alive = src_value](void* p) { delete static_cast<Tensor*>(p); });
+
+    alias_proto = utils::TensorToTensorProto(alias_value.Get<Tensor>(), output_def.Name(),
+                                             /*use_tensor_buffer=*/true);
+    if (!utils::HasExternalDataInMemory(alias_proto)) {
+      // Small tensors are stored inline in the TensorProto and need no backing OrtValue.
+      alias_value = OrtValue();
+    }
+  } else if (utils::HasExternalData(*src_proto) && !utils::HasExternalDataInMemory(*src_proto)) {
+    alias_proto = *src_proto;
+    alias_proto.set_name(output_def.Name());
+    alias_proto.clear_dims();
+    for (const auto dim : output_dims) {
+      alias_proto.add_dims(dim);
+    }
+  } else {
+    return false;
+  }
+
+  ORT_THROW_IF_ERROR(graph.AddInitializedOrtValue(alias_proto, alias_value));
+  return true;
+}
+
 // This function inlines the appropriate subgraph. It does not literally fold it.
 static Status ConstantFoldIfNode(Graph& graph, Node& if_node, const logging::Logger& logger, bool& folded) {
   folded = false;
@@ -441,6 +528,8 @@ Status ConstantFolding::ApplyImpl(Graph& graph, bool& modified, int graph_level,
       }
     } else if (node->OpType().compare("Shape") == 0) {
       converted_to_constant = ConstantFoldShapeNode(graph, *node);
+    } else if (ConstantFoldReshapeAsAlias(graph, *node, GetCompatibleExecutionProviders(), excluded_initializers_)) {
+      converted_to_constant = true;
     } else {
       InitializedTensorSet constant_inputs;
 
