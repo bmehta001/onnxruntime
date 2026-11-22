@@ -10,6 +10,7 @@
 #include "test/util/include/scoped_env_vars.h"
 #include "core/providers/tensorrt/tensorrt_provider_options.h"
 #include "core/providers/tensorrt/tensorrt_execution_provider_utils.h"
+#include <array>
 #include <string>
 #include <thread>
 #include <filesystem>
@@ -679,6 +680,57 @@ TEST(TensorrtExecutionProviderTest, ExcludeOpsTest) {
   // The whole graph should be partitioned into 3 TRT subgraphs and 2 cpu nodes
   ASSERT_EQ(engine_files.size(), 3);
 }
+
+#if (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13) || NV_TENSORRT_MAJOR > 10
+TEST(TensorrtExecutionProviderTest, LoadUserInitializers) {
+  Model model("trt_user_initializers", false, DefaultLoggingManager().DefaultLogger());
+  auto& graph = model.MainGraph();
+  ONNX_NAMESPACE::TypeProto type;
+  auto* tensor_type = type.mutable_tensor_type();
+  tensor_type->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+  tensor_type->mutable_shape()->add_dim()->set_dim_value(1);
+  tensor_type->mutable_shape()->add_dim()->set_dim_value(3);
+  auto& x = graph.GetOrCreateNodeArg("X", &type);
+  auto& w = graph.GetOrCreateNodeArg("W", &type);
+  auto& y = graph.GetOrCreateNodeArg("Y", &type);
+
+  const std::array<float, 3> weights{2.0f, 3.0f, 4.0f};
+  ONNX_NAMESPACE::TensorProto initializer;
+  initializer.set_name("W");
+  initializer.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+  initializer.add_dims(1);
+  initializer.add_dims(3);
+  initializer.set_raw_data(weights.data(), weights.size() * sizeof(float));
+  graph.AddInitializedTensor(initializer);
+  graph.AddNode("Multiply", "Mul", "", {&x, &w}, {&y});
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  std::string serialized_model;
+  ASSERT_TRUE(model.ToProto().SerializeToString(&serialized_model));
+  SessionOptions options;
+  ASSERT_STATUS_OK(options.config_options.AddConfigEntry("session.disable_cpu_ep_fallback", "1"));
+  InferenceSession session{options, GetEnvironment()};
+  OrtTensorRTProviderOptionsV2 provider_options;
+  provider_options.trt_load_user_initializer = 1;
+  ASSERT_STATUS_OK(session.RegisterExecutionProvider(TensorrtExecutionProviderWithOptions(&provider_options)));
+  ASSERT_STATUS_OK(session.Load(serialized_model.data(), static_cast<int>(serialized_model.size())));
+  ASSERT_STATUS_OK(session.Initialize());
+
+  bool used_tensorrt = false;
+  for (const auto& node : session.GetSessionState().GetGraphViewer().Nodes()) {
+    used_tensorrt |= node.GetExecutionProviderType() == kTensorrtExecutionProvider;
+  }
+  ASSERT_TRUE(used_tensorrt);
+
+  auto cuda_provider = DefaultCudaExecutionProvider();
+  auto cpu_allocator = cuda_provider->CreatePreferredAllocators()[1];
+  OrtValue input;
+  CreateMLValue<float>(cpu_allocator, {1, 3}, {1.0f, 2.0f, 3.0f}, &input);
+  NameMLValMap feeds{{"X", input}};
+  RunOptions run_options;
+  RunSession(session, run_options, feeds, {"Y"}, {1, 3}, {2.0f, 6.0f, 12.0f});
+}
+#endif
 
 TEST(TensorrtExecutionProviderTest, TRTPluginsCustomOpTest) {
   PathString model_name = ORT_TSTR("testdata/trt_plugin_custom_op_test.onnx");

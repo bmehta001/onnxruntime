@@ -34,8 +34,11 @@ mp11;https://github.com/boostorg/mp11/archive/refs/tags/boost-1.82.0.zip;9bc9e01
 # The 7 CI requirements.txt files are pinned to onnx==1.23.2.
 # ONNX_VERSION=1.23.2
 onnx;https://github.com/onnx/onnx/archive/refs/tags/v1.23.2.zip;8846de32ab45e653c2cd651d8d6c4c299fb1583d
-# Use the latest commit of 10.9-GA
+# ONNX-TensorRT GA releases selected to match the TensorRT SDK API.
 onnx_tensorrt;https://github.com/onnx/onnx-tensorrt/archive/7e306984b972e9c25fcea1e841cfa03c899ed1aa.zip;34790b85e8072a9edfd03c6d141cbc3b24a0a467
+onnx_tensorrt_10_9;https://github.com/onnx/onnx-tensorrt/archive/d5dce67db7c2e64b07e055571f5ec06f7f254de2.zip;01114d3b67650857281fa50faa2e412130a63b69
+onnx_tensorrt_10_13;https://github.com/onnx/onnx-tensorrt/archive/346bdcae450e2724ffc16d7e15710d3bbf76d7ed.zip;7ace13eaad31e7dd6169947190738b3630a79def
+onnx_tensorrt_10_16;https://github.com/onnx/onnx-tensorrt/archive/6bde6596eca84abf9afe9b4d21c18c32800fd3ad.zip;0799bfb08c98cd62fef717f50258ae5c1ae7f4aa
 protobuf;https://github.com/protocolbuffers/protobuf/releases/download/v33.6/protobuf-33.6.tar.gz;051fee744fcca04dab37eb009d49aa3e9546acda
 protoc_win64;https://github.com/protocolbuffers/protobuf/releases/download/v33.6/protoc-33.6-win64.zip;9f43a76f18e37325079f772bd47673f9d2f06385
 protoc_win32;https://github.com/protocolbuffers/protobuf/releases/download/v33.6/protoc-33.6-win32.zip;127b589423e076fe5f9724e61b2aa9e91eab3936

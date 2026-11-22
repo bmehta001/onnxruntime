@@ -113,16 +113,43 @@
     if (TRT_GREATER_OR_EQUAL_TRT_10_GA)
       set(ONNX_USE_LITE_PROTO ON)
     endif()
-    # The 11.5 archive omits nvonnxparser.def; ORT links the static parser.
+    # Select a parser with the SDK's API, including initializer loading from 10.13 onward.
+    set(onnx_tensorrt_patch)
+    if (NV_TENSORRT_MAJOR_INT GREATER_EQUAL 11)
+      set(onnx_tensorrt_dep onnx_tensorrt)
+      if (MSVC)
+        if (NOT Patch_FOUND)
+          message(FATAL_ERROR "The TensorRT 11 OSS parser on Windows requires the patch tool.")
+        endif()
+        # The 11.5 archive omits nvonnxparser.def; ORT links the static parser.
+        set(onnx_tensorrt_patch PATCH_COMMAND ${Patch_EXECUTABLE} --binary --ignore-whitespace -p1 <
+            ${PROJECT_SOURCE_DIR}/patches/onnx_tensorrt/onnx_tensorrt_optional_windows_exports.patch)
+      endif()
+    elseif (NV_TENSORRT_MAJOR_INT EQUAL 10 AND NV_TENSORRT_MINOR_INT GREATER_EQUAL 16)
+      set(onnx_tensorrt_dep onnx_tensorrt_10_16)
+    elseif (NV_TENSORRT_MAJOR_INT EQUAL 10 AND NV_TENSORRT_MINOR_INT GREATER_EQUAL 13)
+      set(onnx_tensorrt_dep onnx_tensorrt_10_13)
+    else()
+      set(onnx_tensorrt_dep onnx_tensorrt_10_9)
+    endif()
+
     onnxruntime_fetchcontent_declare(
       onnx_tensorrt
-      URL ${DEP_URL_onnx_tensorrt}
-      URL_HASH SHA1=${DEP_SHA1_onnx_tensorrt}
-      PATCH_COMMAND ${Patch_EXECUTABLE} --binary --ignore-whitespace -p1 < ${PROJECT_SOURCE_DIR}/patches/onnx_tensorrt/onnx_tensorrt_optional_windows_exports.patch
+      URL ${DEP_URL_${onnx_tensorrt_dep}}
+      URL_HASH SHA1=${DEP_SHA1_${onnx_tensorrt_dep}}
+      ${onnx_tensorrt_patch}
       EXCLUDE_FROM_ALL
     )
     if (NOT CUDA_INCLUDE_DIR)
       set(CUDA_INCLUDE_DIR ${CUDAToolkit_INCLUDE_DIRS}) # onnx-tensorrt repo needs this variable to build
+    endif()
+    if (NOT onnx_tensorrt_dep STREQUAL "onnx_tensorrt_10_9")
+      find_path(TENSORRT_PYTHON_INCLUDE_DIR NvInferPythonPlugin.h
+        HINTS ${TENSORRT_ROOT}
+        PATH_SUFFIXES include/impl python/include/impl)
+      if (FETCHCONTENT_FULLY_DISCONNECTED AND NOT TENSORRT_PYTHON_INCLUDE_DIR)
+        message(FATAL_ERROR "The TensorRT OSS parser needs NvInferPythonPlugin.h in disconnected builds.")
+      endif()
     endif()
     # The onnx_tensorrt repo contains a test program, getSupportedAPITest, which doesn't support Windows. It uses
     # unistd.h. So we must exclude it from our build. onnxruntime_fetchcontent_makeavailable is for the purpose.
@@ -189,7 +216,7 @@
   target_include_directories(onnxruntime_providers_tensorrt PRIVATE ${ONNXRUNTIME_ROOT} ${CMAKE_CURRENT_BINARY_DIR} ${TENSORRT_INCLUDE_DIR}
     PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
   if (NOT onnxruntime_USE_TENSORRT_BUILTIN_PARSER)
-        target_include_directories(onnxruntime_providers_tensorrt PRIVATE ${onnx_tensorrt_SOURCE_DIR})
+    target_include_directories(onnxruntime_providers_tensorrt BEFORE PRIVATE ${onnx_tensorrt_SOURCE_DIR})
   endif()
   # ${CMAKE_CURRENT_BINARY_DIR} is so that #include "onnxruntime_config.h" inside tensor_shape.h is found
   set_target_properties(onnxruntime_providers_tensorrt PROPERTIES LINKER_LANGUAGE CUDA)
