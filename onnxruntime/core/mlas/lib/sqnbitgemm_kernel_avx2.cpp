@@ -1016,6 +1016,69 @@ ComputeDotProducts_BlkLen32Plus_CompFp32_avx2(
             if constexpr (IsBlkLen64Layout) {
                 count_half_4 = 4 * (int)((kk % (2 * SubBlkLen32)) / SubBlkLen32);
             }
+
+            if (kklen == (int)SubBlkLen32) {
+                // Full sub-block: zero-extend groups of 8 packed bytes straight to int32 lanes, which
+                // avoids the int8 -> int16 -> int32 lane-crossing expansion below. In both layouts the
+                // nibbles of 8 consecutive bytes map to 8 consecutive k, so A needs no reordering.
+                // The products are bit-identical to the generic path: (q - zp) is exact in fp32, and
+                // fma(q, s, -8 * s) rounds the exact (q - 8) * s once, as the multiply below does.
+                const __m256i low4_epi32 = _mm256_set1_epi32(0x0F);
+                const __m128i shift_count = _mm_cvtsi32_si128(count_half_4);
+                UnrolledLoop<NCols>([&](size_t i) {
+                    __m256i bv0_8_epi32, bv1_8_epi32, bv2_8_epi32, bv3_8_epi32;
+                    if constexpr (IsBlkLen64Layout) {
+                        // bytes [0, 32): low nibbles hold k in [0, 32), high nibbles k in [32, 64).
+                        const std::byte* p = b_blk_data_col_ptr[i];
+                        bv0_8_epi32 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(p)));
+                        bv1_8_epi32 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(p + 8)));
+                        bv2_8_epi32 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(p + 16)));
+                        bv3_8_epi32 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(p + 24)));
+                        bv0_8_epi32 = _mm256_and_si256(_mm256_srl_epi32(bv0_8_epi32, shift_count), low4_epi32);
+                        bv1_8_epi32 = _mm256_and_si256(_mm256_srl_epi32(bv1_8_epi32, shift_count), low4_epi32);
+                        bv2_8_epi32 = _mm256_and_si256(_mm256_srl_epi32(bv2_8_epi32, shift_count), low4_epi32);
+                        bv3_8_epi32 = _mm256_and_si256(_mm256_srl_epi32(bv3_8_epi32, shift_count), low4_epi32);
+                        b_blk_data_col_ptr[i] += count_half_4 / 2 * SubBlkStep16;
+                    } else {
+                        // bytes [0, 16): low nibbles hold k in [0, 16), high nibbles k in [16, 32).
+                        const __m256i lo_8_epi32 =
+                            _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(b_blk_data_col_ptr[i])));
+                        const __m256i hi_8_epi32 =
+                            _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(b_blk_data_col_ptr[i] + 8)));
+                        b_blk_data_col_ptr[i] += SubBlkStep16;
+                        bv0_8_epi32 = _mm256_and_si256(lo_8_epi32, low4_epi32);
+                        bv1_8_epi32 = _mm256_and_si256(hi_8_epi32, low4_epi32);
+                        bv2_8_epi32 = _mm256_srli_epi32(lo_8_epi32, 4);
+                        bv3_8_epi32 = _mm256_srli_epi32(hi_8_epi32, 4);
+                    }
+
+                    const __m256 scale_ps = _mm256_set1_ps(scale_v[i]);
+                    __m256 bv0_8_ps = _mm256_cvtepi32_ps(bv0_8_epi32);
+                    __m256 bv1_8_ps = _mm256_cvtepi32_ps(bv1_8_epi32);
+                    __m256 bv2_8_ps = _mm256_cvtepi32_ps(bv2_8_epi32);
+                    __m256 bv3_8_ps = _mm256_cvtepi32_ps(bv3_8_epi32);
+                    if constexpr (HasZeroPoint) {
+                        const __m256 zp_ps = _mm256_set1_ps(static_cast<float>(offset[i]));
+                        bv0_8_ps = _mm256_mul_ps(_mm256_sub_ps(bv0_8_ps, zp_ps), scale_ps);
+                        bv1_8_ps = _mm256_mul_ps(_mm256_sub_ps(bv1_8_ps, zp_ps), scale_ps);
+                        bv2_8_ps = _mm256_mul_ps(_mm256_sub_ps(bv2_8_ps, zp_ps), scale_ps);
+                        bv3_8_ps = _mm256_mul_ps(_mm256_sub_ps(bv3_8_ps, zp_ps), scale_ps);
+                    } else {
+                        const __m256 neg_zp_scale_ps = _mm256_mul_ps(scale_ps, _mm256_set1_ps(-8.0f));
+                        bv0_8_ps = _mm256_fmadd_ps(bv0_8_ps, scale_ps, neg_zp_scale_ps);
+                        bv1_8_ps = _mm256_fmadd_ps(bv1_8_ps, scale_ps, neg_zp_scale_ps);
+                        bv2_8_ps = _mm256_fmadd_ps(bv2_8_ps, scale_ps, neg_zp_scale_ps);
+                        bv3_8_ps = _mm256_fmadd_ps(bv3_8_ps, scale_ps, neg_zp_scale_ps);
+                    }
+
+                    acc[i] = _mm256_fmadd_ps(bv0_8_ps, av0_8_ps, acc[i]);
+                    acc[i] = _mm256_fmadd_ps(bv1_8_ps, av1_8_ps, acc[i]);
+                    acc[i] = _mm256_fmadd_ps(bv2_8_ps, av2_8_ps, acc[i]);
+                    acc[i] = _mm256_fmadd_ps(bv3_8_ps, av3_8_ps, acc[i]);
+                });
+                continue;
+            }
+
             UnrolledLoop<NCols>([&](size_t i) {
                 // Load B col vectors. get SubBlkLen32 4b quantized weights from each column
                 __m256i bv_32_epi8;
