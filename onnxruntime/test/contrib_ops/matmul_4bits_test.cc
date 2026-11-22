@@ -959,6 +959,90 @@ INSTANTIATE_TEST_SUITE_P(MatMulNBits, MatMulNBitsLutOptionsTest,
                                          MatMulNBitsLutOptions{4, 32, 0},
                                          MatMulNBitsLutOptions{4, 32, 4}));
 
+// kOrtSessionOptionsMlasQNBitMinAccuracyLevel raises a lower accuracy_level attribute, so an accuracy-level-0 node
+// must compute exactly like the same node with accuracy_level 4.
+TEST(MatMulNBits, MinAccuracyLevelSessionOption) {
+  constexpr int64_t M = 4;
+  constexpr int64_t N = 64;
+  constexpr int64_t K = 256;
+  constexpr int64_t block_size = 32;
+  constexpr int64_t k_blocks = K / block_size;
+  constexpr int64_t blob_size = block_size * QBits / 8;
+
+  RandomValueGenerator random{1234};
+  const std::vector<float> input_vals = random.Gaussian<float>(AsSpan({M, K}), 0.0f, 0.25f);
+  const std::vector<uint8_t> weight_vals = random.Uniform<uint8_t>(AsSpan({N, k_blocks, blob_size}), 0, 255);
+  const std::vector<float> scale_vals = random.Uniform<float>(AsSpan({N, k_blocks}), 0.01f, 0.05f);
+
+  auto run = [&](int64_t accuracy_level, const char* min_accuracy_level, std::vector<float>& output) {
+    const std::unordered_map<std::string, int> domain_to_version{{"", 21}, {kMSDomain, 1}};
+    Model model("matmul_nbits_min_accuracy_level", false, ModelMetaData(), PathString(),
+                IOnnxRuntimeOpSchemaRegistryList(), domain_to_version,
+                std::vector<ONNX_NAMESPACE::FunctionProto>(), DefaultLoggingManager().DefaultLogger());
+    Graph& graph = model.MainGraph();
+    ModelTestBuilder builder(graph);
+    NodeArg* input = builder.MakeInput<float>({M, K}, input_vals);
+    NodeArg* weight = builder.MakeInitializer<uint8_t>({N, k_blocks, blob_size}, weight_vals);
+    NodeArg* scales = builder.MakeInitializer<float>({N, k_blocks}, scale_vals);
+    NodeArg* out = builder.MakeOutput<float>(std::vector<int64_t>{M, N});
+    Node& node = builder.AddNode("MatMulNBits", {input, weight, scales}, {out}, kMSDomain);
+    node.AddAttribute("K", K);
+    node.AddAttribute("N", N);
+    node.AddAttribute("bits", static_cast<int64_t>(QBits));
+    node.AddAttribute("block_size", block_size);
+    node.AddAttribute("accuracy_level", accuracy_level);
+    builder.SetGraphOutputs();
+    ASSERT_STATUS_OK(graph.Resolve());
+    std::string model_bytes;
+    ASSERT_TRUE(model.ToProto().SerializeToString(&model_bytes));
+
+    SessionOptions session_options;
+    if (min_accuracy_level != nullptr) {
+      ASSERT_STATUS_OK(session_options.config_options.AddConfigEntry(kOrtSessionOptionsMlasQNBitMinAccuracyLevel,
+                                                                     min_accuracy_level));
+    }
+    InferenceSessionWrapper session{session_options, GetEnvironment()};
+    ASSERT_STATUS_OK(session.Load(model_bytes.data(), static_cast<int>(model_bytes.size())));
+    ASSERT_STATUS_OK(session.Initialize());
+    std::vector<OrtValue> fetches;
+    ASSERT_STATUS_OK(session.Run(RunOptions{}, builder.feeds_, builder.output_names_, &fetches));
+    ASSERT_EQ(fetches.size(), size_t{1});
+    const auto span = fetches[0].Get<Tensor>().DataAsSpan<float>();
+    output.assign(span.begin(), span.end());
+  };
+
+  std::vector<float> acc0, acc4, acc0_raised, acc4_with_lower_min;
+  ASSERT_NO_FATAL_FAILURE(run(0, nullptr, acc0));
+  ASSERT_NO_FATAL_FAILURE(run(4, nullptr, acc4));
+  ASSERT_NO_FATAL_FAILURE(run(0, "4", acc0_raised));
+  ASSERT_NO_FATAL_FAILURE(run(4, "1", acc4_with_lower_min));
+
+  EXPECT_EQ(acc0_raised, acc4);
+  EXPECT_EQ(acc4_with_lower_min, acc4);
+  if (MlasIsQNBitGemmAvailable(QBits, block_size, SQNBIT_CompInt8)) {
+    // The int8 path quantizes A, so its result differs from the fp32 path.
+    EXPECT_NE(acc0_raised, acc0);
+  }
+}
+
+TEST(MatMulNBits, MinAccuracyLevelSessionOptionInvalid) {
+  OpTester test("MatMulNBits", 1, kMSDomain);
+  test.AddAttribute<int64_t>("K", 32);
+  test.AddAttribute<int64_t>("N", 1);
+  test.AddAttribute<int64_t>("block_size", 32);
+  test.AddAttribute<int64_t>("bits", QBits);
+  test.AddInput<float>("A", {1, 32}, std::vector<float>(32, 1.0f));
+  test.AddInput<uint8_t>("B", {1, 1, 16}, std::vector<uint8_t>(16, 0x88), true);
+  test.AddInput<float>("scales", {1, 1}, {1.0f}, true);
+  test.AddOutput<float>("Y", {1, 1}, {0.0f});
+  test.ConfigEp(DefaultCpuExecutionProvider());
+  SessionOptions session_options;
+  ASSERT_STATUS_OK(session_options.config_options.AddConfigEntry(kOrtSessionOptionsMlasQNBitMinAccuracyLevel, "5"));
+  test.Config(session_options);
+  test.Config(OpTester::ExpectResult::kExpectFailure, "mlas.qnbit.min_accuracy_level");
+  test.RunWithConfig();
+}
+
 // Covers multiple concurrent PrePack calls, including two nodes sharing an initializer while a
 // third consumes a distinct initializer. Outputs and prepack counts must match the sequential path.
 TEST(MatMulNBits, ParallelPrepack) {

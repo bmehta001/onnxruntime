@@ -3,14 +3,17 @@
 
 #include "contrib_ops/cpu/quantization/matmul_nbits_impl.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <string>
 #include <type_traits>
 
 #include "core/common/common.h"
 #include "core/common/narrow.h"
+#include "core/common/parse_string.h"
 #include "core/common/safeint.h"
 #include "core/framework/op_kernel.h"
 #include "core/mlas/inc/mlas_qnbit.h"
@@ -157,6 +160,19 @@ GetComputeType<MLFloat16>(size_t nbits, size_t block_size, int64_t accuracy_leve
 
 // Largest block length implemented by the MLAS QNBit GEMM and blockwise dequantization kernels.
 constexpr size_t kMaxExecutionBlockSize = 256;
+
+// Returns the node's accuracy_level raised to the session's kOrtSessionOptionsMlasQNBitMinAccuracyLevel, if set.
+int64_t GetEffectiveAccuracyLevel(const OpKernelInfo& info) {
+  const int64_t accuracy_level = info.GetAttr<int64_t>("accuracy_level");
+  const std::string min_level_str =
+      info.GetConfigOptions().GetConfigOrDefault(kOrtSessionOptionsMlasQNBitMinAccuracyLevel, "0");
+  int64_t min_level = 0;
+  ORT_ENFORCE(TryParseStringWithClassicLocale(min_level_str, min_level) &&
+                  min_level >= static_cast<int64_t>(Level0) && min_level <= static_cast<int64_t>(Level4),
+              "Invalid value for session config ", kOrtSessionOptionsMlasQNBitMinAccuracyLevel, ": '",
+              min_level_str, "'. Expected an integer in [0, 4].");
+  return std::max(accuracy_level, min_level);
+}
 
 constexpr size_t GetExecutionBlockSize(size_t logical_block_size) {
   return logical_block_size > kMaxExecutionBlockSize ? kMaxExecutionBlockSize : logical_block_size;
@@ -312,10 +328,11 @@ class MatMulNBits final : public OpKernel {
         nbits_{narrow<size_t>(info.GetAttr<int64_t>("bits"))},
         has_g_idx_{info.GetInputCount() > InputIndex::g_idx && info.node().InputDefs()[InputIndex::g_idx]->Exists()},
         has_bias_{info.GetInputCount() > InputIndex::bias && info.node().InputDefs()[InputIndex::bias]->Exists()},
+        accuracy_level_{GetEffectiveAccuracyLevel(info)},
         force_fp32_{info.GetConfigOptions().GetConfigEntry(kOrtSessionOptionsMlasQNBitForceFp32) == "1" &&
                     kQNBitForceFp32Supported && std::is_same_v<T1, float> &&
                     nbits_ == 4 && block_size_ == 32 &&
-                    info.GetAttr<int64_t>("accuracy_level") == static_cast<int64_t>(Level4) &&
+                    accuracy_level_ == static_cast<int64_t>(Level4) &&
                     MlasIsQNBitGemmAvailable(nbits_, block_size_, SQNBIT_CompFp32)},
         prefer_lut_gemm_{std::is_same_v<T1, float> &&
                          !force_fp32_ &&
@@ -323,7 +340,7 @@ class MatMulNBits final : public OpKernel {
                          MlasIsLutGemmAvailable(N_, K_, nbits_, block_size_)},
         compute_type_{force_fp32_
                           ? SQNBIT_CompFp32
-                          : GetComputeType<T1>(nbits_, block_size_, info.GetAttr<int64_t>("accuracy_level"))} {
+                          : GetComputeType<T1>(nbits_, block_size_, accuracy_level_)} {
     SetupMlasBackendKernelSelectorFromConfigOptions(mlas_backend_kernel_selector_config_, info.GetConfigOptions());
 
     const auto& node = info.node();
@@ -405,6 +422,7 @@ class MatMulNBits final : public OpKernel {
   const bool has_bias_;
   bool scales_are_packed_{false};
   bool skip_prepack_{false};
+  const int64_t accuracy_level_;
   const bool force_fp32_;
   const bool prefer_lut_gemm_{false};
   const MLAS_QNBIT_GEMM_COMPUTE_TYPE compute_type_;
