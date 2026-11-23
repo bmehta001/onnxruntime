@@ -19,6 +19,7 @@ Abstract:
 #include "sqnbitgemm_q8_block.h"
 
 #include <cassert>
+#include <functional>
 #include <vector>
 
 // N-strip width the CompInt8 compute path tiles by, and the M-tile height
@@ -1367,7 +1368,7 @@ InitializeWorkspace_CompInt8<float>(
         // W8), force W2 down the W8-compatible branch.
         const bool prefer_compute_blksum = (BlkBitWidth == 2);
         if (QuantizeARow && !prefer_compute_blksum) {
-            MlasTrySimpleParallel(ThreadPool, BatchN, [&](ptrdiff_t gemm_idx) {
+            const auto QuantizeAWork = [&](ptrdiff_t gemm_idx) {
                 const auto& data = DataParams[gemm_idx];
 
                 const float* ARowPtr = data.A;
@@ -1378,7 +1379,9 @@ InitializeWorkspace_CompInt8<float>(
                     ARowPtr += data.lda;
                     QuantARowPtr += QuantAStride;
                 }
-            });
+            };
+            // std::cref keeps std::function from heap-allocating the large by-reference capture.
+            MlasTrySimpleParallel(ThreadPool, BatchN, std::cref(QuantizeAWork));
         } else if (QuantizeARow2) {
             // W2 needs SIGNED int8 A (NEON DotProd-only hosts wire the
             // shared QuantizeARowComputeBlkSum_CompInt8 to the UNSIGNED
@@ -1388,7 +1391,7 @@ InitializeWorkspace_CompInt8<float>(
                 (BlkBitWidth == 2 && GetMlasPlatform().QNBitGemmDispatch->QuantizeARowComputeBlkSum_CompInt8_W2 != nullptr)
                     ? GetMlasPlatform().QNBitGemmDispatch->QuantizeARowComputeBlkSum_CompInt8_W2
                     : QuantizeARow2;
-            MlasTrySimpleParallel(ThreadPool, BatchN, [&](ptrdiff_t gemm_idx) {
+            const auto QuantizeAWork = [&](ptrdiff_t gemm_idx) {
                 const auto& data = DataParams[gemm_idx];
                 const float* ARowPtr = data.A;
                 const MLAS_FP16* AFp16RowPtr = data.AFp16;
@@ -1411,11 +1414,13 @@ InitializeWorkspace_CompInt8<float>(
                     QuantARowScalePtr += BlockCountK;
                     QuantARowBlkSum += BlockCountK;
                 }
-            });
+            };
+            // std::cref keeps std::function from heap-allocating the large by-reference capture.
+            MlasTrySimpleParallel(ThreadPool, BatchN, std::cref(QuantizeAWork));
         }
     } else if (BlkBitWidth == 8) {
         if (QuantizeARow2) {
-            MlasTrySimpleParallel(ThreadPool, BatchN, [&](ptrdiff_t gemm_idx) {
+            const auto QuantizeAWork = [&](ptrdiff_t gemm_idx) {
                 const auto& data = DataParams[gemm_idx];
                 const float* ARowPtr = data.A;
                 const MLAS_FP16* AFp16RowPtr = data.AFp16;
@@ -1438,7 +1443,9 @@ InitializeWorkspace_CompInt8<float>(
                     QuantARowScalePtr += BlockCountK;
                     QuantARowBlkSum += BlockCountK;
                 }
-            });
+            };
+            // std::cref keeps std::function from heap-allocating the large by-reference capture.
+            MlasTrySimpleParallel(ThreadPool, BatchN, std::cref(QuantizeAWork));
         }
     }
 }
@@ -1673,7 +1680,7 @@ MlasQNBitGemmBatch(
     const size_t ThreadCountN = MlasDivRoundup(N, StrideN);
     ThreadsPerGemm = ThreadCountM * ThreadCountN;
 
-    MlasTrySimpleParallel(ThreadPool, ThreadsPerGemm * BatchN, [&](ptrdiff_t tid) {
+    const auto ComputeWork = [&](ptrdiff_t tid) {
         const auto gemm_i = tid / ThreadsPerGemm;
         const auto blk_i = tid % ThreadsPerGemm;
         const auto* Data = &DataParams[gemm_i];
@@ -1717,7 +1724,9 @@ MlasQNBitGemmBatch(
         } else {
             ComputeOperation(BlkLen, K, Data, PerGemmWorkspace, RangeStartM, RangeCountM, RangeStartN, RangeCountN, BackendKernelSelectorConfig);
         }
-    });
+    };
+    // std::cref keeps std::function from heap-allocating the large by-reference capture.
+    MlasTrySimpleParallel(ThreadPool, ThreadsPerGemm * BatchN, std::cref(ComputeWork));
 }
 
 template
