@@ -275,6 +275,65 @@ common::Status CopyTensorFromCPUToDevice(
   }
 }
 
+// Finds initializers whose bytes are identical to an earlier initializer planned on the same non-CPU device: either
+// both are views of the same in-memory CPU buffer (e.g. a constant-folded Reshape of a tied embedding weight) or both
+// reference the same external-file range. Only the first of each group is copied to the device; the others become
+// device views of it. Returns a map from alias ort_value_index to the index of the initializer it shares.
+static InlinedHashMap<int, int> FindDeviceInitializerAliases(
+    const GraphViewer& graph,
+    const InlinedHashMap<int, const ONNX_NAMESPACE::TensorProto*>& id_to_initialized_tensor,
+    const InlinedHashSet<int>& user_supplied_initializer_ids,
+    const ExecutionPlanBase& exec_plan) {
+  InlinedHashMap<int, int> alias_to_primary;
+#if !defined(ORT_MINIMAL_BUILD)
+  static const auto default_cpu_device = OrtDevice();
+  InlinedVector<int> indices;
+  indices.reserve(id_to_initialized_tensor.size());
+  for (const auto& entry : id_to_initialized_tensor) {
+    indices.push_back(entry.first);
+  }
+  std::sort(indices.begin(), indices.end());
+
+  InlinedHashMap<std::string, int> source_to_primary;
+  for (int idx : indices) {
+    const auto& tensor_proto = *id_to_initialized_tensor.at(idx);
+    const OrtDevice& device = exec_plan.GetLocation(idx);
+    if (user_supplied_initializer_ids.contains(idx) || tensor_proto.name().empty() ||
+        device == default_cpu_device || utils::HasString(tensor_proto)) {
+      continue;
+    }
+
+    std::string key;
+    if (OrtValue value; graph.GetOrtValueInitializer(tensor_proto.name(), value)) {
+      const Tensor& tensor = value.Get<Tensor>();
+      if (tensor.Location().device.Type() != OrtDevice::CPU || tensor.SizeInBytes() == 0) {
+        continue;
+      }
+      key = MakeString("m|", reinterpret_cast<uintptr_t>(tensor.DataRaw()), "|", tensor.SizeInBytes());
+    } else if (utils::HasExternalData(tensor_proto) && !utils::HasExternalDataInMemory(tensor_proto)) {
+      key = "f";
+      for (const auto& kv : tensor_proto.external_data()) {
+        key += MakeString("|", kv.key(), "=", kv.value());
+      }
+    } else {
+      continue;
+    }
+    key += MakeString("|", tensor_proto.data_type(), "|", device.ToString());
+
+    auto [it, inserted] = source_to_primary.emplace(std::move(key), idx);
+    if (!inserted) {
+      alias_to_primary.emplace(idx, it->second);
+    }
+  }
+#else
+  ORT_UNUSED_PARAMETER(graph);
+  ORT_UNUSED_PARAMETER(id_to_initialized_tensor);
+  ORT_UNUSED_PARAMETER(user_supplied_initializer_ids);
+  ORT_UNUSED_PARAMETER(exec_plan);
+#endif
+  return alias_to_primary;
+}
+
 common::Status SaveInitializedTensors(
     const Env& env, const std::basic_string<PATH_CHAR_TYPE>& graph_loc,
     const GraphViewer& graph, const AllocatorPtr& default_cpu_alloc,
@@ -340,6 +399,9 @@ common::Status SaveInitializedTensors(
 
   static const auto default_cpu_device = OrtDevice();
 
+  const InlinedHashMap<int, int> device_alias_to_primary =
+      FindDeviceInitializerAliases(graph, id_to_initialized_tensor, user_supplied_initializer_ids, exec_plan);
+
   // tensors requiring a specific allocation order are traced first, to ensure they are allocated in order
   // NB1: vector with init allocation order may contain a subset of all tensors (or none at all)
   // NB2: only skip tracing and planning memory when data is external (i.e mmap) and on CPU.
@@ -367,6 +429,7 @@ common::Status SaveInitializedTensors(
     constexpr bool loader_creates_tensor = false;
 #endif
     const bool trace_allocation = !loader_creates_tensor &&
+                                  !device_alias_to_primary.contains(ort_value_index) &&
                                   ((exec_plan.GetLocation(ort_value_index) != default_cpu_device) ||
                                    !utils::HasExternalData(*tensor_proto));
 
@@ -381,6 +444,9 @@ common::Status SaveInitializedTensors(
   for (const auto& entry : initialized_tensors_to_allocate) {
     // We don't want to trace shared initializers since their memory is provided by the user
     if (user_supplied_initializer_ids.find(entry.first) != user_supplied_initializer_ids.end()) {
+      continue;
+    }
+    if (device_alias_to_primary.contains(entry.first)) {
       continue;
     }
     if (utils::HasString(*entry.second)) {
@@ -421,9 +487,16 @@ common::Status SaveInitializedTensors(
   // ??? Should we ignore this session option if the EP is explicitly providing the read only allocator?
   // bool have_readonly_initializer_allocator = alloc->Info().alloc_type == OrtReadOnlyAllocator;
   // This option also means to ignore arena if present and use Reserve().
-  const bool use_device_allocator_for_initializers =
-      session_options.config_options.GetConfigOrDefault(
-          kOrtSessionOptionsUseDeviceAllocatorForInitializers, "0") == "1";
+  // When unset, non-CPU devices default to Reserve(): initializers are long-lived, and allocating them from a
+  // growing arena leaves the arena's power-of-two extension slack permanently reserved on the device.
+  const std::string device_allocator_option = session_options.config_options.GetConfigOrDefault(
+      kOrtSessionOptionsUseDeviceAllocatorForInitializers, "");
+  auto use_device_allocator_for_initializers = [&device_allocator_option](const OrtDevice& device) {
+    if (device_allocator_option.empty()) {
+      return device != default_cpu_device;
+    }
+    return device_allocator_option == "1";
+  };
 
   // Keep opened external-data file handles alive until the loaders drain their queued work.
   [[maybe_unused]] constexpr size_t kMaxCachedExternalDataFiles = 64;
@@ -541,9 +614,17 @@ common::Status SaveInitializedTensors(
 #endif
 
   // 3. create weight tensors based on weights buffer
+  InlinedHashSet<int> device_alias_primaries;
+  for (const auto& [alias_idx, primary_idx] : device_alias_to_primary) {
+    device_alias_primaries.insert(primary_idx);
+  }
+  InlinedHashMap<int, OrtValue> device_primary_values;
   for (const auto& ordered_entry : ordered_initializers) {
     const std::pair<int, const ONNX_NAMESPACE::TensorProto*> entry{
         ordered_entry.ort_value_index, ordered_entry.tensor_proto};
+    if (device_alias_to_primary.contains(entry.first)) {
+      continue;
+    }
     // We check for cancellation for every initializer since mapping from disk can be costly
     if (session_options.IsLoadCancellationFlagSet()) {
       return ORT_MAKE_STATUS(ONNXRUNTIME, MODEL_LOAD_CANCELED,
@@ -589,7 +670,8 @@ common::Status SaveInitializedTensors(
                                                ->GetElementType();
           Tensor tensor;
           ORT_RETURN_IF_ERROR(AllocateTensor((memory_buffer) ? &*memory_buffer : nullptr, tensor, type,
-                                             tensor_shape, use_device_allocator_for_initializers,
+                                             tensor_shape,
+                                             use_device_allocator_for_initializers(memory_info.device),
                                              alloc));
           ORT_RETURN_IF_ERROR(CopyTensorFromCPUToDevice(data_transfer_mgr,
                                                         ort_value_from_graph.Get<Tensor>(),
@@ -615,7 +697,8 @@ common::Status SaveInitializedTensors(
                                            (memory_buffer.has_value()) ? &*memory_buffer : nullptr,
                                            alloc, default_cpu_alloc, ort_value, data_transfer_mgr,
                                            external_data_loader_mgr, prepacked_for_graph,
-                                           use_device_allocator_for_initializers,
+                                           use_device_allocator_for_initializers(
+                                               exec_plan.GetLocation(ort_value_index)),
                                            &external_file_cache);
         if (!st.IsOK()) {
           std::ostringstream oss;
@@ -628,6 +711,10 @@ common::Status SaveInitializedTensors(
     // 'name' is a reference to a string within the TensorProto that save_tensor_func may free
     // so we need to output this message prior to calling save_tensor_func
     VLOGS(logger, 1) << "Adding weight with name : " << name << " with index: " << ort_value_index;
+
+    if (device_alias_primaries.contains(ort_value_index)) {
+      device_primary_values.emplace(ort_value_index, ort_value);
+    }
 
     // any outer scope value is shadowed by a local value and can't override it.
     // due to that check_outer_scope is false
@@ -646,6 +733,36 @@ common::Status SaveInitializedTensors(
   external_data_loader_mgr.EndLoad();
   external_data_load_ended = true;
 #endif
+
+  // Initializers sharing bytes with an already materialized device initializer become views of it. The view keeps
+  // the primary OrtValue alive so releasing either one (e.g. after prepacking) cannot leave the other dangling.
+  for (const auto& [alias_idx, primary_idx] : device_alias_to_primary) {
+    const auto primary_it = device_primary_values.find(primary_idx);
+    ORT_RETURN_IF(primary_it == device_primary_values.end(), "Missing primary initializer for device alias");
+    const OrtValue& primary_value = primary_it->second;
+    const Tensor& primary_tensor = primary_value.Get<Tensor>();
+    const ONNX_NAMESPACE::TensorProto& alias_proto = *id_to_initialized_tensor.at(alias_idx);
+    const TensorShape alias_shape = utils::GetTensorShapeFromTensorProto(alias_proto);
+    ORT_RETURN_IF_NOT(alias_shape.Size() == primary_tensor.Shape().Size(),
+                      "Device alias ", alias_proto.name(), " does not match the size of its primary initializer");
+
+    auto alias_tensor = std::make_unique<Tensor>(primary_tensor.DataType(), alias_shape,
+                                                 const_cast<void*>(primary_tensor.DataRaw()),
+                                                 primary_tensor.Location());
+    OrtValue alias_value;
+    alias_value.Init(alias_tensor.release(), DataTypeImpl::GetType<Tensor>(),
+                     [keep_alive = primary_value](void* p) { delete static_cast<Tensor*>(p); });
+
+    const std::string& name = alias_proto.name();
+    LOGS(logger, INFO) << "Initializer " << name << " shares device memory with an identical initializer.";
+    const bool constant = graph.IsConstantInitializer(name, /* check_outer_scope */ false);
+#if !defined(DISABLE_SPARSE_TENSORS)
+    const bool sparse = graph.GetGraph().IsSparseInitializer(name);
+    ORT_RETURN_IF_ERROR(save_tensor_func(name, alias_idx, alias_value, constant, sparse));
+#else
+    ORT_RETURN_IF_ERROR(save_tensor_func(name, alias_idx, alias_value, constant, false));
+#endif
+  }
   LOGS(logger, INFO) << "Done saving initialized tensors";
   return common::Status::OK();
 }

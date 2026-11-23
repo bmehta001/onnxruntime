@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -627,7 +628,9 @@ TEST(SessionStateTest, TestInitializerMemoryAllocatedUsingNonArenaMemory) {
   AllocatorPtr cpu_allocator = CPUAllocator::DefaultInstance();
   const auto& default_logger = DefaultLoggingManager().DefaultLogger();
 
-  auto setup_and_run_test = [&cpu_allocator, &default_logger](Model& model, bool use_device_allocator) -> AllocatorStats {
+  auto setup_and_run_test = [&cpu_allocator, &default_logger](
+                                Model& model, const char* use_device_allocator,
+                                InlinedHashMap<std::string, const void*>* initializer_data = nullptr) -> AllocatorStats {
     Graph& graph = model.MainGraph();
     DataTransferManager dtm;
     ExecutionProviders execution_providers;
@@ -653,10 +656,9 @@ TEST(SessionStateTest, TestInitializerMemoryAllocatedUsingNonArenaMemory) {
     sess_options.use_deterministic_compute = false;
     sess_options.enable_mem_reuse = true;
 
-    if (use_device_allocator) {
-      // disable allocating initialized tensor memory from the arena(by default it will be allocated by the arena)
+    if (use_device_allocator != nullptr) {
       EXPECT_STATUS_OK(sess_options.config_options.AddConfigEntry(kOrtSessionOptionsUseDeviceAllocatorForInitializers,
-                                                                  "1"));
+                                                                  use_device_allocator));
     }
 
     SessionState session_state(graph, execution_providers, nullptr, nullptr, dtm, edlm,
@@ -681,6 +683,15 @@ TEST(SessionStateTest, TestInitializerMemoryAllocatedUsingNonArenaMemory) {
 
     EXPECT_STATUS_OK(session_state.FinalizeSessionState(model.ModelPath(), krm));
 
+    if (initializer_data != nullptr) {
+      for (const auto& [idx, value] : session_state.GetInitializedTensors()) {
+        std::string name;
+        EXPECT_STATUS_OK(session_state.GetOrtValueNameIdxMap().GetName(idx, name));
+        EXPECT_EQ(value.Get<Tensor>().Location().device.Type(), OrtDevice::GPU) << name;
+        (*initializer_data)[name] = value.Get<Tensor>().DataRaw();
+      }
+    }
+
     // Fetch the CUDA arena-allocator from the session state
     OrtMemoryInfo mem_info(CUDA, OrtArenaAllocator);
     AllocatorPtr alloc = session_state.GetAllocator(mem_info);
@@ -694,29 +705,86 @@ TEST(SessionStateTest, TestInitializerMemoryAllocatedUsingNonArenaMemory) {
   };
 
   const ORTCHAR_T* model_path = ORT_TSTR("testdata/mul_1.onnx");
-  // Part 1: Feature turned ON (i.e.) allocate from non-arena memory
-  {
+  // "1" and unset (the default for non-CPU devices) allocate the sole initializer with an exact-size Reserve().
+  for (const char* option : {"1", static_cast<const char*>(nullptr)}) {
     std::shared_ptr<Model> model;
     ASSERT_STATUS_OK(Model::Load(model_path, model, nullptr, default_logger));
 
-    auto alloc_stats = setup_and_run_test(*model, /*use_device_allocator=*/true);
+    auto alloc_stats = setup_and_run_test(*model, option);
 
-    // Assert that we have made 1 Reserve() call (for allocating memory for the sole initializer in the model)
-    ASSERT_EQ(1, alloc_stats.num_reserves);
+    ASSERT_EQ(1, alloc_stats.num_reserves) << (option ? option : "unset");
+    ASSERT_EQ(0, alloc_stats.num_arena_extensions) << (option ? option : "unset");
   }
 
-  // Part 2: Feature turned OFF (i.e.) allocate from arena memory (default behavior)
+  // Two initializers referencing the same external-data range share one device allocation.
   {
+    const std::filesystem::path model_file = ORT_TSTR("session_state_shared_external_init.onnx");
+    const std::filesystem::path data_file = ORT_TSTR("session_state_shared_external_init.bin");
+    const std::array<float, 4> weights{1.f, 2.f, 3.f, 4.f};
+    {
+      std::ofstream ofs(data_file, std::ios::binary);
+      ofs.write(reinterpret_cast<const char*>(weights.data()), sizeof(weights));
+    }
+
+    auto set_value_info = [](ValueInfoProto* value_info, const char* name) {
+      value_info->set_name(name);
+      auto* tensor_type = value_info->mutable_type()->mutable_tensor_type();
+      tensor_type->set_elem_type(TensorProto_DataType_FLOAT);
+      tensor_type->mutable_shape()->add_dim()->set_dim_value(4);
+    };
+
+    ModelProto model_proto;
+    model_proto.set_ir_version(ONNX_NAMESPACE::Version::IR_VERSION);
+    auto* opset = model_proto.add_opset_import();
+    opset->set_domain("");
+    opset->set_version(13);
+    auto* graph_proto = model_proto.mutable_graph();
+    graph_proto->set_name("shared_external_init");
+    for (const char* name : {"W1", "W2"}) {
+      auto* initializer = graph_proto->add_initializer();
+      initializer->set_name(name);
+      initializer->set_data_type(TensorProto_DataType_FLOAT);
+      initializer->add_dims(4);
+      initializer->set_data_location(TensorProto_DataLocation_EXTERNAL);
+      auto* entry = initializer->add_external_data();
+      entry->set_key("location");
+      entry->set_value(ToUTF8String(data_file.native()));
+      entry = initializer->add_external_data();
+      entry->set_key("offset");
+      entry->set_value("0");
+      entry = initializer->add_external_data();
+      entry->set_key("length");
+      entry->set_value(std::to_string(sizeof(weights)));
+    }
+    set_value_info(graph_proto->add_input(), "X");
+    set_value_info(graph_proto->add_output(), "Y1");
+    set_value_info(graph_proto->add_output(), "Y2");
+    auto* mul = graph_proto->add_node();
+    mul->set_op_type("Mul");
+    mul->add_input("X");
+    mul->add_input("W1");
+    mul->add_output("Y1");
+    auto* add = graph_proto->add_node();
+    add->set_op_type("Add");
+    add->add_input("X");
+    add->add_input("W2");
+    add->add_output("Y2");
+    {
+      std::ofstream ofs(model_file, std::ios::binary);
+      ASSERT_TRUE(model_proto.SerializeToOstream(&ofs));
+    }
+
     std::shared_ptr<Model> model;
-    ASSERT_STATUS_OK(Model::Load(model_path, model, nullptr, default_logger));
+    ASSERT_STATUS_OK(Model::Load(model_file.native(), model, nullptr, default_logger));
 
-    auto alloc_stats = setup_and_run_test(*model, /*use_device_allocator=*/false);
+    InlinedHashMap<std::string, const void*> initializer_data;
+    setup_and_run_test(*model, "1", &initializer_data);
 
-    // One reserve call should have been made (for allocating memory for the sole initializer in the model)
-    ASSERT_EQ(1, alloc_stats.num_reserves);
-
-    // This counter comes from Reserve(). The actual call for arena based allocator went to StreamAwareBFCArena instance
-    ASSERT_EQ(1, alloc_stats.num_allocs);
+    std::filesystem::remove(model_file);
+    std::filesystem::remove(data_file);
+    ASSERT_EQ(2u, initializer_data.size());
+    ASSERT_NE(nullptr, initializer_data["W1"]);
+    ASSERT_EQ(initializer_data["W1"], initializer_data["W2"]);
   }
 }
 

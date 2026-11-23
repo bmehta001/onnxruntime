@@ -202,7 +202,8 @@ static const char* const kOrtSessionOptionsConstantFoldingMaxOutputSizeInBytes =
 // Default value is set to "1".
 static const char* const kOrtSessionOptionsGraphOptimizationsLoopLevel = "session.graph_optimizations_loop_level";
 
-// Enable or disable using device allocator for allocating initialized tensor memory. "1": enable; "0": disable. The default is "0".
+// Enable or disable using device allocator for allocating initialized tensor memory. "1": enable; "0": disable.
+// When unset, initializers placed on non-CPU devices use the device allocator and CPU initializers do not.
 // Using device allocators means the memory allocation is made using malloc/new.
 static const char* const kOrtSessionOptionsUseDeviceAllocatorForInitializers = "session.use_device_allocator_for_initializers";
 
