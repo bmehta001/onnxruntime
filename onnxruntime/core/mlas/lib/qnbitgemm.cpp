@@ -1451,7 +1451,7 @@ InitializeWorkspace_CompInt8<float>(
 }
 
 template <typename T>
-using InitializeWorkspaceFn = std::function<void(
+using InitializeWorkspaceFn = void (*)(
     size_t M,
     size_t N,
     size_t K,
@@ -1463,7 +1463,7 @@ using InitializeWorkspaceFn = std::function<void(
     MLAS_THREADPOOL* ThreadPool,
     size_t BlkBitWidth,
     const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* BackendKernelSelectorConfig
-)>;
+);
 
 template <typename T>
 InitializeWorkspaceFn<T>
@@ -1492,7 +1492,7 @@ GetInitializeWorkspace(QNBitGemmVariant variant)
 }
 
 template <typename T>
-using QNBitGemmFn = std::function<void(
+using QNBitGemmFn = void (*)(
     const size_t BlkLen,
     const size_t K,
     const MLAS_QNBIT_GEMM_DATA_PARAMS<T>* const DataParams,
@@ -1502,7 +1502,7 @@ using QNBitGemmFn = std::function<void(
     const size_t RangeStartN,
     const size_t RangeCountN,
     const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* BackendKernelSelectorConfig
-)>;
+);
 
 template <typename T>
 QNBitGemmFn<T>
