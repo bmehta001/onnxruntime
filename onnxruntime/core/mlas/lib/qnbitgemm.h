@@ -22,6 +22,8 @@ Abstract:
 
 #pragma once
 
+#include <cassert>
+
 #include "mlas_qnbit.h"
 #include "mlasi.h"
 
@@ -56,9 +58,12 @@ inline constexpr size_t kSq2BitAvx512WeightKBlockGroup = 4;
 
 template <typename T, int BlkBitWidth>
 struct PackedQuantBDataStruct {
-    PackedQuantBDataStruct(void* PackedQuantBWorkspace, size_t N, size_t BlockCountK, size_t BlkLen, bool QuantAUnsigned)
+    // OmitBlkSum: the buffer has no QuantBBlkSum region (QuantBBlkSum is null) and the kernel derives the
+    // block sums from the packed scales. Only valid when QuantAUnsigned is false.
+    PackedQuantBDataStruct(void* PackedQuantBWorkspace, size_t N, size_t BlockCountK, size_t BlkLen, bool QuantAUnsigned, bool OmitBlkSum = false)
         : QuantBWorkspace_(PackedQuantBWorkspace), N_(N), BlockCountK_(BlockCountK), BlkLen_(BlkLen)
     {
+        assert(!(OmitBlkSum && QuantAUnsigned));
         // For 2-bit weights, the AVX-512 W2 packed layout groups
         // kSq2BitAvx512WeightKBlockGroup (=4) consecutive K-blocks into a
         // single 64-byte slot so the SIMD unpack is one ZMM load + four fixed
@@ -95,7 +100,11 @@ struct PackedQuantBDataStruct {
         QuantBBlkSum = (T*)(PackedQuantBData + PackedQuantBDataSize);
         QuantBBlkSum = (T*)MlasAlignAddress(QuantBBlkSum, MlasQNBitQuantBBlkSumAlignment());
 
-        if (QuantAUnsigned) {
+        if (OmitBlkSum) {
+            PackedQuantBScale = QuantBBlkSum;
+            QuantBBlkSum = nullptr;
+            BlkUnsignedQuantAZeroPointCorrection = nullptr;
+        } else if (QuantAUnsigned) {
             BlkUnsignedQuantAZeroPointCorrection = (T*)((std::byte*)QuantBBlkSum + BlkSumSize);
             BlkUnsignedQuantAZeroPointCorrection = (T*)MlasAlignAddress(BlkUnsignedQuantAZeroPointCorrection, MlasQNBitQuantBBlkSumAlignment());
             PackedQuantBScale = (T*)((std::byte*)BlkUnsignedQuantAZeroPointCorrection + BlkSumSize);
@@ -145,6 +154,15 @@ struct MLAS_QNBIT_GEMM_DISPATCH {
     );
 
     Q4BitGemmPackQuantBDataSize_Fn* Q4BitGemmPackQuantBDataSize = nullptr;
+
+    /**
+     * Returns true when the SQNBIT_CompInt8 4-bit packed B buffer omits the QuantBBlkSum region (see
+     * PackedQuantBDataStruct OmitBlkSum). Must give the same answer at pack and compute time, where HasZeroPoint
+     * is whether zero points are supplied. Optional; null means the block sums are always stored.
+     */
+    typedef bool(Q4BitGemmCompInt8OmitsBlkSum_Fn)(size_t BlkLen, bool HasZeroPoint);
+
+    Q4BitGemmCompInt8OmitsBlkSum_Fn* Q4BitGemmCompInt8OmitsBlkSum = nullptr;
 
     /** Gets size of packed quantized B data containing 8-bit integers. See MlasQNBitGemmPackQuantBDataSize(). */
     typedef size_t(Q8BitGemmPackQuantBDataSize_Fn)(

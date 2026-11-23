@@ -874,6 +874,25 @@ TEST(MatMulNBits, SharedPrepackedWeights_DynamicZeroPoints_AsymmetricCompInt8) {
   RunTest<float>(opts);
 }
 
+// Runtime zero points with a constant B on every platform: the Q4 CompInt8 B pack layout depends on whether
+// zero points exist, so PrePack(B) must not build it before the runtime zero points are known. M > 1 runs the
+// block-sum correction path, which a pack built without zero points would get wrong.
+TEST(MatMulNBits, DynamicZeroPoints_AsymmetricCompInt8_MultiRow) {
+  for (int64_t M : {1, 8}) {
+    TestOptions opts{};
+    opts.M = M;
+    opts.N = 96;
+    opts.K = 256;
+    opts.block_size = 32;
+    opts.accuracy_level = 4;
+    opts.has_zero_point = true;
+    opts.zero_points_are_initializers = false;
+    opts.output_abs_error = 0.1f;
+    opts.output_rel_error = 0.02f;
+    RunTest<float>(opts);
+  }
+}
+
 // Negative control: with the shared container present but neither opt-in mechanism enabled, no
 // pre-packed weights are shared across sessions.
 TEST(MatMulNBits, SharedPrepackedWeights_NotSharedWithoutOptIn) {

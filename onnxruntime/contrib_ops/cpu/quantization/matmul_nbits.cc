@@ -531,6 +531,18 @@ static const float* ConvertFloatZeroPointsForLutGemm(
   return zp_fp32_buf.data();
 }
 
+#if defined(MLAS_TARGET_AMD64_IX86)
+namespace {
+// The x86 Q4 CompInt8 packed B layout depends on whether zero points exist: asymmetric packs store the
+// zero-point-derived block sums, symmetric packs may omit them. Runtime zero points arrive after PrePack(B),
+// so decline prepacking rather than create a pack whose layout does not match the Compute-time inputs.
+bool RequiresDynamicZeroPointPrepackFallback(size_t nbits, bool has_zp_arg, bool has_zp_input,
+                                             MLAS_QNBIT_GEMM_COMPUTE_TYPE compute_type) {
+  const auto effective_compute_type = compute_type == HQNBIT_CompInt8 ? SQNBIT_CompInt8 : compute_type;
+  return has_zp_arg && !has_zp_input && nbits == 4 && effective_compute_type == SQNBIT_CompInt8;
+}
+}  // namespace
+#endif
 #if defined(MLAS_TARGET_ARM64)
 namespace {
 bool RequiresDynamicQuantizationParameterPrepackFallback(
@@ -650,6 +662,11 @@ Status MatMulNBits<T1>::PrePack(const Tensor& input_tensor, int input_idx, /*out
   if (RequiresDynamicQuantizationParameterPrepackFallback(
           K_, nbits_, block_size_, has_scales_initializer_, has_zp_arg_, has_zp_input_,
           compute_type_, mlas_backend_kernel_selector_config_)) {
+    return Status::OK();
+  }
+#endif
+#if defined(MLAS_TARGET_AMD64_IX86)
+  if (RequiresDynamicZeroPointPrepackFallback(nbits_, has_zp_arg_, has_zp_input_, compute_type_)) {
     return Status::OK();
   }
 #endif
@@ -1049,6 +1066,11 @@ Status MatMulNBits<MLFloat16>::PrePack(const Tensor& input_tensor, int input_idx
     return Status::OK();
   }
 #endif
+#if defined(MLAS_TARGET_AMD64_IX86)
+  if (RequiresDynamicZeroPointPrepackFallback(nbits_, has_zp_arg_, has_zp_input_, compute_type_)) {
+    return Status::OK();
+  }
+#endif
 
   const auto effective_compute_type = compute_type_ == HQNBIT_CompInt8 ? SQNBIT_CompInt8 : compute_type_;
   if (input_idx == InputIndex::B) {
@@ -1163,6 +1185,11 @@ Status MatMulNBits<T1>::UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>& 
                       K_, nbits_, block_size_, has_scales_initializer_, has_zp_arg_, has_zp_input_,
                       compute_type_, mlas_backend_kernel_selector_config_),
                   "MatMulNBits cannot use shared prepacked B for KleidiAI Q4 with runtime scales or zero_points. ",
+                  "PrePack should have declined prepacking for this node.");
+#endif
+#if defined(MLAS_TARGET_AMD64_IX86)
+    ORT_RETURN_IF(RequiresDynamicZeroPointPrepackFallback(nbits_, has_zp_arg_, has_zp_input_, compute_type_),
+                  "MatMulNBits cannot use shared prepacked B for Q4 CompInt8 with runtime zero_points. ",
                   "PrePack should have declined prepacking for this node.");
 #endif
 

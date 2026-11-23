@@ -63,13 +63,12 @@ MlasQNBitPackChunkSize(size_t TotalUnits, size_t N, MLAS_THREADPOOL* ThreadPool)
 
 template <int BlkBitWidth>
 static size_t
-QNBitGemmPackQuantBDataSize(
+QNBitGemmPackQuantBDataSizeImpl(
     size_t N,
     size_t K,
     size_t BlkLen,
-    bool /* HasZeroPoint */,
     MLAS_QNBIT_GEMM_COMPUTE_TYPE ComputeType,
-    const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* /* BackendKernelSelectorConfig */
+    bool OmitBlkSum
 )
 {
     const size_t BlockCountK = MlasDivRoundup(K, BlkLen);
@@ -84,12 +83,30 @@ QNBitGemmPackQuantBDataSize(
         constexpr size_t PackedQuantBDataAlignment = 64;
         PackedQuantBDataSize += SafeInt<size_t>(PackedQuantBDataAlignment) - 1;
         constexpr size_t BlkSumAlignment = MlasQNBitQuantBBlkSumAlignment();
+        if (OmitBlkSum) {
+            // The scales start at the BlkSum-aligned address after the data (see PackedQuantBDataStruct).
+            BlkSumSize = 0;
+        }
         BlkSumSize += SafeInt<size_t>(BlkSumAlignment) - 1;
 
         return static_cast<size_t>(PackedQuantBDataSize + ScaleSize + BlkSumSize);
     } else {
         return static_cast<size_t>(BlockCount * BlkDataSize);
     }
+}
+
+template <int BlkBitWidth>
+static size_t
+QNBitGemmPackQuantBDataSize(
+    size_t N,
+    size_t K,
+    size_t BlkLen,
+    bool /* HasZeroPoint */,
+    MLAS_QNBIT_GEMM_COMPUTE_TYPE ComputeType,
+    const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* /* BackendKernelSelectorConfig */
+)
+{
+    return QNBitGemmPackQuantBDataSizeImpl<BlkBitWidth>(N, K, BlkLen, ComputeType, false);
 }
 
 static void
@@ -435,9 +452,11 @@ ComputePackBlkSum(
             }
 
             // BlockSum write using pre-computed offsets
-            const size_t dst_offset = blocksum_row_offset + k_blk * 16 + blocksum_col_offset;
-            *(BlockSumBegin + dst_offset) = -QuantBScale * zp;
-            
+            if (BlockSumBegin != nullptr) {
+                const size_t dst_offset = blocksum_row_offset + k_blk * 16 + blocksum_col_offset;
+                *(BlockSumBegin + dst_offset) = -QuantBScale * zp;
+            }
+
             if (BlkLen == 16) {  // TODO
 
             } else if (BlkLen >= SubBlkLen) {

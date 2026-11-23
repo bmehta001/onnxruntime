@@ -358,6 +358,13 @@ struct PerGemmQuantAWorkspace {
     size_t M_, BlockCountK_, BlkLen_;
 };
 
+static bool
+Q4BitCompInt8OmitsBlkSum(const MLAS_QNBIT_GEMM_DISPATCH* Dispatch, size_t BlkLen, bool HasZeroPoint)
+{
+    return Dispatch != nullptr && Dispatch->Q4BitGemmCompInt8OmitsBlkSum != nullptr &&
+           Dispatch->Q4BitGemmCompInt8OmitsBlkSum(BlkLen, HasZeroPoint);
+}
+
 void MLASCALL
 MlasQNBitGemmPackQuantBData(
     size_t N,
@@ -394,7 +401,10 @@ MlasQNBitGemmPackQuantBData(
     if (BlkBitWidth == 4) {
         if (ComputeType == SQNBIT_CompInt8 && Dispatch->SQ4BitGemmPackQuantBDataAndBlkSum != nullptr) {
             const size_t BlockCountK = MlasDivRoundup(K, BlkLen);
-            PackedQuantBDataStruct<float, 4> packed_quant_b(PackedQuantBDataAndOrBlkSumWorkspace, N, BlockCountK, BlkLen, false);
+            PackedQuantBDataStruct<float, 4> packed_quant_b(
+                PackedQuantBDataAndOrBlkSumWorkspace, N, BlockCountK, BlkLen, false,
+                Q4BitCompInt8OmitsBlkSum(Dispatch, BlkLen, HasZeroPoint)
+            );
             Dispatch->SQ4BitGemmPackQuantBDataAndBlkSum(
                 N,
                 K,
@@ -924,7 +934,8 @@ SQ4BitGemm_CompInt8(
             ? nullptr
             : static_cast<const std::byte*>(DataParams->QuantBZeroPoint) + RangeStartN * k_blks_zp_bytes;
     const float* ABlockSum = per_gemm_quant_a_workspace->BlockSum + RangeStartM * k_blks;
-    const float* QuantBBlkSum = DataParams->QuantBBlkSum + RangeStartN * k_blks;
+    const float* QuantBBlkSum =
+        (DataParams->QuantBBlkSum == nullptr) ? nullptr : DataParams->QuantBBlkSum + RangeStartN * k_blks;
 
     // fp16 output: let the kernel write each N-strip into a per-thread fp32 scratch, then
     // convert that strip straight to fp16, so the full fp32 result never lands in a caller
@@ -996,7 +1007,8 @@ SQ4BitGemm_CompInt8(
 #ifdef MLAS_TARGET_AMD64_IX86
         else if (GetMlasPlatform().QNBitGemmDispatch->SQ4BitGemmKernel_BlkSum_CompInt8 != nullptr)
         {
-            const float* b_blk_sum = QuantBBlkSum + n * k_blks;
+            // Null when the packed layout omits the block sums; the kernel derives them from the scales.
+            const float* b_blk_sum = (QuantBBlkSum == nullptr) ? nullptr : QuantBBlkSum + n * k_blks;
             if (to_fp16) {
                 // fp16 output and a post-processor are never set together by the operator, so the
                 // fp32-branch post-processing does not apply here; assert rather than silently
@@ -1602,7 +1614,7 @@ MlasQNBitGemmBatch(
             void* PerGemmWorkspace =
                 reinterpret_cast<std::byte*>(Workspace) + gemm_i * PerGemmWorkspaceStride;
             if (Variant == SQ4BitGemmVariant_CompInt8 && GetMlasPlatform().QNBitGemmDispatch->SQ4BitGemmKernel_BlkSum_CompInt8 != nullptr) {
-                PackedQuantBDataStruct<T, 4> packed_quant_b(const_cast<void*>(Data->QuantBDataWorkspace), N, BlockCountK, BlkLen, false);
+                PackedQuantBDataStruct<T, 4> packed_quant_b(const_cast<void*>(Data->QuantBDataWorkspace), N, BlockCountK, BlkLen, false, Q4BitCompInt8OmitsBlkSum(GetMlasPlatform().QNBitGemmDispatch, BlkLen, Data->QuantBZeroPoint != nullptr));
                 const_cast<MLAS_QNBIT_GEMM_DATA_PARAMS<T>*>(Data)->PackedQuantBData = packed_quant_b.PackedQuantBData;
                 const_cast<MLAS_QNBIT_GEMM_DATA_PARAMS<T>*>(Data)->QuantBBlkSum = packed_quant_b.QuantBBlkSum;
                 const_cast<MLAS_QNBIT_GEMM_DATA_PARAMS<T>*>(Data)->QuantBScale = packed_quant_b.PackedQuantBScale;
@@ -1690,7 +1702,7 @@ MlasQNBitGemmBatch(
         void* PerGemmWorkspace =
             reinterpret_cast<std::byte*>(Workspace) + gemm_i * PerGemmWorkspaceStride;
         if (Variant == SQ4BitGemmVariant_CompInt8 && GetMlasPlatform().QNBitGemmDispatch->SQ4BitGemmKernel_BlkSum_CompInt8 != nullptr) {
-            PackedQuantBDataStruct<T, 4> packed_quant_b(const_cast<void*>(Data->QuantBDataWorkspace), N, BlockCountK, BlkLen, false);
+            PackedQuantBDataStruct<T, 4> packed_quant_b(const_cast<void*>(Data->QuantBDataWorkspace), N, BlockCountK, BlkLen, false, Q4BitCompInt8OmitsBlkSum(GetMlasPlatform().QNBitGemmDispatch, BlkLen, Data->QuantBZeroPoint != nullptr));
             const_cast<MLAS_QNBIT_GEMM_DATA_PARAMS<T>*>(Data)->PackedQuantBData = packed_quant_b.PackedQuantBData;
             const_cast<MLAS_QNBIT_GEMM_DATA_PARAMS<T>*>(Data)->QuantBBlkSum = packed_quant_b.QuantBBlkSum;
             const_cast<MLAS_QNBIT_GEMM_DATA_PARAMS<T>*>(Data)->QuantBScale = packed_quant_b.PackedQuantBScale;

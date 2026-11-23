@@ -19,6 +19,7 @@ Abstract:
 #include <cassert>
 #include <cstring>
 #include <utility>
+#include <vector>
 
 #include "qnbitgemm.h"
 #include "sqnbitgemm_kernel_avx_common.h"
@@ -556,6 +557,145 @@ SQ4BitGemmM1Kernel_CompInt8_avx2(
     }
 }
 
+//
+// Symmetric 4-bit CompInt8 packed buffers produced by this dispatch omit QuantBBlkSum (see
+// SQ4BitGemmCompInt8OmitsBlkSum_avx2): each block sum is -scale * 8, so the packed scales carry the same
+// information. These helpers rebuild, per call, the exact float values ComputePackBlkSum would have stored
+// in the GemmFloatKernel width-16 layout, so the correction GEMM below is unchanged and bit-identical.
+// The M == 1 kernel folds the zero point into its inner loop and never needs the block sums.
+//
+
+static bool
+SQ4BitGemmCompInt8OmitsBlkSum_avx2(size_t BlkLen, bool HasZeroPoint)
+{
+    // BlkLen 16 runs the block-sum correction even for M == 1, so it keeps the stored sums.
+    return !HasZeroPoint && BlkLen >= 32;
+}
+
+static size_t
+Q4BitGemmPackQuantBDataSize_avx2(
+    size_t N,
+    size_t K,
+    size_t BlkLen,
+    bool HasZeroPoint,
+    MLAS_QNBIT_GEMM_COMPUTE_TYPE ComputeType,
+    const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* /* BackendKernelSelectorConfig */
+)
+{
+    return QNBitGemmPackQuantBDataSizeImpl<4>(
+        N, K, BlkLen, ComputeType, SQ4BitGemmCompInt8OmitsBlkSum_avx2(BlkLen, HasZeroPoint)
+    );
+}
+
+// -scale * zp with zp = 8, computed exactly as ComputePackBlkSum does (negate, then multiply).
+MLAS_FORCEINLINE __m128
+NegScaleTimesSymmetricZp(__m128 scale)
+{
+    return _mm_mul_ps(_mm_xor_ps(scale, _mm_set1_ps(-0.0f)), _mm_set1_ps(8.0f));
+}
+
+MLAS_FORCEINLINE __m256
+NegScaleTimesSymmetricZp(__m256 scale)
+{
+    return _mm256_mul_ps(_mm256_xor_ps(scale, _mm256_set1_ps(-0.0f)), _mm256_set1_ps(8.0f));
+}
+
+static const float*
+DeriveSymmetricQ4BlkSum_avx2(size_t BlkLen, const float* QuantBScale, size_t CountN, size_t BlockCountK)
+{
+    assert(BlkLen >= 32);
+
+    // GemmFloatKernel expects its packed B operand to be aligned like the stored block sums.
+    constexpr size_t Alignment = MlasQNBitQuantBBlkSumAlignment();
+    static thread_local std::vector<float> blk_sum;
+    const size_t size = MlasDivRoundup(CountN, 16) * BlockCountK * 16 + Alignment / sizeof(float);
+    if (blk_sum.size() < size) {
+        blk_sum.resize(size);
+    }
+    float* dst = static_cast<float*>(MlasAlignAddress(blk_sum.data(), Alignment));
+
+    // Packed scale layout (ComputePackBlkSum): each full group of 4 columns is interleaved by block, the
+    // trailing CountN % 4 columns are stored row-major. BlkLen 32 uses SubBlkLen 64, which interleaves
+    // pairs of blocks per column; BlkLen >= 64 stores the 4 column scales of each block contiguously.
+    // Each 16-column output row is filled from up to 4 column groups at once so the scratch is written
+    // sequentially, one full cache line per block.
+    const size_t full_groups = CountN / 4;
+    const size_t group_stride = 4 * BlockCountK;
+    for (size_t n16 = 0; n16 < full_groups * 4; n16 += 16) {
+        const size_t groups = std::min<size_t>(4, full_groups - n16 / 4);
+        const float* src = QuantBScale + n16 * BlockCountK;
+        float* d = dst + n16 * BlockCountK;
+        if (BlkLen == 32) {
+            const __m256i deinterleave = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+            const size_t pairs = BlockCountK / 2;
+            size_t p = 0;
+            if (groups == 4) {
+                // Full 16 columns: assemble each 64-byte row from the 4 groups and store it whole.
+                for (; p < pairs; ++p) {
+                    __m256 v[4];
+                    for (size_t gi = 0; gi < 4; ++gi) {
+                        v[gi] = NegScaleTimesSymmetricZp(
+                            _mm256_permutevar8x32_ps(_mm256_loadu_ps(src + gi * group_stride + p * 8), deinterleave)
+                        );
+                    }
+                    float* row = d + (2 * p) * 16;
+                    _mm256_store_ps(row, _mm256_permute2f128_ps(v[0], v[1], 0x20));
+                    _mm256_store_ps(row + 8, _mm256_permute2f128_ps(v[2], v[3], 0x20));
+                    _mm256_store_ps(row + 16, _mm256_permute2f128_ps(v[0], v[1], 0x31));
+                    _mm256_store_ps(row + 24, _mm256_permute2f128_ps(v[2], v[3], 0x31));
+                }
+            }
+            for (; p < pairs; ++p) {
+                for (size_t gi = 0; gi < groups; ++gi) {
+                    const __m256 v =
+                        _mm256_permutevar8x32_ps(_mm256_loadu_ps(src + gi * group_stride + p * 8), deinterleave);
+                    _mm_storeu_ps(d + (2 * p) * 16 + gi * 4, NegScaleTimesSymmetricZp(_mm256_castps256_ps128(v)));
+                    _mm_storeu_ps(d + (2 * p + 1) * 16 + gi * 4, NegScaleTimesSymmetricZp(_mm256_extractf128_ps(v, 1)));
+                }
+            }
+            if (BlockCountK % 2 != 0) {
+                for (size_t gi = 0; gi < groups; ++gi) {
+                    _mm_storeu_ps(
+                        d + (BlockCountK - 1) * 16 + gi * 4,
+                        NegScaleTimesSymmetricZp(_mm_loadu_ps(src + gi * group_stride + pairs * 8))
+                    );
+                }
+            }
+        } else if (groups == 4) {
+            for (size_t k = 0; k < BlockCountK; ++k) {
+                const __m256 lo = _mm256_insertf128_ps(
+                    _mm256_castps128_ps256(_mm_loadu_ps(src + k * 4)), _mm_loadu_ps(src + group_stride + k * 4), 1
+                );
+                const __m256 hi = _mm256_insertf128_ps(
+                    _mm256_castps128_ps256(_mm_loadu_ps(src + 2 * group_stride + k * 4)),
+                    _mm_loadu_ps(src + 3 * group_stride + k * 4), 1
+                );
+                _mm256_store_ps(d + k * 16, NegScaleTimesSymmetricZp(lo));
+                _mm256_store_ps(d + k * 16 + 8, NegScaleTimesSymmetricZp(hi));
+            }
+        } else {
+            for (size_t k = 0; k < BlockCountK; ++k) {
+                for (size_t gi = 0; gi < groups; ++gi) {
+                    _mm_storeu_ps(
+                        d + k * 16 + gi * 4, NegScaleTimesSymmetricZp(_mm_loadu_ps(src + gi * group_stride + k * 4))
+                    );
+                }
+            }
+        }
+    }
+
+    constexpr uint8_t zp = 8;
+    for (size_t n = full_groups * 4; n < CountN; ++n) {
+        const float* src = QuantBScale + n * BlockCountK;
+        float* d = dst + (n / 16) * BlockCountK * 16 + (n % 16);
+        for (size_t k = 0; k < BlockCountK; ++k) {
+            d[k * 16] = -src[k] * zp;
+        }
+    }
+
+    return dst;
+}
+
 MLAS_FORCEINLINE
 size_t
 SQ4BitGemmKernel_BlkSum_CompInt8_avx2(
@@ -597,6 +737,9 @@ SQ4BitGemmKernel_BlkSum_CompInt8_avx2(
     );
     float* c_blk = C;
     const float* b_blk_sum = QuantBBlkSum;
+    if (b_blk_sum == nullptr) {
+        b_blk_sum = DeriveSymmetricQ4BlkSum_avx2(BlkLen, QuantBScale, CountN, BlockCountK);
+    }
 
     size_t RowsRemaining = CountM;
     const float* a_blksum_row = ABlockSum;
@@ -1546,7 +1689,8 @@ SQ2BitGemmKernel_BlkSum_CompInt8_Avx2_Dispatch(
 const MLAS_QNBIT_GEMM_DISPATCH MlasSQNBitGemmDispatchAvx2 = []() {
     MLAS_QNBIT_GEMM_DISPATCH d;
 
-    d.Q4BitGemmPackQuantBDataSize = QNBitGemmPackQuantBDataSize<4>;
+    d.Q4BitGemmPackQuantBDataSize = Q4BitGemmPackQuantBDataSize_avx2;
+    d.Q4BitGemmCompInt8OmitsBlkSum = SQ4BitGemmCompInt8OmitsBlkSum_avx2;
     d.Q8BitGemmPackQuantBDataSize = QNBitGemmPackQuantBDataSize<8>;
     d.SQ4BitGemmPackQuantBData = SQ4BitGemmPackQuantBData;
     d.SQ4BitGemmPackQuantBDataAndBlkSum = SQ4BitGemmPackQuantBDataAndBlkSum;
