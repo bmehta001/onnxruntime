@@ -231,9 +231,12 @@ WeightOnlyGroupwiseQuantGemmPluginProfiler::getDeterministicConfig(int m) const 
       }
     }
   }
+  // The runner dispatches the Sm89 kernels on an SM89 device even though mArch (the weight packing SM) is 80, and
+  // those kernels reject two-stage configs.
+  const bool allow_two_stages = mArch < 89 && mDeviceSm != 89;
   for (const auto& config : configs) {
     if (!config.enableCudaKernel && config.split_k_style == cutlass_extensions::SplitKStyle::NO_SPLIT_K &&
-        (mArch < 89 || config.stages != 2)) {
+        (allow_two_stages || config.stages != 2)) {
       return config;
     }
   }
