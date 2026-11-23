@@ -589,6 +589,30 @@ Status mha_fwd_kvcache(const cudaDeviceProp& dprops,
     params.page_block_size = 1;
   }
 
+  // Single-token GQA decode: view the query heads sharing a KV head as query rows of that KV head,
+  // so each CTA streams its K/V tile once for the whole group instead of once per query head.
+  // A lone query attends every cached key, so causal masking is a no-op and is dropped (the swapped
+  // rows must not be masked against each other). Query RoPE then uses the same position for every
+  // row, as the unswapped causal path does for its single row. The q/o element order and the
+  // lse/accumulator layouts ([b, h, 1] == [b, h_k, ngroups]) are unchanged.
+  const bool swap_ngroups = seqlen_q == 1 && num_heads > num_heads_k && num_heads % num_heads_k == 0 &&
+                            local_window_size < 0 && head_sink == nullptr && seqused_q == nullptr &&
+                            !paged_KV;
+  if (swap_ngroups) {
+    const int ngroups = num_heads / num_heads_k;
+    params.h = num_heads_k;
+    params.h_h_k_ratio = 1;
+    params.seqlen_q = ngroups;
+    params.seqlen_q_rounded = round_multiple(ngroups, 128);
+    params.q_head_stride = static_cast<int64_t>(ngroups) * head_size;
+    params.q_row_stride = head_size;
+    params.o_head_stride = static_cast<int64_t>(ngroups) * head_size;
+    params.o_row_stride = head_size;
+    params.is_causal = false;
+    params.window_size_left = -1;
+    params.window_size_right = -1;
+  }
+
   // Only split kernel supports appending to KV cache
   // or if using packed QKV (to ensure correct handling of strided inputs which might be better supported or isolated in split kernel logic).
   // Note: if the fused kernel handles packing/rotary/appending, it should pass is_packed_qkv=false to this API (via use_packed_for_fa=false),

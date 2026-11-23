@@ -4823,7 +4823,8 @@ static void RunGQACudaCacheAliasingTest(
     bool shared_cache_only = false,
     bool enable_flash_fast_decode = false,
     bool packed_qkv = false,
-    std::optional<int32_t> query_seqlens = std::nullopt) {
+    std::optional<int32_t> query_seqlens = std::nullopt,
+    int num_heads = 4) {
   ScopedEnvironmentVariables scoped_env_vars{{
       {"ORT_DISABLE_FLASH_ATTENTION", use_flash ? "0" : "1"},
       {"ORT_DISABLE_MEMORY_EFFICIENT_ATTENTION", "1"},
@@ -4841,7 +4842,6 @@ static void RunGQACudaCacheAliasingTest(
   }
 
   const int batch_size = windowed_sequence_length > 1 ? 1 : 2;
-  constexpr int num_heads = 4;
   constexpr int kv_num_heads = 2;
   constexpr int head_size = 128;
   const int sequence_length = windowed_sequence_length > 0 ? windowed_sequence_length : 1;
@@ -4849,7 +4849,7 @@ static void RunGQACudaCacheAliasingTest(
   const bool valid_windowed_cache = windowed_sequence_length > 0;
   const int total_length = valid_windowed_cache ? 257 : past_length + sequence_length;
   constexpr int cache_capacity = 8;
-  constexpr int hidden_size = num_heads * head_size;
+  const int hidden_size = num_heads * head_size;
   constexpr int kv_hidden_size = kv_num_heads * head_size;
 
   Model model("gqa_cuda_cache_aliasing", true, ModelMetaData(), PathString(),
@@ -4935,7 +4935,7 @@ static void RunGQACudaCacheAliasingTest(
   const auto query_data = make_data(query_shape.Size(), 1);
   OrtValue query_value;
   if (packed_qkv) {
-    constexpr int packed_hidden_size = hidden_size + 2 * kv_hidden_size;
+    const int packed_hidden_size = hidden_size + 2 * kv_hidden_size;
     std::vector<MLFloat16> packed_data(static_cast<size_t>(batch_size) * sequence_length * packed_hidden_size);
     for (int token = 0; token < batch_size * sequence_length; ++token) {
       auto destination = packed_data.begin() + token * packed_hidden_size;
@@ -5310,6 +5310,23 @@ TEST(GroupQueryAttentionTest, CudaFlashFastDecodeClampsOversizedSeqlensK) {
   RunGQACudaCacheAliasingTest(
       true, false, 0, &clamped_output, cache_capacity - sequence_length, true, true);
   ExpectOutputsMatch(invalid_output, clamped_output, 0.002f, "oversized decode seqlens_k clamp");
+#else
+  GTEST_SKIP() << "FlashAttention is not compiled";
+#endif
+}
+
+// Group size 7 (Qwen2.5) misses XQA; Flash fast decode folds the 7 query heads of each KV head into rows.
+TEST(GroupQueryAttentionTest, CudaFlashFastDecodeGroupedHeadsMatchUnfused) {
+#if USE_FLASH_ATTENTION
+  constexpr int num_heads = 14;
+  std::vector<float> flash_output;
+  std::vector<float> unfused_output;
+  RunGQACudaCacheAliasingTest(true, false, 0, &flash_output, std::nullopt, true, true, false, std::nullopt,
+                              num_heads);
+  RunGQACudaCacheAliasingTest(false, false, 0, &unfused_output, std::nullopt, true, false, false, std::nullopt,
+                              num_heads);
+  ASSERT_FALSE(flash_output.empty());
+  ExpectOutputsMatch(flash_output, unfused_output, 0.002f, "grouped fast decode vs unfused");
 #else
   GTEST_SKIP() << "FlashAttention is not compiled";
 #endif
