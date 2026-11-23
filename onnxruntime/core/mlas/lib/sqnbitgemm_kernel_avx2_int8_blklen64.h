@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "qnbitgemm.h"
+#include "sqnbitgemm_kernel_avx2_int8_blklen32.h"
 #include "sqnbitgemm_kernel_avx_common.h"
 
 MLAS_DECLSPEC_ALIGN(static const uint32_t MasksAvx2BlkLen64[24], 32) = {
@@ -1028,6 +1029,221 @@ Q8Int8GemmR1xC1BlkLen64Avx2(
     }
 }
 
+// Non-VNNI replacement for Q4Int8GemmR2xC4BlkLen64Avx2<false>; see UnpackQ4ShuffledAvx2. Bit-identical output.
+static void
+Q4Int8GemmR2xC4BlkLen64Avx2Shuffled(
+    const size_t BlkLen,
+    const std::byte* QuantA,
+    const float* QuantAScale,
+    const std::byte* QuantBData,
+    const float* QuantBScale,
+    float* C,
+    size_t CountM,
+    size_t CountN,
+    size_t BlockCountK,
+    const float* Bias,
+    size_t ldc
+)
+{
+    constexpr size_t BlkBitWidth4 = 4;
+    constexpr size_t NCols4 = 4;
+    constexpr size_t NRows2 = 2;
+    constexpr size_t SubblkLen = 64;
+
+    const size_t BlkDataSizeInBytes = MlasQNBitBlkDataSizeInBytes(BlkBitWidth4, BlkLen);
+    const size_t PerBlkSubblkCount = BlkLen / SubblkLen;
+    const size_t SubblkDataSizeInBytes = BlkDataSizeInBytes / PerBlkSubblkCount;
+
+    const size_t lda = BlockCountK * BlkLen;
+    const size_t StrideQuantBData = BlockCountK * BlkDataSizeInBytes;
+
+    assert(CountM % NRows2 == 0);
+    assert(CountN % NCols4 == 0);
+
+    const __m256i low_mask = _mm256_set1_epi8(0x0F);
+    const __m256i ones = _mm256_set1_epi16(1);
+
+    for (size_t m = 0; m < CountM; m += NRows2) {
+        const std::byte* QuantBDataColPtr = QuantBData;
+        const float* QuantBScaleColPtr = QuantBScale;
+        const float* BiasPtr = Bias;
+        auto* SumPtr = C + m * ldc;
+
+        for (size_t n = 0; n < CountN; n += NCols4) {
+            const std::byte* QuantAPtr = QuantA + m * lda;
+            const float* QuantAScalePtr = QuantAScale + m * BlockCountK;
+            const std::byte* QuantBDataPtr = QuantBDataColPtr;
+            const float* QuantBScalePtr = QuantBScaleColPtr;
+
+            __m256 acc[NCols4 * NRows2] = {
+                _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+                _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()
+            };
+
+            for (size_t k = 0; k < BlockCountK; ++k) {
+                const __m256 scale_a0_ps = _mm256_broadcast_ss(QuantAScalePtr);
+                const __m256 scale_a1_ps = _mm256_broadcast_ss(QuantAScalePtr + BlockCountK);
+                __m256 scale[NCols4 * NRows2];
+                for (size_t c = 0; c < NCols4; ++c) {
+                    const __m256 scale_b_ps = _mm256_broadcast_ss(QuantBScalePtr + c);
+                    scale[c] = _mm256_mul_ps(scale_a0_ps, scale_b_ps);
+                    scale[NCols4 + c] = _mm256_mul_ps(scale_a1_ps, scale_b_ps);
+                }
+
+                for (size_t kk = 0; kk < PerBlkSubblkCount; kk++) {
+                    const __m256i av_00_epi8 = _mm256_loadu_si256((const __m256i*)QuantAPtr);
+                    const __m256i av_01_epi8 = _mm256_loadu_si256((const __m256i*)(QuantAPtr + 32));
+                    const __m256i av_10_epi8 = _mm256_loadu_si256((const __m256i*)(QuantAPtr + lda));
+                    const __m256i av_11_epi8 = _mm256_loadu_si256((const __m256i*)(QuantAPtr + lda + 32));
+                    const __m256i a0p = ShuffleDwords2020Avx2(av_00_epi8, av_01_epi8);
+                    const __m256i a0q = ShuffleDwords3131Avx2(av_00_epi8, av_01_epi8);
+                    const __m256i a1p = ShuffleDwords2020Avx2(av_10_epi8, av_11_epi8);
+                    const __m256i a1q = ShuffleDwords3131Avx2(av_10_epi8, av_11_epi8);
+
+                    for (size_t c = 0; c < NCols4; ++c) {
+                        __m256i bp, bq;
+                        UnpackQ4ShuffledAvx2(QuantBDataPtr + c * SubblkDataSizeInBytes, low_mask, bp, bq);
+                        acc[c] = _mm256_fmadd_ps(DotQ4ShuffledAvx2(bp, bq, a0p, a0q, ones), scale[c], acc[c]);
+                        acc[NCols4 + c] = _mm256_fmadd_ps(
+                            DotQ4ShuffledAvx2(bp, bq, a1p, a1q, ones), scale[NCols4 + c], acc[NCols4 + c]
+                        );
+                    }
+
+                    QuantAPtr += SubblkLen;
+                    QuantBDataPtr += NCols4 * SubblkDataSizeInBytes;
+                }
+                QuantAScalePtr++;
+                QuantBScalePtr += NCols4;
+            }
+
+            __m128 acc_r0 = FoldAccumulators(acc[0], acc[1], acc[2], acc[3]);
+            __m128 acc_r1 = FoldAccumulators(acc[NCols4 + 0], acc[NCols4 + 1], acc[NCols4 + 2], acc[NCols4 + 3]);
+            if (BiasPtr != nullptr) {
+                const __m128 bias_4_ps = _mm_loadu_ps(BiasPtr);
+                acc_r0 = _mm_add_ps(acc_r0, bias_4_ps);
+                acc_r1 = _mm_add_ps(acc_r1, bias_4_ps);
+            }
+            _mm_storeu_ps(SumPtr, acc_r0);
+            _mm_storeu_ps(SumPtr + ldc, acc_r1);
+
+            QuantBDataColPtr += NCols4 * StrideQuantBData;
+            QuantBScaleColPtr += NCols4 * BlockCountK;
+            BiasPtr += BiasPtr != nullptr ? NCols4 : 0;
+            SumPtr += NCols4;
+        }
+    }
+}
+
+// Non-VNNI replacement for Q8Int8GemmR2xC4BlkLen64Avx2<false>; see DotQ8SignFoldAvx2. Bit-identical output.
+static void
+Q8Int8GemmR2xC4BlkLen64Avx2SignFold(
+    const size_t BlkLen,
+    const std::byte* QuantA,
+    const float* QuantAScale,
+    const std::byte* QuantBData,
+    const float* QuantBScale,
+    float* C,
+    size_t CountM,
+    size_t CountN,
+    size_t BlockCountK,
+    const float* Bias,
+    size_t ldc
+)
+{
+    constexpr size_t BlkBitWidth = 8;
+    constexpr size_t NCols4 = 4;
+    constexpr size_t NRows2 = 2;
+    constexpr size_t SubblkLen = 64;
+
+    const size_t BlkDataSizeInBytes = MlasQNBitBlkDataSizeInBytes(BlkBitWidth, BlkLen);
+    const size_t PerBlkSubblkCount = BlkLen / SubblkLen;
+    const size_t SubblkDataSizeInBytes = BlkDataSizeInBytes / PerBlkSubblkCount;
+
+    const size_t lda = BlockCountK * BlkLen;
+    const size_t StrideQuantBData = BlockCountK * BlkDataSizeInBytes;
+
+    assert(CountM % NRows2 == 0);
+    assert(CountN % NCols4 == 0);
+
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i ones_8 = _mm256_set1_epi8(1);
+    const __m256i sign_flip = _mm256_set1_epi8(static_cast<char>(0x80));
+
+    for (size_t m = 0; m < CountM; m += NRows2) {
+        const std::byte* QuantBDataColPtr = QuantBData;
+        const float* QuantBScaleColPtr = QuantBScale;
+        const float* BiasPtr = Bias;
+        auto* SumPtr = C + m * ldc;
+
+        for (size_t n = 0; n < CountN; n += NCols4) {
+            const std::byte* QuantAPtr = QuantA + m * lda;
+            const float* QuantAScalePtr = QuantAScale + m * BlockCountK;
+            const std::byte* QuantBDataPtr = QuantBDataColPtr;
+            const float* QuantBScalePtr = QuantBScaleColPtr;
+
+            __m256 acc[NCols4 * NRows2] = {
+                _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+                _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()
+            };
+
+            for (size_t k = 0; k < BlockCountK; ++k) {
+                const float scale_a0 = *QuantAScalePtr;
+                const float scale_a1 = *(QuantAScalePtr + BlockCountK);
+                float scale[NCols4 * NRows2];
+                for (size_t c = 0; c < NCols4; ++c) {
+                    scale[c] = QuantBScalePtr[c] * scale_a0;
+                    scale[NCols4 + c] = QuantBScalePtr[c] * scale_a1;
+                }
+
+                for (size_t kk = 0; kk < PerBlkSubblkCount; kk++) {
+                    const __m256i av_00_epi8 = _mm256_load_si256((const __m256i*)QuantAPtr);
+                    const __m256i av_01_epi8 = _mm256_load_si256((const __m256i*)(QuantAPtr + 32));
+                    const __m256i av_10_epi8 = _mm256_load_si256((const __m256i*)(QuantAPtr + lda));
+                    const __m256i av_11_epi8 = _mm256_load_si256((const __m256i*)(QuantAPtr + lda + 32));
+                    const __m256i corr0 = Q8SignFoldCorrectionAvx2(av_00_epi8, av_01_epi8, ones_8, ones);
+                    const __m256i corr1 = Q8SignFoldCorrectionAvx2(av_10_epi8, av_11_epi8, ones_8, ones);
+
+                    for (size_t c = 0; c < NCols4; ++c) {
+                        const std::byte* b = QuantBDataPtr + c * SubblkDataSizeInBytes;
+                        const __m256i s0 = _mm256_xor_si256(_mm256_load_si256((const __m256i*)b), sign_flip);
+                        const __m256i s1 = _mm256_xor_si256(_mm256_load_si256((const __m256i*)(b + 32)), sign_flip);
+                        const __m256i u0 = _mm256_abs_epi8(s0);
+                        const __m256i u1 = _mm256_abs_epi8(s1);
+                        acc[c] = _mm256_fmadd_ps(
+                            DotQ8SignFoldAvx2(u0, s0, u1, s1, av_00_epi8, av_01_epi8, corr0, ones),
+                            _mm256_set1_ps(scale[c]), acc[c]
+                        );
+                        acc[NCols4 + c] = _mm256_fmadd_ps(
+                            DotQ8SignFoldAvx2(u0, s0, u1, s1, av_10_epi8, av_11_epi8, corr1, ones),
+                            _mm256_set1_ps(scale[NCols4 + c]), acc[NCols4 + c]
+                        );
+                    }
+
+                    QuantAPtr += SubblkLen;
+                    QuantBDataPtr += NCols4 * SubblkDataSizeInBytes;
+                }
+                QuantAScalePtr++;
+                QuantBScalePtr += NCols4;
+            }
+
+            __m128 acc_r0 = FoldAccumulators(acc[0], acc[1], acc[2], acc[3]);
+            __m128 acc_r1 = FoldAccumulators(acc[NCols4 + 0], acc[NCols4 + 1], acc[NCols4 + 2], acc[NCols4 + 3]);
+            if (BiasPtr != nullptr) {
+                const __m128 bias_4_ps = _mm_loadu_ps(BiasPtr);
+                acc_r0 = _mm_add_ps(acc_r0, bias_4_ps);
+                acc_r1 = _mm_add_ps(acc_r1, bias_4_ps);
+            }
+            _mm_storeu_ps(SumPtr, acc_r0);
+            _mm_storeu_ps(SumPtr + ldc, acc_r1);
+
+            QuantBDataColPtr += NCols4 * StrideQuantBData;
+            QuantBScaleColPtr += NCols4 * BlockCountK;
+            BiasPtr += BiasPtr != nullptr ? NCols4 : 0;
+            SumPtr += NCols4;
+        }
+    }
+}
+
 template <bool vnni>
 MLAS_FORCEINLINE size_t
 MlasQ4Int8GemmKernelBlkLen64Avx2(
@@ -1059,19 +1275,26 @@ MlasQ4Int8GemmKernelBlkLen64Avx2(
     size_t multipleCols = CountN - remainingCols;
 
     if (multipleRows > 0 && multipleCols > 0) {
-        Q4Int8GemmR2xC4BlkLen64Avx2<vnni>(
-            BlkLen,
-            QuantA,
-            QuantAScale,
-            QuantBData,
-            QuantBScale,
-            C,
-            multipleRows,
-            multipleCols,
-            BlockCountK,
-            Bias,
-            ldc
-        );
+        if constexpr (vnni) {
+            Q4Int8GemmR2xC4BlkLen64Avx2<vnni>(
+                BlkLen,
+                QuantA,
+                QuantAScale,
+                QuantBData,
+                QuantBScale,
+                C,
+                multipleRows,
+                multipleCols,
+                BlockCountK,
+                Bias,
+                ldc
+            );
+        } else {
+            Q4Int8GemmR2xC4BlkLen64Avx2Shuffled(
+                BlkLen, QuantA, QuantAScale, QuantBData, QuantBScale, C, multipleRows, multipleCols, BlockCountK,
+                Bias, ldc
+            );
+        }
     }
     if (remainingCols > 0 && multipleRows > 0) {
         Q4Int8GemmR2xC1BlkLen64Avx2<vnni>(
@@ -1152,19 +1375,26 @@ MlasQ8Int8GemmKernelBlkLen64Avx2(
     size_t multipleCols = CountN - remainingCols;
 
     if (multipleRows > 0 && multipleCols > 0) {
-        Q8Int8GemmR2xC4BlkLen64Avx2<vnni>(
-            BlkLen,
-            QuantA,
-            QuantAScale,
-            QuantBData,
-            QuantBScale,
-            C,
-            multipleRows,
-            multipleCols,
-            BlockCountK,
-            Bias,
-            ldc
-        );
+        if constexpr (vnni) {
+            Q8Int8GemmR2xC4BlkLen64Avx2<vnni>(
+                BlkLen,
+                QuantA,
+                QuantAScale,
+                QuantBData,
+                QuantBScale,
+                C,
+                multipleRows,
+                multipleCols,
+                BlockCountK,
+                Bias,
+                ldc
+            );
+        } else {
+            Q8Int8GemmR2xC4BlkLen64Avx2SignFold(
+                BlkLen, QuantA, QuantAScale, QuantBData, QuantBScale, C, multipleRows, multipleCols, BlockCountK,
+                Bias, ldc
+            );
+        }
     }
     if (remainingCols > 0 && multipleRows > 0) {
         Q8Int8GemmR2xC1BlkLen64Avx2<vnni>(

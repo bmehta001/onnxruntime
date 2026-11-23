@@ -1348,7 +1348,43 @@ InitializeWorkspace_CompInt8<float>(
     const size_t BlockCountK = MlasDivRoundup(K, BlkLen);
     const size_t QuantAStride = BlockCountK * Q8BlkSize(BlkLen);
 
-    // TODO: try parallel on BatchN * M threads because BatchN is usually 1.
+    // Rows of A are quantized independently, so split each GEMM's rows into chunks and parallelize over
+    // BatchN x chunks (BatchN is usually 1). The chunk size depends only on the shape.
+    constexpr size_t QuantARowTaskElements = 16384;
+    const size_t RowsPerTask = std::max<size_t>(1, std::min(M, QuantARowTaskElements / std::max<size_t>(K, 1)));
+    const size_t TasksPerGemm = MlasDivRoundup(M, RowsPerTask);
+    const ptrdiff_t TaskCount = static_cast<ptrdiff_t>(BatchN * TasksPerGemm);
+
+    const auto QuantizeRowsComputeBlkSum = [&](auto QuantizeFn) {
+        MlasTrySimpleParallel(ThreadPool, TaskCount, [&](ptrdiff_t task_idx) {
+            const size_t gemm_idx = static_cast<size_t>(task_idx) / TasksPerGemm;
+            const size_t RangeStartM = (static_cast<size_t>(task_idx) % TasksPerGemm) * RowsPerTask;
+            const size_t RangeEndM = std::min(M, RangeStartM + RowsPerTask);
+            const auto& data = DataParams[gemm_idx];
+            const bool quant_from_fp16 = data.AFp16 != nullptr && QuantizeARow2Fp16 != nullptr;
+            const float* ARowPtr = quant_from_fp16 ? nullptr : data.A + RangeStartM * data.lda;
+            const MLAS_FP16* AFp16RowPtr = quant_from_fp16 ? data.AFp16 + RangeStartM * data.lda : nullptr;
+
+            void* PerGemmWorkspace = static_cast<std::byte*>(Workspace) + gemm_idx * PerGemmWorkspaceStride;
+            PerGemmQuantAWorkspace quant_a_data(PerGemmWorkspace, M, BlockCountK, BlkLen);
+            std::byte* QuantARowPtr = quant_a_data.QuantData + RangeStartM * BlockCountK * BlkLen;
+            float* QuantARowScalePtr = quant_a_data.QuantScale + RangeStartM * BlockCountK;
+            float* QuantARowBlkSum = quant_a_data.BlockSum + RangeStartM * BlockCountK;
+            for (size_t m = RangeStartM; m < RangeEndM; ++m) {
+                if (quant_from_fp16) {
+                    QuantizeARow2Fp16(BlkLen, AFp16RowPtr, K, QuantARowPtr, QuantARowScalePtr, QuantARowBlkSum);
+                    AFp16RowPtr += data.lda;
+                } else {
+                    QuantizeFn(BlkLen, ARowPtr, K, QuantARowPtr, QuantARowScalePtr, QuantARowBlkSum);
+                    ARowPtr += data.lda;
+                }
+                QuantARowPtr += BlockCountK * BlkLen;
+                QuantARowScalePtr += BlockCountK;
+                QuantARowBlkSum += BlockCountK;
+            }
+        });
+    };
+
     // TODO(hasesh): The (BlkBitWidth x A-layout x A-signedness) matrix below is
     // resolved by a hand-rolled cascade because the dispatch exposes both an
     // interleaved-scale (W4-style) and a separate-scale (W8-style) quantize fn,
@@ -1367,12 +1403,16 @@ InitializeWorkspace_CompInt8<float>(
         // W8), force W2 down the W8-compatible branch.
         const bool prefer_compute_blksum = (BlkBitWidth == 2);
         if (QuantizeARow && !prefer_compute_blksum) {
-            MlasTrySimpleParallel(ThreadPool, BatchN, [&](ptrdiff_t gemm_idx) {
+            MlasTrySimpleParallel(ThreadPool, TaskCount, [&](ptrdiff_t task_idx) {
+                const size_t gemm_idx = static_cast<size_t>(task_idx) / TasksPerGemm;
+                const size_t RangeStartM = (static_cast<size_t>(task_idx) % TasksPerGemm) * RowsPerTask;
+                const size_t RangeEndM = std::min(M, RangeStartM + RowsPerTask);
                 const auto& data = DataParams[gemm_idx];
 
-                const float* ARowPtr = data.A;
-                std::byte* QuantARowPtr = static_cast<std::byte*>(Workspace) + gemm_idx * PerGemmWorkspaceStride;
-                for (size_t m = 0; m < M; ++m) {
+                const float* ARowPtr = data.A + RangeStartM * data.lda;
+                std::byte* QuantARowPtr = static_cast<std::byte*>(Workspace) + gemm_idx * PerGemmWorkspaceStride +
+                                          RangeStartM * QuantAStride;
+                for (size_t m = RangeStartM; m < RangeEndM; ++m) {
                     QuantizeARow(BlkLen, ARowPtr, K, QuantARowPtr);
 
                     ARowPtr += data.lda;
@@ -1388,57 +1428,11 @@ InitializeWorkspace_CompInt8<float>(
                 (BlkBitWidth == 2 && GetMlasPlatform().QNBitGemmDispatch->QuantizeARowComputeBlkSum_CompInt8_W2 != nullptr)
                     ? GetMlasPlatform().QNBitGemmDispatch->QuantizeARowComputeBlkSum_CompInt8_W2
                     : QuantizeARow2;
-            MlasTrySimpleParallel(ThreadPool, BatchN, [&](ptrdiff_t gemm_idx) {
-                const auto& data = DataParams[gemm_idx];
-                const float* ARowPtr = data.A;
-                const MLAS_FP16* AFp16RowPtr = data.AFp16;
-                const bool quant_from_fp16 = AFp16RowPtr != nullptr && QuantizeARow2Fp16 != nullptr;
-
-                void* PerGemmWorkspace = static_cast<std::byte*>(Workspace) + gemm_idx * PerGemmWorkspaceStride;
-                PerGemmQuantAWorkspace quant_a_data(PerGemmWorkspace, M, BlockCountK, BlkLen);
-                std::byte* QuantARowPtr = quant_a_data.QuantData;
-                float* QuantARowScalePtr = quant_a_data.QuantScale;
-                float* QuantARowBlkSum = quant_a_data.BlockSum;
-                for (size_t m = 0; m < M; ++m) {
-                    if (quant_from_fp16) {
-                        QuantizeARow2Fp16(BlkLen, AFp16RowPtr, K, QuantARowPtr, QuantARowScalePtr, QuantARowBlkSum);
-                        AFp16RowPtr += data.lda;
-                    } else {
-                        QuantizeARow2_W2(BlkLen, ARowPtr, K, QuantARowPtr, QuantARowScalePtr, QuantARowBlkSum);
-                        ARowPtr += data.lda;
-                    }
-                    QuantARowPtr += BlockCountK * BlkLen;
-                    QuantARowScalePtr += BlockCountK;
-                    QuantARowBlkSum += BlockCountK;
-                }
-            });
+            QuantizeRowsComputeBlkSum(QuantizeARow2_W2);
         }
     } else if (BlkBitWidth == 8) {
         if (QuantizeARow2) {
-            MlasTrySimpleParallel(ThreadPool, BatchN, [&](ptrdiff_t gemm_idx) {
-                const auto& data = DataParams[gemm_idx];
-                const float* ARowPtr = data.A;
-                const MLAS_FP16* AFp16RowPtr = data.AFp16;
-                const bool quant_from_fp16 = AFp16RowPtr != nullptr && QuantizeARow2Fp16 != nullptr;
-
-                void* PerGemmWorkspace = static_cast<std::byte*>(Workspace) + gemm_idx * PerGemmWorkspaceStride;
-                PerGemmQuantAWorkspace quant_a_data(PerGemmWorkspace, M, BlockCountK, BlkLen);
-                std::byte* QuantARowPtr = quant_a_data.QuantData;
-                float* QuantARowScalePtr = quant_a_data.QuantScale;
-                float* QuantARowBlkSum = quant_a_data.BlockSum;
-                for (size_t m = 0; m < M; ++m) {
-                    if (quant_from_fp16) {
-                        QuantizeARow2Fp16(BlkLen, AFp16RowPtr, K, QuantARowPtr, QuantARowScalePtr, QuantARowBlkSum);
-                        AFp16RowPtr += data.lda;
-                    } else {
-                        QuantizeARow2(BlkLen, ARowPtr, K, QuantARowPtr, QuantARowScalePtr, QuantARowBlkSum);
-                        ARowPtr += data.lda;
-                    }
-                    QuantARowPtr += BlockCountK * BlkLen;
-                    QuantARowScalePtr += BlockCountK;
-                    QuantARowBlkSum += BlockCountK;
-                }
-            });
+            QuantizeRowsComputeBlkSum(QuantizeARow2);
         }
     }
 }
@@ -1597,6 +1591,19 @@ MlasQNBitGemmBatch(
     const size_t BlockCountK = MlasDivRoundup(K, BlkLen);
 
     if (ThreadPool == nullptr) {
+        // Tile M so the quantized A tile stays cache resident while the N strips are streamed. Tiles start at
+        // even rows and a single-row remainder is folded into the last tile, so every row goes through the same
+        // kernel (and row pairing) as the untiled call and the result is unchanged.
+        const auto ComputeInt8MTiles = [&](const MLAS_QNBIT_GEMM_DATA_PARAMS<T>* Data,
+                                           PerGemmQuantAWorkspace* QuantAWorkspace) {
+            constexpr size_t StrideM = kQNBitGemmComputeStrideM;
+            static_assert(StrideM % 2 == 0);
+            size_t CountM;
+            for (size_t m = 0; m < M; m += CountM) {
+                CountM = (M - m <= StrideM + 1) ? M - m : StrideM;
+                ComputeOperation(BlkLen, K, Data, QuantAWorkspace, m, CountM, 0, N, BackendKernelSelectorConfig);
+            }
+        };
         for (size_t gemm_i = 0; gemm_i < BatchN; gemm_i++) {
             const auto* Data = &DataParams[gemm_i];
             void* PerGemmWorkspace =
@@ -1607,7 +1614,7 @@ MlasQNBitGemmBatch(
                 const_cast<MLAS_QNBIT_GEMM_DATA_PARAMS<T>*>(Data)->QuantBBlkSum = packed_quant_b.QuantBBlkSum;
                 const_cast<MLAS_QNBIT_GEMM_DATA_PARAMS<T>*>(Data)->QuantBScale = packed_quant_b.PackedQuantBScale;
                 PerGemmQuantAWorkspace per_gemm_quant_a_workspace(PerGemmWorkspace, M, BlockCountK, BlkLen);
-                ComputeOperation(BlkLen, K, Data, &per_gemm_quant_a_workspace, 0, M, 0, N, BackendKernelSelectorConfig);
+                ComputeInt8MTiles(Data, &per_gemm_quant_a_workspace);
             } else if (Variant == SQ8BitGemmVariant_CompInt8 && GetMlasPlatform().QNBitGemmDispatch->SQ8BitGemmKernel_BlkSum_CompInt8 != nullptr) {
                 PackedQuantBDataStruct<T, 8> packed_quant_b(const_cast<void*>(Data->QuantBDataWorkspace), N, BlockCountK, BlkLen, GetMlasPlatform().ArmNeonIsQuantActivationsUnsigned);
                 const_cast<MLAS_QNBIT_GEMM_DATA_PARAMS<T>*>(Data)->PackedQuantBData = packed_quant_b.PackedQuantBData;
@@ -1616,14 +1623,14 @@ MlasQNBitGemmBatch(
                 const_cast<MLAS_QNBIT_GEMM_DATA_PARAMS<T>*>(Data)->BlkUnsignedQuantAZeroPointCorrection = packed_quant_b.BlkUnsignedQuantAZeroPointCorrection;
 
                 PerGemmQuantAWorkspace per_gemm_quant_a_workspace(PerGemmWorkspace, M, BlockCountK, BlkLen);
-                ComputeOperation(BlkLen, K, Data, &per_gemm_quant_a_workspace, 0, M, 0, N, BackendKernelSelectorConfig);
+                ComputeInt8MTiles(Data, &per_gemm_quant_a_workspace);
             } else if (Variant == SQ2BitGemmVariant_CompInt8 && GetMlasPlatform().QNBitGemmDispatch->SQ2BitGemmKernel_BlkSum_CompInt8 != nullptr) {
                 PackedQuantBDataStruct<T, 2> packed_quant_b(const_cast<void*>(Data->QuantBDataWorkspace), N, BlockCountK, BlkLen, false);
                 const_cast<MLAS_QNBIT_GEMM_DATA_PARAMS<T>*>(Data)->PackedQuantBData = packed_quant_b.PackedQuantBData;
                 const_cast<MLAS_QNBIT_GEMM_DATA_PARAMS<T>*>(Data)->QuantBBlkSum = packed_quant_b.QuantBBlkSum;
                 const_cast<MLAS_QNBIT_GEMM_DATA_PARAMS<T>*>(Data)->QuantBScale = packed_quant_b.PackedQuantBScale;
                 PerGemmQuantAWorkspace per_gemm_quant_a_workspace(PerGemmWorkspace, M, BlockCountK, BlkLen);
-                ComputeOperation(BlkLen, K, Data, &per_gemm_quant_a_workspace, 0, M, 0, N, BackendKernelSelectorConfig);
+                ComputeInt8MTiles(Data, &per_gemm_quant_a_workspace);
             } else {
                 ComputeOperation(BlkLen, K, Data, PerGemmWorkspace, 0, M, 0, N, BackendKernelSelectorConfig);
             }
