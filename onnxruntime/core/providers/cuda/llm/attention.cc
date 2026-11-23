@@ -371,14 +371,8 @@ Status Attention<T>::RunFlashAttention(
   auto softmax_lse_accum_buffer = GetScratchBuffer<void>(softmax_lse_accum_bytes, GetComputeStream(context));
   auto out_accum_buffer = GetScratchBuffer<void>(out_accum_bytes, GetComputeStream(context));
 
-  if (softmax_lse_accum_bytes > 0) {
-    CUDA_RETURN_IF_ERROR(cudaMemsetAsync(softmax_lse_accum_buffer.get(), 0,
-                                         softmax_lse_accum_bytes, cuda_stream));
-  }
-  if (out_accum_bytes > 0) {
-    CUDA_RETURN_IF_ERROR(cudaMemsetAsync(out_accum_buffer.get(), 0,
-                                         out_accum_bytes, cuda_stream));
-  }
+  // FlashAttention writes live split rows, including empty splits (0 output, -inf LSE); combine
+  // ignores padded query rows.
 
   // --- Transpose Q from BNSH to BSNH (flash always expects Q as BSNH) ---
   const void* q_data = Q->Data<T>();
