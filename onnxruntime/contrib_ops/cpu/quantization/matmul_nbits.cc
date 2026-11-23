@@ -1314,9 +1314,16 @@ Status MatMulNBits<T1>::ComputeBPacked(const Tensor* a,
   IAllocatorUniquePtr<std::byte> workspace{};
   const size_t workspace_size = MlasQNBitGemmBatchWorkspaceSize(
       M, N, K, batch_count, nbits_, block_size_, zero_points, compute_type_, &mlas_backend_kernel_selector_config_);
-  if (workspace_size > 0) {
+  // Decode-sized (small M) workspaces fit on the stack, which avoids a heap round trip on every call.
+  constexpr size_t kStackWorkspaceBytes = 16 * 1024;
+  alignas(64) std::byte stack_workspace[kStackWorkspaceBytes];
+  std::byte* workspace_ptr = nullptr;
+  if (workspace_size > kStackWorkspaceBytes) {
     // Use reserve since no caching is needed
     workspace = IAllocator::MakeUniquePtr<std::byte>(allocator, workspace_size, true);
+    workspace_ptr = workspace.get();
+  } else if (workspace_size > 0) {
+    workspace_ptr = stack_workspace;
   }
 
   InlinedVector<MLAS_QNBIT_GEMM_DATA_PARAMS<T1>> data(batch_count);
@@ -1333,7 +1340,7 @@ Status MatMulNBits<T1>::ComputeBPacked(const Tensor* a,
     data[i].C = y_data + helper.OutputOffsets()[i];
     data[i].ldc = N;
   }
-  MlasQNBitGemmBatch(M, N, K, batch_count, nbits_, block_size_, compute_type_, data.data(), workspace.get(),
+  MlasQNBitGemmBatch(M, N, K, batch_count, nbits_, block_size_, compute_type_, data.data(), workspace_ptr,
                      thread_pool, &mlas_backend_kernel_selector_config_);
   return Status::OK();
 }
