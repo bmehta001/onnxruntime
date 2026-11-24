@@ -298,6 +298,54 @@ TEST(SignalOpsTest, STFTFloat) {
   test.Run();
 }
 
+// Whisper-style log-mel front end: real signal, non-power-of-two Hann window (n_fft = 400), hop 160.
+TEST(SignalOpsTest, STFTFloatRealNonPowerOfTwoWindow) {
+  constexpr int64_t kBatch = 2;
+  constexpr int64_t kSignalLength = 1200;
+  constexpr int64_t kFrameLength = 400;
+  constexpr int64_t kFrameStep = 160;
+  constexpr int64_t kNumFrames = (kSignalLength - kFrameLength) / kFrameStep + 1;
+  constexpr int64_t kBins = kFrameLength / 2 + 1;
+  const double pi = std::acos(-1.0);
+
+  RandomValueGenerator random(GetTestRandomSeed());
+  const vector<int64_t> signal_shape{kBatch, kSignalLength};
+  vector<float> signal = random.Uniform<float>(signal_shape, -1.f, 1.f);
+  vector<float> window(kFrameLength);
+  for (int64_t n = 0; n < kFrameLength; ++n) {
+    window[n] = static_cast<float>(0.5 - 0.5 * std::cos(2.0 * pi * n / kFrameLength));
+  }
+
+  vector<float> expected(kBatch * kNumFrames * kBins * 2);
+  for (int64_t b = 0; b < kBatch; ++b) {
+    for (int64_t f = 0; f < kNumFrames; ++f) {
+      for (int64_t k = 0; k < kBins; ++k) {
+        double re = 0.0;
+        double im = 0.0;
+        for (int64_t n = 0; n < kFrameLength; ++n) {
+          const double x = static_cast<double>(signal[b * kSignalLength + f * kFrameStep + n]) * window[n];
+          const double angle = -2.0 * pi * static_cast<double>((k * n) % kFrameLength) / kFrameLength;
+          re += x * std::cos(angle);
+          im += x * std::sin(angle);
+        }
+        const int64_t out = ((b * kNumFrames + f) * kBins + k) * 2;
+        expected[out] = static_cast<float>(re);
+        expected[out + 1] = static_cast<float>(im);
+      }
+    }
+  }
+
+  OpTester test("STFT", kMinOpsetVersion);
+  test.AddInput<float>("signal", {kBatch, kSignalLength, 1}, signal);
+  test.AddInput<int64_t>("frame_step", {}, {kFrameStep});
+  test.AddInput<float>("window", {kFrameLength}, window);
+  test.AddInput<int64_t>("frame_length", {}, {kFrameLength});
+  test.AddOutput<float>("output", {kBatch, kNumFrames, kBins, 2}, expected);
+  test.SetOutputAbsErr("output", 0.005f);
+  test.ConfigExcludeEps({kDmlExecutionProvider});
+  test.RunWithConfig();
+}
+
 static void TestSTFTInvalidFrameStep(int64_t frame_step) {
   OpTester test("STFT", kMinOpsetVersion);
 

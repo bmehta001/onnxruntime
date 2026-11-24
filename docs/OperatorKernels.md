@@ -756,6 +756,8 @@ The **OpSet Version** column uses the following notation:
 |Crop|*in* input:**T**<br> *out* output:**T**|1+|**T** = tensor(double), tensor(float), tensor(float16)|
 |CumSum|*in* x:**T**<br> *in* axis:**T2**<br> *out* y:**T**|14+|**T** = tensor(double), tensor(float), tensor(float16), tensor(int32), tensor(int64), tensor(uint32), tensor(uint64)<br/> **T2** = tensor(int32), tensor(int64)|
 |||[11, 13]|**T** = tensor(double), tensor(float), tensor(int32), tensor(int64), tensor(uint32), tensor(uint64)<br/> **T2** = tensor(int32), tensor(int64)|
+|DFT|*in* input:**T1**<br> *in* dft_length:**T2**<br> *in* axis:**tensor(int64)**<br> *out* output:**T1**<br><br>or<br><br>*in* input:**T1**<br> *in* dft_length:**T2**<br> *out* output:**T1**|20+|**T1** = tensor(double), tensor(float)<br/> **T2** = tensor(int32), tensor(int64)|
+|||[17, 19]|**T1** = tensor(double), tensor(float)<br/> **T2** = tensor(int32), tensor(int64)|
 |DeformConv|*in* X:**T**<br> *in* W:**T**<br> *in* offset:**T**<br> *in* B:**T**<br> *in* mask:**T**<br> *out* Y:**T**|22+|**T** = tensor(bfloat16), tensor(double), tensor(float), tensor(float16)|
 |||[19, 21]|**T** = tensor(double), tensor(float), tensor(float16)|
 |DepthToSpace|*in* input:**T**<br> *out* output:**T**|28+|**T** = tensor(double), tensor(float), tensor(float16)|
@@ -996,6 +998,7 @@ The **OpSet Version** column uses the following notation:
 |RotaryEmbedding|*in* X:**T**<br> *in* cos_cache:**T**<br> *in* sin_cache:**T**<br> *in* position_ids:**M**<br> *out* Y:**T**|23+|**M** = tensor(int64)<br/> **T** = tensor(bfloat16), tensor(float), tensor(float16)|
 |Round|*in* X:**T**<br> *out* Y:**T**|22+|**T** = tensor(double), tensor(float), tensor(float16)|
 |||[11, 21]|**T** = tensor(double), tensor(float), tensor(float16)|
+|STFT|*in* signal:**T1**<br> *in* frame_step:**T2**<br> *in* window:**T1**<br> *in* frame_length:**T2**<br> *out* output:**T1**|17+|**T1** = tensor(double), tensor(float)<br/> **T2** = tensor(int32), tensor(int64)|
 |ScaledTanh|*in* input:**T**<br> *out* output:**T**|1+|**T** = tensor(double), tensor(float), tensor(float16)|
 |Scan|*in* initial_state_and_scan_inputs:**V**<br> *out* final_state_and_scan_outputs:**V**<br><br>or<br><br>*in* sequence_lens:**I**<br> *in* initial_state_and_scan_inputs:**V**<br> *out* final_state_and_scan_outputs:**V**|25+|**V** = tensor(bfloat16), tensor(bool), tensor(double), tensor(float), tensor(float16), tensor(float8e4m3fn), tensor(float8e4m3fnuz), tensor(float8e5m2), tensor(float8e5m2fnuz), tensor(int16), tensor(int32), tensor(int64), tensor(int8), tensor(uint16), tensor(uint32), tensor(uint64), tensor(uint8)|
 |||[23, 24]|**V** = tensor(bfloat16), tensor(bool), tensor(double), tensor(float), tensor(float16), tensor(float8e4m3fn), tensor(float8e4m3fnuz), tensor(float8e5m2), tensor(float8e5m2fnuz), tensor(int16), tensor(int32), tensor(int64), tensor(int8), tensor(uint16), tensor(uint32), tensor(uint64), tensor(uint8)|
