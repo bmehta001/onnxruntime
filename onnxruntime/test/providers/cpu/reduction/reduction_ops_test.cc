@@ -2616,6 +2616,40 @@ TEST(ReductionOpTest, ReduceSum_int32) {
   test.Run();
 }
 
+// Many rows with a tiny reduced trailing axis (e.g. the real/imag axis of a DFT output).
+TEST(ReductionOpTest, ReduceSumAndMean_NarrowTrailingAxis_ManyRows) {
+  constexpr int64_t rows = 1000;
+  for (int64_t cols : {2, 3, 16}) {
+    std::vector<float> data(static_cast<size_t>(rows * cols));
+    std::vector<float> sums(static_cast<size_t>(rows));
+    std::vector<float> means(static_cast<size_t>(rows));
+    for (int64_t r = 0; r < rows; ++r) {
+      float sum = 0.0f;
+      for (int64_t c = 0; c < cols; ++c) {
+        const float v = static_cast<float>((r * 7 + c * 3) % 11) - 5.0f;
+        data[static_cast<size_t>(r * cols + c)] = v;
+        sum += v;
+      }
+      sums[static_cast<size_t>(r)] = sum;
+      means[static_cast<size_t>(r)] = sum / static_cast<float>(cols);
+    }
+
+    OpTester sum_test("ReduceSum", 13);
+    sum_test.AddAttribute("keepdims", static_cast<int64_t>(0));
+    sum_test.AddInput<float>("data", {2, rows / 2, cols}, data);
+    sum_test.AddInput<int64_t>("axes", {1}, {-1}, true);
+    sum_test.AddOutput<float>("reduced", {2, rows / 2}, sums);
+    sum_test.Run();
+
+    OpTester mean_test("ReduceMean", 13);
+    mean_test.AddAttribute("axes", std::vector<int64_t>{-1});
+    mean_test.AddAttribute("keepdims", static_cast<int64_t>(1));
+    mean_test.AddInput<float>("data", {rows, cols}, data);
+    mean_test.AddOutput<float>("reduced", {rows, 1}, means);
+    mean_test.Run();
+  }
+}
+
 #if defined(USE_CUDA) || defined(USE_COREML)
 TEST(ReductionOpTest, ReduceSumHalfHalf) {
   OpTester test("ReduceSum");

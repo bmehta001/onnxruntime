@@ -294,12 +294,44 @@ __global__ void reduce_matrix_columns_kernel(
   }
 }
 
+// Rows at most this wide are reduced by a single thread each. The block-per-row kernel above would otherwise leave
+// nearly all threads of each block idle, e.g. ReduceSum over the trailing real/imaginary axis of a spectrogram.
+constexpr int MAX_NUM_COLS_FOR_THREAD_PER_ROW = 16;
+
+template <typename TIn, typename TOut, typename TBuf, typename TOp, typename TFinalOp, bool DivideResultBySize>
+__global__ void reduce_narrow_matrix_columns_kernel(
+    const int num_rows, const int num_cols, const TIn* const input, TOut* const output) {
+  for (int64_t row_id = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; row_id < num_rows;
+       row_id += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const TIn* const row_data = input + row_id * num_cols;
+    TBuf value = 0;
+    for (int col = 0; col < num_cols; ++col) {
+      value += TOp()(TBuf(row_data[col]));
+    }
+    // Match reduce_all(): convert to TOut before the optional mean division and final op.
+    const TOut result = TOut(value);
+    if (DivideResultBySize) {
+      output[row_id] = TFinalOp()(result / TOut(num_cols));
+    } else {
+      output[row_id] = TFinalOp()(result);
+    }
+  }
+}
+
 template <typename TIn, typename TOut, typename TOp, typename TFinalOp, bool DivideResultBySize>
 Status call_reduce_matrix_columns(
     cudaStream_t stream, const TIn* input, TOut* output, const int num_rows, const int num_cols, void* buffer, size_t buffer_size) {
   ORT_ENFORCE(num_rows >= 0 && num_cols >= 0);
 
   using TBuf = AccumulationType_t<TIn>;
+
+  if (num_cols > 0 && num_cols <= MAX_NUM_COLS_FOR_THREAD_PER_ROW && num_rows > 1) {
+    constexpr int kThreadsPerBlock = GridDim::maxThreadsPerBlock;
+    const int num_blocks = (num_rows - 1) / kThreadsPerBlock + 1;
+    reduce_narrow_matrix_columns_kernel<TIn, TOut, TBuf, TOp, TFinalOp, DivideResultBySize>
+        <<<num_blocks, kThreadsPerBlock, 0, stream>>>(num_rows, num_cols, input, output);
+    return CUDA_CALL(cudaGetLastError());
+  }
 
   const auto grid_and_block_dims = compute_grid_and_block_dims(num_rows, num_cols);
   const dim3& grid_dim = grid_and_block_dims.first;
